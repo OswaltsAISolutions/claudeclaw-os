@@ -5,6 +5,7 @@ import { serve } from '@hono/node-server';
 
 import fs from 'fs';
 import path from 'path';
+import { spawn } from 'child_process';
 import { AGENT_ID, ALLOWED_CHAT_ID, DASHBOARD_PORT, DASHBOARD_TOKEN, DASHBOARD_URL, PROJECT_ROOT, STORE_DIR, WHATSAPP_ENABLED, SLACK_USER_TOKEN, CONTEXT_LIMIT, agentDefaultModel, CLAUDECLAW_CONFIG } from './config.js';
 import crypto from 'crypto';
 import {
@@ -104,14 +105,38 @@ import {
   clearMeetingSessions,
   getOpenTextMeetingIds,
   getTextMeetings,
+  logConversationTurn,
+  getRecentConversation,
+  logToHiveMind,
 } from './db.js';
 import { messageQueue } from './message-queue.js';
 import * as killSwitches from './kill-switches.js';
 import { getIngestionQuotaStatus, extractViaClaude } from './memory-ingest.js';
 import { WARROOM_ENABLED, WARROOM_PORT } from './config.js';
 import { logger } from './logger.js';
-import { getTelegramConnected, getBotInfo, chatEvents, getIsProcessing, abortActiveQuery, ChatEvent } from './state.js';
+import { getTelegramConnected, getBotInfo, chatEvents, getIsProcessing, abortActiveQuery, ChatEvent, emitChatEvent } from './state.js';
 import { killProcess, isProcessAlive, findProcessesByPattern } from './platform.js';
+import {
+  ollamaHealth,
+  ollamaListModels,
+  ollamaShowModel,
+  ollamaRunningModels,
+  ollamaDeleteModel,
+  ollamaPullModel,
+  ollamaChat,
+  clearOllamaHostCache,
+  resolveOllamaBaseUrl,
+  type ChatMessage,
+} from './ollama.js';
+import { buildMemoryContext } from './memory.js';
+import {
+  SPECIALISTS,
+  ALL_CALLSIGNS,
+  delegate as delegateToSpecialist,
+  resolveSpecialistModel,
+  suggestRoute,
+  type SpecialistCallsign,
+} from './specialists.js';
 
 async function classifyTaskAgent(prompt: string): Promise<string | null> {
   const agentIds = listAgentIds();
@@ -425,8 +450,22 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     // window.location, falling back to sessionStorage. Serving this
     // unauthenticated means a token-stripped URL still loads the app
     // instead of showing raw 401 JSON.
+    //
+    // No-cache on the HTML shell is critical: the hashed assets are
+    // immutable, so if the shell itself is cached the browser keeps
+    // loading the old bundle hash forever (or 404s if we deleted it).
+    // Bug observed 2026-05-23: tab kept showing days-old chat content
+    // because the shell+old bundle were both in disk cache and never
+    // revalidated. Forcing the shell to revalidate fixes that.
     const html = fs.readFileSync(newDashboardIndex, 'utf-8');
-    return c.html(html);
+    return new Response(html, {
+      headers: {
+        'Content-Type': 'text/html; charset=UTF-8',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+      },
+    });
   });
 
   // Static asset serving for the Vite-built frontend.
@@ -498,7 +537,16 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     }
     // v2 SPA shell — no embedded token, safe to serve unauth so a
     // hard-refresh of a token-stripped URL still loads the app.
-    return c.html(fs.readFileSync(newDashboardIndex, 'utf-8'));
+    // No-cache for the same reason as the `/` handler above (hashed
+    // assets are immutable, so a cached shell pins old asset hashes).
+    return new Response(fs.readFileSync(newDashboardIndex, 'utf-8'), {
+      headers: {
+        'Content-Type': 'text/html; charset=UTF-8',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+      },
+    });
   });
 
   // Text War Room page. Expects ?meetingId= (created via POST
@@ -1854,7 +1902,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       turns,
       compactions,
       sessionAge,
-      model: agentDefaultModel || 'sonnet-4-6',
+      model: agentDefaultModel || 'claude-opus-4-7',
       telegramConnected: getTelegramConnected(),
       waConnected: WHATSAPP_ENABLED,
       slackConnected: !!SLACK_USER_TOKEN,
@@ -1920,7 +1968,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
           id,
           name: config.name,
           description: config.description,
-          model: mainOverride ?? config.model ?? 'claude-opus-4-6',
+          model: mainOverride ?? config.model ?? 'claude-opus-4-7',
           running,
           todayTurns: stats.todayTurns,
           todayCost: stats.todayCost,
@@ -1945,7 +1993,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     }
     const mainStats = getAgentTokenStats('main');
     const allAgents = [
-      { id: 'main', name: 'Main', description: 'Primary ClaudeClaw bot', model: getMainModelOverride() ?? 'claude-opus-4-6', running: mainRunning, todayTurns: mainStats.todayTurns, todayCost: mainStats.todayCost, avatar_etag: avatarEtagForId('main') },
+      { id: 'main', name: 'Main', description: 'Primary ClaudeClaw bot', model: getMainModelOverride() ?? 'claude-opus-4-7', running: mainRunning, todayTurns: mainStats.todayTurns, todayCost: mainStats.todayCost, avatar_etag: avatarEtagForId('main') },
       ...agents,
     ];
 
@@ -1985,7 +2033,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const model = body?.model?.trim();
     if (!model) return c.json({ error: 'model required' }, 400);
 
-    const validModels = ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
+    const validModels = ['claude-opus-4-7', 'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
     if (!validModels.includes(model)) return c.json({ error: `Invalid model` }, 400);
 
     const agentIds = listAgentIds();
@@ -2010,7 +2058,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const model = body?.model?.trim();
     if (!model) return c.json({ error: 'model required' }, 400);
 
-    const validModels = ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
+    const validModels = ['claude-opus-4-7', 'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
     if (!validModels.includes(model)) return c.json({ error: `Invalid model. Valid: ${validModels.join(', ')}` }, 400);
 
     try {
@@ -2578,12 +2626,154 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   // Restart an agent (kill + relaunch service)
   app.post('/api/agents/:id/restart', (c) => {
     const agentId = c.req.param('id');
-    if (agentId === 'main') return c.json({ error: 'Cannot restart main via this endpoint. Restart the main process manually.' }, 400);
+
+    // Main bot: we are inside the main process. We can't restart ourselves
+    // synchronously because we'd kill the HTTP response. Detach a shell
+    // that waits a moment, then issues the systemctl restart. systemd
+    // brings the process back up on its own.
+    if (agentId === 'main') {
+      try {
+        const isLinux = process.platform === 'linux';
+        const isMac = process.platform === 'darwin';
+        if (!isLinux && !isMac) {
+          return c.json({ error: 'Main restart only supported on Linux/macOS with a system service' }, 400);
+        }
+
+        const force = c.req.query('force') === 'true';
+        const { processing } = getIsProcessing();
+        if (processing && !force) {
+          return c.json({
+            error: 'busy',
+            reason: 'agent_in_flight',
+            message: 'An agent task is in progress. Abort it (/api/chat/abort) or wait, then retry. Pass ?force=true to override.',
+          }, 409);
+        }
+
+        // Phase 8 telemetry (2026-05-21): record every accepted main restart so we
+        // can answer "how many times did we restart, and was something in flight?"
+        try {
+          insertAuditLog(
+            'main',
+            '',
+            'service_restart',
+            JSON.stringify({ forced: force, busy_at_request: processing }),
+            false,
+          );
+        } catch (auditErr) {
+          logger.warn({ err: auditErr }, 'Failed to insert service_restart audit row');
+        }
+
+        if (ALLOWED_CHAT_ID) {
+          emitChatEvent({
+            type: 'assistant_message',
+            chatId: ALLOWED_CHAT_ID,
+            agentId: 'main',
+            content: 'Restarting the service now. Any in-flight task did not finish. Re-send your last message after I come back (~3s).',
+            source: 'dashboard',
+          });
+        }
+
+        const cmd = isLinux
+          ? 'sleep 0.6 && systemctl --user restart com.claudeclaw.main.service'
+          : `sleep 0.6 && launchctl kickstart -k gui/$(id -u)/com.claudeclaw.main`;
+        const child = spawn('bash', ['-c', cmd], {
+          detached: true,
+          stdio: 'ignore',
+        });
+        child.unref();
+        return c.json({ ok: true, message: 'Main bot restarting in ~1s. Dashboard will briefly disconnect.' });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return c.json({ error: `Failed to schedule main restart: ${msg}` }, 500);
+      }
+    }
+
     const result = restartAgent(agentId);
     if (result.ok) {
       return c.json({ ok: true, message: `Agent ${agentId} restarted` });
     }
     return c.json({ error: result.error }, 500);
+  });
+
+  // Live logs (SSE stream from journalctl/log file)
+  app.get('/api/agents/:id/logs', (c) => {
+    const agentId = c.req.param('id');
+    // Strict allowlist on agent ID to avoid shell injection through the URL.
+    if (!/^[a-z0-9_-]{1,40}$/.test(agentId)) {
+      return c.json({ error: 'Invalid agent id' }, 400);
+    }
+
+    const isLinux = process.platform === 'linux';
+    const isMac = process.platform === 'darwin';
+    const serviceName = agentId === 'main'
+      ? 'com.claudeclaw.main.service'
+      : `com.claudeclaw.agent-${agentId}.service`;
+
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          const enc = new TextEncoder();
+          const send = (line: string) => {
+            try { controller.enqueue(enc.encode(`data: ${line.replace(/\n/g, '\\n')}\n\n`)); } catch { /* closed */ }
+          };
+
+          let child: ReturnType<typeof spawn> | null = null;
+          if (isLinux) {
+            // -n 200 prints the last 200 lines, -f follows new output.
+            // --no-pager avoids any TTY paging weirdness.
+            child = spawn('journalctl', ['--user', '-u', serviceName, '-n', '200', '-f', '--no-pager', '--output=short-iso'], { stdio: ['ignore', 'pipe', 'pipe'] });
+          } else if (isMac) {
+            // launchd writes stdout/stderr to files defined by the plist;
+            // fall back to tailing a known path. Best-effort.
+            const logPath = path.join(STORE_DIR, `agent-${agentId}.log`);
+            child = spawn('tail', ['-n', '200', '-f', logPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+          } else {
+            send(`[unsupported platform: ${process.platform}]`);
+            controller.close();
+            return;
+          }
+
+          let stdoutBuf = '';
+          let stderrBuf = '';
+          child.stdout?.on('data', (chunk: Buffer) => {
+            stdoutBuf += chunk.toString();
+            let idx;
+            while ((idx = stdoutBuf.indexOf('\n')) !== -1) {
+              send(stdoutBuf.slice(0, idx));
+              stdoutBuf = stdoutBuf.slice(idx + 1);
+            }
+          });
+          child.stderr?.on('data', (chunk: Buffer) => {
+            stderrBuf += chunk.toString();
+            let idx;
+            while ((idx = stderrBuf.indexOf('\n')) !== -1) {
+              send('[stderr] ' + stderrBuf.slice(0, idx));
+              stderrBuf = stderrBuf.slice(idx + 1);
+            }
+          });
+          child.on('error', (e) => send(`[spawn error] ${e.message}`));
+          child.on('close', () => { try { controller.close(); } catch { /* ok */ } });
+
+          // Heartbeat every 25s so proxies don't kill the stream.
+          const hb = setInterval(() => {
+            try { controller.enqueue(enc.encode(`: heartbeat\n\n`)); } catch { /* closed */ }
+          }, 25_000);
+
+          c.req.raw.signal.addEventListener('abort', () => {
+            clearInterval(hb);
+            try { child?.kill('SIGTERM'); } catch { /* ok */ }
+          });
+        },
+      }),
+      {
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache, no-transform',
+          'Connection': 'keep-alive',
+          'X-Accel-Buffering': 'no',
+        },
+      },
+    );
   });
 
   // Delete an agent entirely
@@ -2601,6 +2791,512 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   app.get('/api/agents/:id/status', (c) => {
     const agentId = c.req.param('id');
     return c.json({ running: isAgentRunning(agentId) });
+  });
+
+  // Rich runtime details — uptime, restarts, last error, last activity.
+  // Reads systemd state (Linux) or launchd state (macOS) plus the DB
+  // for last conversation time. Best-effort — returns null fields when
+  // a source is unavailable rather than failing the whole request.
+  app.get('/api/agents/:id/details', async (c) => {
+    const agentId = c.req.param('id');
+    if (!/^[a-z0-9_-]{1,40}$/.test(agentId)) {
+      return c.json({ error: 'Invalid agent id' }, 400);
+    }
+    const serviceName = agentId === 'main'
+      ? 'com.claudeclaw.main.service'
+      : `com.claudeclaw.agent-${agentId}.service`;
+
+    type Details = {
+      running: boolean;
+      activeState: string | null;
+      subState: string | null;
+      uptimeSec: number | null;
+      restartCount: number | null;
+      mainPid: number | null;
+      memBytes: number | null;
+      lastActivityAt: number | null;
+      lastError: string | null;
+    };
+    const out: Details = {
+      running: isAgentRunning(agentId),
+      activeState: null,
+      subState: null,
+      uptimeSec: null,
+      restartCount: null,
+      mainPid: null,
+      memBytes: null,
+      lastActivityAt: null,
+      lastError: null,
+    };
+
+    // systemd show — single shot, no streaming.
+    if (process.platform === 'linux') {
+      await new Promise<void>((resolve) => {
+        const proc = spawn('systemctl', ['--user', 'show', serviceName, '--no-page',
+          '--property=ActiveState,SubState,ActiveEnterTimestampMonotonic,NRestarts,MainPID,MemoryCurrent,ExecMainStartTimestamp']);
+        let buf = '';
+        proc.stdout.on('data', (chunk: Buffer) => { buf += chunk.toString(); });
+        proc.on('close', () => {
+          const kv: Record<string, string> = {};
+          for (const line of buf.split('\n')) {
+            const eq = line.indexOf('=');
+            if (eq > 0) kv[line.slice(0, eq)] = line.slice(eq + 1);
+          }
+          out.activeState = kv['ActiveState'] || null;
+          out.subState = kv['SubState'] || null;
+          out.restartCount = kv['NRestarts'] ? parseInt(kv['NRestarts'], 10) : null;
+          out.mainPid = kv['MainPID'] && kv['MainPID'] !== '0' ? parseInt(kv['MainPID'], 10) : null;
+          out.memBytes = kv['MemoryCurrent'] && kv['MemoryCurrent'] !== '[not set]' ? parseInt(kv['MemoryCurrent'], 10) : null;
+          if (kv['ExecMainStartTimestamp']) {
+            const startMs = Date.parse(kv['ExecMainStartTimestamp']);
+            if (!isNaN(startMs)) out.uptimeSec = Math.floor((Date.now() - startMs) / 1000);
+          }
+          resolve();
+        });
+        proc.on('error', () => resolve());
+      });
+
+      // Pull the most recent error/warning line from the journal.
+      await new Promise<void>((resolve) => {
+        const proc = spawn('journalctl', ['--user', '-u', serviceName, '-p', 'err', '-n', '1', '--no-pager', '-o', 'short-iso']);
+        let buf = '';
+        proc.stdout.on('data', (chunk: Buffer) => { buf += chunk.toString(); });
+        proc.on('close', () => {
+          const lines = buf.split('\n').filter((l) => l && !l.startsWith('--'));
+          if (lines.length > 0) out.lastError = lines[lines.length - 1];
+          resolve();
+        });
+        proc.on('error', () => resolve());
+        // Don't hang forever waiting for the journal.
+        setTimeout(() => { try { proc.kill(); } catch {} resolve(); }, 1500);
+      });
+    }
+
+    // Last conversation activity from the DB.
+    try {
+      const chatIdForLookup = ALLOWED_CHAT_ID || '';
+      const turns = getAgentRecentConversation(agentId, chatIdForLookup, 1);
+      if (turns.length > 0 && turns[0].created_at) {
+        out.lastActivityAt = turns[0].created_at;
+      }
+    } catch { /* db may be empty */ }
+
+    return c.json(out);
+  });
+
+  // ── Local models (Ollama) ──────────────────────────────────────
+  //
+  // Read-mostly endpoints proxy directly to the Ollama HTTP API. Pull is
+  // SSE-streamed so the browser sees download progress in real time. All
+  // model names are validated against a strict regex before being sent
+  // to Ollama to prevent any chance of command-injection through the
+  // model field.
+
+  // Ollama tag regex: namespace/name:tag — chars allowed are alnum, dash,
+  // underscore, dot, slash, colon. Length capped to keep things sane.
+  const OLLAMA_TAG_RE = /^[A-Za-z0-9._:/-]{1,160}$/;
+
+  app.get('/api/ollama/health', async (c) => {
+    const h = await ollamaHealth();
+    return c.json(h);
+  });
+
+  app.post('/api/ollama/refresh-host', (c) => {
+    clearOllamaHostCache();
+    return c.json({ ok: true, baseUrl: resolveOllamaBaseUrl() });
+  });
+
+  app.get('/api/ollama/models', async (c) => {
+    try {
+      const [models, running] = await Promise.all([
+        ollamaListModels(),
+        ollamaRunningModels().catch(() => []),
+      ]);
+      const runningByModel = new Map(running.map((r) => [r.model, r]));
+      // Augment each model with whether it is currently loaded into VRAM
+      // and the offload split. Saves the frontend a second round trip.
+      const augmented = models.map((m) => {
+        const r = runningByModel.get(m.model);
+        return {
+          ...m,
+          loaded: !!r,
+          vramBytes: r?.size_vram ?? null,
+          totalLoadedBytes: r?.size ?? null,
+          expiresAt: r?.expires_at ?? null,
+        };
+      });
+      return c.json({ models: augmented, baseUrl: resolveOllamaBaseUrl() });
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : String(err) }, 502);
+    }
+  });
+
+  app.get('/api/ollama/models/:name{.+}', async (c) => {
+    const name = c.req.param('name');
+    if (!OLLAMA_TAG_RE.test(name)) return c.json({ error: 'invalid model name' }, 400);
+    try {
+      const info = await ollamaShowModel(name);
+      return c.json(info);
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : String(err) }, 502);
+    }
+  });
+
+  app.delete('/api/ollama/models/:name{.+}', async (c) => {
+    const name = c.req.param('name');
+    if (!OLLAMA_TAG_RE.test(name)) return c.json({ error: 'invalid model name' }, 400);
+    try {
+      await ollamaDeleteModel(name);
+      return c.json({ ok: true });
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : String(err) }, 502);
+    }
+  });
+
+  // Pull a model with live progress over SSE. The browser opens this via
+  // EventSource and the connection stays open until the pull completes,
+  // fails, or the client disconnects (which aborts the pull).
+  app.get('/api/ollama/pull', (c) => {
+    const name = c.req.query('name') || '';
+    if (!OLLAMA_TAG_RE.test(name)) return c.json({ error: 'invalid model name' }, 400);
+    return streamSSE(c, async (stream) => {
+      const ctrl = new AbortController();
+      let aborted = false;
+      stream.onAbort(() => { aborted = true; ctrl.abort(); });
+      try {
+        await stream.writeSSE({ event: 'start', data: JSON.stringify({ name }) });
+        await ollamaPullModel(name, async (ev) => {
+          if (aborted) return;
+          // Forward progress as-is. Frontend computes percentage.
+          await stream.writeSSE({ data: JSON.stringify(ev) });
+        }, ctrl.signal);
+        if (!aborted) {
+          await stream.writeSSE({ event: 'done', data: JSON.stringify({ name }) });
+        }
+      } catch (err) {
+        if (!aborted) {
+          await stream.writeSSE({
+            event: 'error',
+            data: JSON.stringify({ error: err instanceof Error ? err.message : String(err) }),
+          });
+        }
+      }
+    });
+  });
+
+  // Curated catalog of recommended abliterated / uncensored models. Served
+  // statically — the user can pull any of these with one click. Reviewed
+  // and tuned for the user's hardware (16GB VRAM, 64GB DDR5).
+  app.get('/api/ollama/catalog', (c) => {
+    return c.json({
+      categories: [
+        {
+          id: 'fits-vram',
+          label: 'Fits fully in 16GB VRAM',
+          models: [
+            {
+              tag: 'huihui_ai/glm-4.7-flash-abliterated:q4_K_S',
+              displayName: 'GLM-4.7 Flash abliterated',
+              sizeGB: 17,
+              params: '30B-A3B MoE',
+              context: 198000,
+              capabilities: ['chat', 'tools', 'thinking'],
+              notes: 'Consensus top pick under 32B as of May 2026. 198K context, tools + thinking. Q4_K_S fits in 16GB with tight headroom.',
+              source: 'https://ollama.com/huihui_ai/glm-4.7-flash-abliterated',
+            },
+            {
+              tag: 'aqualaguna/gemma-3-27b-it-abliterated-GGUF:q4_k_m',
+              displayName: 'Gemma 3 27B abliterated (mlabonne)',
+              sizeGB: 17,
+              params: '27B',
+              context: 8192,
+              capabilities: ['chat'],
+              notes: 'mlabonne recipe on Gemma 3 27B. Different lineage than huihui — keeps Gemma 3 writing style. Q4_K_M is tight on 16GB; Q3_K_M (~13GB) fits cleanly.',
+              source: 'https://huggingface.co/mlabonne/gemma-3-27b-it-abliterated',
+            },
+            {
+              tag: 'hf.co/bartowski/p-e-w_gpt-oss-20b-heretic-GGUF:Q5_K_M',
+              displayName: 'gpt-oss 20B Heretic (p-e-w)',
+              sizeGB: 14,
+              params: '20B',
+              context: 32768,
+              capabilities: ['chat'],
+              notes: 'Heretic v1.2.0 abliteration on gpt-oss-20b. Reddit consensus: less lobotomized than first-gen abliteration on this base.',
+              source: 'https://huggingface.co/bartowski/p-e-w_gpt-oss-20b-heretic-GGUF',
+            },
+            {
+              tag: 'hf.co/bartowski/TheDrummer_Cydonia-24B-v4.1-GGUF:Q4_K_M',
+              displayName: 'Cydonia 24B v4.1 (TheDrummer)',
+              sizeGB: 15,
+              params: '24B',
+              context: 131072,
+              capabilities: ['chat', 'creative-writing'],
+              notes: 'Uncensored creative-writing finetune on Mistral Small 3.2 24B. Best-in-class for fiction/RP at this size.',
+              source: 'https://openrouter.ai/thedrummer/cydonia-24b-v4.1',
+            },
+          ],
+        },
+        {
+          id: 'partial-offload',
+          label: 'Partial GPU offload (slower but viable on 64GB RAM)',
+          models: [
+            {
+              tag: 'huihui_ai/qwen3-vl-abliterated:30b',
+              displayName: 'Qwen3-VL 30B abliterated',
+              sizeGB: 20,
+              params: '30B',
+              context: 256000,
+              capabilities: ['chat', 'vision'],
+              notes: 'Major upgrade from your :8b vision model. ~4GB offload at Q4. 256K context.',
+              source: 'https://ollama.com/huihui_ai/qwen3-vl-abliterated',
+            },
+            {
+              tag: 'huihui_ai/qwen3-abliterated:32b',
+              displayName: 'Qwen3 32B abliterated (dense)',
+              sizeGB: 19,
+              params: '32B',
+              context: 32768,
+              capabilities: ['chat', 'reasoning'],
+              notes: 'Dense 32B counterpart to your Qwen3.6 MoE. Slight offload at Q4_K_M; Q3_K_M (~15GB) fits cleanly.',
+              source: 'https://huggingface.co/huihui-ai/Qwen3-32B-abliterated',
+            },
+            {
+              tag: 'hf.co/bartowski/TheDrummer_Skyfall-36B-v2-GGUF:Q4_K_M',
+              displayName: 'Skyfall 36B v2 (TheDrummer)',
+              sizeGB: 21,
+              params: '36B',
+              context: 32768,
+              capabilities: ['chat', 'creative-writing'],
+              notes: 'Mistral Small 2501 enhanced for nuanced writing and roleplay. ~5GB offload, expect 15-25 tok/s.',
+              source: 'https://openrouter.ai/thedrummer',
+            },
+            {
+              tag: 'hf.co/bartowski/TheDrummer_Valkyrie-49B-v1-GGUF:Q4_K_M',
+              displayName: 'Valkyrie 49B v1 (TheDrummer)',
+              sizeGB: 28,
+              params: '49B',
+              context: 131072,
+              capabilities: ['chat', 'creative-writing'],
+              notes: 'Llama 3.3 Nemotron Super 49B base. Heavy offload, expect 8-15 tok/s.',
+              source: 'https://openrouter.ai/thedrummer',
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  // ── Local model CHAT (SSE-streamed, hivemind-aware) ────────────
+  //
+  // Lets the user converse directly with a local model. Every turn:
+  //   1. Reads recent conversation for the local-chat agent (per chat_id).
+  //   2. Builds a memory context from the SHARED hivemind (all agents) so
+  //      the local model sees the same facts Jarvis sees.
+  //   3. Streams the response back over SSE.
+  //   4. Persists both the user message and the assistant reply into
+  //      conversation_log under agent_id = `local:<sanitized-model>`,
+  //      which feeds back into the same memory store for future turns.
+  //   5. Records a hive_mind action so the memory extractor and other
+  //      agents can observe the interaction.
+
+  // Conversation history for the local-chat session of a given model.
+  app.get('/api/ollama/chat/history', (c) => {
+    const model = c.req.query('model') || '';
+    if (!OLLAMA_TAG_RE.test(model)) return c.json({ error: 'invalid model' }, 400);
+    const chatIdQ = c.req.query('chatId') || ALLOWED_CHAT_ID || '';
+    const agentNs = `local:${model.replace(/[^A-Za-z0-9._:-]/g, '_')}`;
+    const turns = getRecentConversation(chatIdQ, 50, agentNs);
+    // Returned newest-first by the DB; reverse to chronological for the UI.
+    return c.json({ turns: turns.slice().reverse() });
+  });
+
+  // SSE chat stream. Open with EventSource; one stream per turn.
+  // Query params: model, chatId (optional), message.
+  app.get('/api/ollama/chat', (c) => {
+    const model = c.req.query('model') || '';
+    const message = c.req.query('message') || '';
+    const chatIdQ = c.req.query('chatId') || ALLOWED_CHAT_ID || '';
+    if (!OLLAMA_TAG_RE.test(model)) return c.json({ error: 'invalid model' }, 400);
+    if (!message.trim() || message.length > 16000) {
+      return c.json({ error: 'invalid message' }, 400);
+    }
+    const agentNs = `local:${model.replace(/[^A-Za-z0-9._:-]/g, '_')}`;
+
+    return streamSSE(c, async (stream) => {
+      const ctrl = new AbortController();
+      let aborted = false;
+      stream.onAbort(() => { aborted = true; ctrl.abort(); });
+
+      try {
+        // ── Step 1: persist the user turn first so it shows up in
+        // history even if the model errors mid-stream.
+        logConversationTurn(chatIdQ, 'user', message, undefined, agentNs);
+
+        // ── Step 2: build the shared hivemind memory context. No
+        // strictAgentId means memories from ALL agents are eligible —
+        // exactly what "shared hivemind" means for the user.
+        let memoryContext = '';
+        try {
+          const built = await buildMemoryContext(chatIdQ, message, agentNs);
+          memoryContext = built.contextText || '';
+        } catch (err) {
+          // Memory failure is non-fatal — local chat keeps working.
+          memoryContext = '';
+        }
+
+        // ── Step 3: pull recent local-chat history for this model so
+        // multi-turn context works.
+        const recentTurns = getRecentConversation(chatIdQ, 12, agentNs)
+          .slice()
+          .reverse() // chronological
+          // Drop the user turn we just inserted; we'll add it as the
+          // final message after the system prompt.
+          .filter((t, i, arr) => !(i === arr.length - 1 && t.role === 'user' && t.content === message));
+
+        const systemPrompt = [
+          'You are a local LLM running on the user\'s personal machine via Ollama.',
+          'You share the same memory store ("hivemind") as the user\'s primary',
+          'assistant Jarvis and all other agents. Treat the memory context below',
+          'as authoritative facts about the user. Keep replies tight and direct;',
+          'no AI clichés ("Certainly!", "I\'d be happy to"), no em dashes.',
+          memoryContext ? `\n${memoryContext}` : '',
+        ].join('\n').trim();
+
+        const messages: ChatMessage[] = [
+          { role: 'system', content: systemPrompt },
+          ...recentTurns.map((t) => ({
+            role: t.role as 'user' | 'assistant',
+            content: t.content,
+          })),
+          { role: 'user', content: message },
+        ];
+
+        await stream.writeSSE({ event: 'start', data: JSON.stringify({ model }) });
+
+        // ── Step 4: stream the response. Accumulate to log on success.
+        let assistantText = '';
+        let evalCount = 0;
+        let totalDurationNs = 0;
+        await ollamaChat(model, messages, async (ev) => {
+          if (aborted) return;
+          if (ev.delta) {
+            assistantText += ev.delta;
+            await stream.writeSSE({ data: JSON.stringify({ delta: ev.delta }) });
+          }
+          if (ev.done) {
+            evalCount = ev.evalCount || 0;
+            totalDurationNs = ev.totalDurationNs || 0;
+          }
+        }, { num_ctx: 8192 }, ctrl.signal);
+
+        if (!aborted && assistantText.trim()) {
+          logConversationTurn(chatIdQ, 'assistant', assistantText, undefined, agentNs);
+          // Surface in hive_mind so the global activity feed and memory
+          // extractor see it.
+          try {
+            logToHiveMind(
+              agentNs,
+              chatIdQ,
+              'local-chat',
+              assistantText.slice(0, 200),
+              JSON.stringify({ model, evalCount, durationMs: Math.round(totalDurationNs / 1e6) }),
+            );
+          } catch { /* hivemind insert is best-effort */ }
+
+          await stream.writeSSE({
+            event: 'done',
+            data: JSON.stringify({ evalCount, durationMs: Math.round(totalDurationNs / 1e6) }),
+          });
+        }
+      } catch (err) {
+        if (!aborted) {
+          await stream.writeSSE({
+            event: 'error',
+            data: JSON.stringify({ error: err instanceof Error ? err.message : String(err) }),
+          });
+        }
+      }
+    });
+  });
+
+  // ── Specialist roster + dispatch ──────────────────────────────────
+  // The 8 callsigns (Scribe, Coder, Eye, Sleuth, Reaper, Archivist,
+  // Sentinel, Cipher) plus a sync delegate endpoint and a routing hint.
+  // Mission Control panel and Jarvis tool calls both hit these.
+
+  // List the full roster annotated with current model availability.
+  // Used by the /specialists dashboard panel.
+  app.get('/api/specialists', async (c) => {
+    const annotated = await Promise.all(
+      ALL_CALLSIGNS.map(async (cs) => {
+        const spec = SPECIALISTS[cs];
+        const resolved = await resolveSpecialistModel(cs).catch(() => null);
+        return {
+          callsign: spec.callsign,
+          tier: spec.tier,
+          role: spec.role,
+          preferredModel: spec.preferredModel,
+          fallbackModels: spec.fallbackModels,
+          fallbackCallsign: spec.fallbackCallsign || null,
+          capabilities: spec.capabilities,
+          vramHintGB: spec.vramHintGB,
+          temperature: spec.temperature,
+          contextTokens: spec.defaultContextTokens,
+          // Cloud specialists are always "available" — auth lives at call
+          // time. Local specialists need a resolved Ollama model.
+          available: spec.tier === 'cloud' ? true : !!resolved,
+          modelInUse: spec.tier === 'cloud' ? spec.preferredModel : (resolved?.model || null),
+          fellBackFrom: resolved?.fellBackFrom || null,
+        };
+      }),
+    );
+    return c.json({ specialists: annotated });
+  });
+
+  // Suggest a route for a task. Returns 'self' (Jarvis handles) or a
+  // callsign. Keyword heuristic; Jarvis has final say.
+  app.get('/api/specialists/route', (c) => {
+    const task = c.req.query('task') || '';
+    if (!task.trim() || task.length > 4000) {
+      return c.json({ error: 'invalid task' }, 400);
+    }
+    return c.json({ suggestion: suggestRoute(task) });
+  });
+
+  // Synchronous delegation. Blocks until the specialist finishes and
+  // returns the full output. For long tasks, the caller should stream
+  // via /api/ollama/chat directly with the chosen model.
+  app.post('/api/specialists/delegate', async (c) => {
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    const callsign = String(body?.callsign || '').toLowerCase() as SpecialistCallsign;
+    const task = String(body?.task || '');
+    if (!ALL_CALLSIGNS.includes(callsign)) return c.json({ error: 'unknown callsign' }, 400);
+    if (!task.trim() || task.length > 16000) return c.json({ error: 'invalid task' }, 400);
+    try {
+      const result = await delegateToSpecialist(callsign, task, {
+        chatId: body?.chatId || undefined,
+        shareMemory: body?.shareMemory !== false,
+        maxTokens: typeof body?.maxTokens === 'number' ? body.maxTokens : undefined,
+        systemAddendum: typeof body?.systemAddendum === 'string' ? body.systemAddendum : undefined,
+      });
+      return c.json(result);
+    } catch (err) {
+      return c.json(
+        { error: err instanceof Error ? err.message : String(err) },
+        500,
+      );
+    }
+  });
+
+  // Recent task history per specialist, drawn from conversation_log
+  // under agent_id `specialist:<callsign>`.
+  app.get('/api/specialists/:callsign/history', (c) => {
+    const callsign = c.req.param('callsign').toLowerCase() as SpecialistCallsign;
+    if (!ALL_CALLSIGNS.includes(callsign)) return c.json({ error: 'unknown callsign' }, 400);
+    const chatIdQ = c.req.query('chatId') || ALLOWED_CHAT_ID || '';
+    const turns = getRecentConversation(chatIdQ, 30, `specialist:${callsign}`);
+    return c.json({ callsign, turns: turns.slice().reverse() });
   });
 
   // Unified avatar resolver, used by Mission Control, both War Room
@@ -2958,16 +3654,63 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const message = body?.message?.trim();
     if (!message) return c.json({ error: 'message required' }, 400);
 
-    // Reject if a turn is already in flight. Without this guard, rapid
-    // clicks (or a scripted token holder) can stack N agent invocations,
-    // each consuming context and Anthropic budget.
-    if (getIsProcessing().processing) {
-      return c.json({ error: 'busy', reason: 'already_processing' }, 429);
+    // No more 429 busy-reject: send goes onto the per-chat FIFO queue,
+    // which already serializes Telegram + dashboard + scheduler turns.
+    // The user can stack N tasks; each runs in order. Returned `queued`
+    // is the queue depth AFTER this enqueue so the UI can show
+    // "Queued behind N tasks". Was 429 — changed 2026-05-23 so the UI
+    // can pile up follow-up tasks without each one being rejected.
+    const chatIdStr = ALLOWED_CHAT_ID || '';
+    const queuedBefore = chatIdStr ? messageQueue.queuedFor(chatIdStr) : 0;
+
+    // Fire-and-forget: the response stream comes via SSE. enqueue itself
+    // is sync; the actual agent run happens behind the queue.
+    void processMessageFromDashboard(botApi, message);
+
+    return c.json({ ok: true, queued: queuedBefore + 1 });
+  });
+
+  // Unified notify endpoint. Mid-task status pings from scripts (notify.sh)
+  // need to land in three places at once: Telegram (so the user sees it on
+  // their phone), conversation_log (so the dashboard /chat history keeps a
+  // record), and the SSE chat event bus (so the dashboard updates live
+  // without a refresh). Previously notify.sh hit the Telegram API
+  // directly, which meant the message bypassed the dashboard entirely.
+  app.post('/api/notify', async (c) => {
+    const body = await c.req.json<{ message?: string; agentId?: string }>().catch(() => ({} as { message?: string; agentId?: string }));
+    const message = (body?.message || '').trim();
+    const agentId = body?.agentId || 'main';
+    if (!message) return c.json({ error: 'message required' }, 400);
+    const chatId = ALLOWED_CHAT_ID || '';
+    if (!chatId) return c.json({ error: 'ALLOWED_CHAT_ID not configured' }, 500);
+
+    // 1. Persist so the dashboard history shows it on next page load.
+    try {
+      logConversationTurn(chatId, 'assistant', message, undefined, agentId);
+    } catch { /* best-effort */ }
+
+    // 2. Broadcast to any open SSE listeners so dashboards update live.
+    try {
+      emitChatEvent({
+        type: 'assistant_message',
+        chatId,
+        agentId,
+        content: message,
+        source: 'telegram',
+      });
+    } catch { /* best-effort */ }
+
+    // 3. Push to Telegram. Bot API may be unavailable during startup or
+    //    if the network drops; that's not fatal for the dashboard mirror.
+    let telegramOk = false;
+    if (botApi) {
+      try {
+        await botApi.sendMessage(chatId, message);
+        telegramOk = true;
+      } catch { /* swallow */ }
     }
 
-    // Fire-and-forget: response comes via SSE
-    void processMessageFromDashboard(botApi, message);
-    return c.json({ ok: true });
+    return c.json({ ok: true, telegram: telegramOk });
   });
 
   // Abort current processing
@@ -2993,8 +3736,18 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     if (!fs.existsSync(newDashboardIndex)) {
       return c.text('Dashboard not built. Run `npm run build`.', 503);
     }
+    // No-cache on the SPA shell: hashed assets are immutable, so if
+    // the shell itself is cached the browser pins the old bundle hash
+    // and never picks up new builds. See `/` handler above for the bug.
     const html = fs.readFileSync(newDashboardIndex, 'utf-8');
-    return c.html(html);
+    return new Response(html, {
+      headers: {
+        'Content-Type': 'text/html; charset=UTF-8',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+      },
+    });
   });
 
   return app;
