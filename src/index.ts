@@ -12,6 +12,7 @@ import { logger } from './logger.js';
 import { cleanupOldUploads } from './media.js';
 import { runConsolidation } from './memory-consolidate.js';
 import { runDecaySweep } from './memory.js';
+import { recoverOrphanMessages } from './recovery.js';
 import { runWarroomAvatarMigration } from './avatars.js';
 import { initOAuthHealthCheck } from './oauth-health.js';
 import { initOrchestrator } from './orchestrator.js';
@@ -160,8 +161,12 @@ async function main(): Promise<void> {
     // the new resolver serves it as the mutable source-of-truth.
     runWarroomAvatarMigration();
 
-    // Memory consolidation: find patterns across recent memories every 30 minutes
-    if (ALLOWED_CHAT_ID && GOOGLE_API_KEY) {
+    // Memory consolidation: find patterns across recent memories every 30 minutes.
+    // Phase 5 (2026-05-21): consolidation switched from Gemini to Haiku 4.5 via
+    // claude-agent-sdk, so GOOGLE_API_KEY is no longer required to gate it.
+    // Embeddings for consolidations still call Gemini, but a missing key only
+    // skips embedding (the summary + insight still save).
+    if (ALLOWED_CHAT_ID) {
       // Delay first consolidation 2 minutes after startup to let things settle
       setTimeout(() => {
         void runConsolidation(ALLOWED_CHAT_ID).catch((err) =>
@@ -173,7 +178,7 @@ async function main(): Promise<void> {
           logger.error({ err }, 'Periodic consolidation failed'),
         );
       }, 30 * 60 * 1000);
-      logger.info('Memory consolidation enabled (every 30 min)');
+      logger.info('Memory consolidation enabled (every 30 min, model: claude-sonnet-4-6)');
     }
   } else {
     logger.info({ agentId: AGENT_ID }, 'Skipping decay/consolidation (main process owns these)');
@@ -186,6 +191,14 @@ async function main(): Promise<void> {
   // Dashboard only runs in the main bot process
   if (AGENT_ID === 'main') {
     startDashboard(bot.api);
+
+    // Phase 3 (2026-05-21): notify on boot about messages clobbered by a
+    // mid-task SIGTERM that never made it into conversation_log. Wrapped in
+    // a 10s race so a stuck recovery never blocks the rest of startup.
+    void Promise.race([
+      recoverOrphanMessages(bot.api),
+      new Promise<void>((resolve) => setTimeout(resolve, 10_000)),
+    ]).catch((err) => logger.error({ err }, 'Orphan recovery failed (non-blocking)'));
 
     // War Room voice server (auto-start if enabled, with auto-respawn)
     if (WARROOM_ENABLED) {

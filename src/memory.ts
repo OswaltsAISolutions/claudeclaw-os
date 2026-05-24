@@ -76,14 +76,14 @@ export async function buildMemoryContext(
   const summaryMap = new Map<number, string>();
   const memLines: string[] = [];
 
-  // Embed the query for vector search (async, adds ~200ms but gives semantic results)
+  // Embed the query for vector search (async, adds ~200ms but gives semantic results).
+  // 2026-05-23: removed the stale GOOGLE_API_KEY gate. embedText() runs on local
+  // bge-m3 (Ollama) now — no Google auth needed. Always try; non-fatal on failure.
   let queryEmbedding: number[] | undefined;
-  if (GOOGLE_API_KEY) {
-    try {
-      queryEmbedding = await embedText(userMessage);
-    } catch {
-      // Embedding failure is non-fatal; falls back to keyword search
-    }
+  try {
+    queryEmbedding = await embedText(userMessage);
+  } catch {
+    // Embedding failure is non-fatal; falls back to keyword search
   }
 
   // Layer 1: semantic search (embedding) with FTS5/LIKE fallback
@@ -208,7 +208,35 @@ export async function buildMemoryContext(
   // for matching exchanges. This gives the agent access to the full context that
   // memory extraction may have compressed into a single sentence.
   if (includeRecallHistory) {
-    const recallKeywords = /\bremember\b|\brecall\b|\byesterday\b|\blast time\b|\bwe talked\b|\bwe discussed\b|\bwhat do you know\b|\bdo you know\b|\bwhat did we\b|\bpreviously\b|\bearlier\b|\blast week\b|\bfew days\b/i;
+    // 2026-05-23: expanded keyword set. Old set only matched memory-recall phrasings
+    // ("remember", "yesterday"); missed activity-summary phrasings like "shipped",
+    // "today's wins", "what we did", "last 24 hours", "tldr". These activity
+    // questions are exactly when Jarvis needs the conversation_log most — after a
+    // /newchat his session is empty and he has nothing to draw from without this.
+    const recallKeywords = new RegExp(
+      [
+        // Original memory-recall phrasings
+        '\\bremember\\b', '\\brecall\\b', '\\byesterday\\b', '\\blast time\\b',
+        '\\bwe talked\\b', '\\bwe discussed\\b', '\\bwhat do you know\\b',
+        '\\bdo you know\\b', '\\bpreviously\\b', '\\bearlier\\b',
+        '\\blast week\\b', '\\bfew days\\b',
+        // Activity-summary phrasings
+        '\\bshipped\\b', '\\bshipping\\b',
+        "\\btoday'?s?\\b.*\\b(wins?|activity|work|progress|recap|summary)\\b",
+        '\\bwhat we (did|have|worked|built|shipped|discussed|talked|made)\\b',
+        '\\bwhat (did|have|are|were) we\\b',
+        '\\bwhat\'?s been (shipped|done|happening|going|new|built)\\b',
+        '\\bsummarize (today|the day|recent|the last)\\b',
+        '\\brecap\\b', '\\bwhat happened\\b', '\\btldr\\b', '\\btl;?dr\\b',
+        '\\blast \\d+ (hour|day|week|month)s?\\b',
+        '\\blast (few|several) (hour|day|week|month)s?\\b',
+        '\\bin the last (hour|day|week|month|24|48|72)\\b',
+        '\\bprogress (update|report|so far)\\b',
+        '\\bstatus (update|report|check)\\b',
+        '\\bwhere are we\\b', '\\bwhere we (left|stand)\\b',
+      ].join('|'),
+      'i',
+    );
     if (recallKeywords.test(userMessage)) {
       const historyTurns = searchConversationHistory(chatId, userMessage, agentId, 7, 10);
       if (historyTurns.length > 0) {
@@ -238,30 +266,30 @@ export async function buildMemoryContext(
 }
 
 /**
- * Process a conversation turn: log it and fire async memory extraction.
- * Called AFTER Claude responds, with both user message and Claude's response.
+ * Persist the assistant turn of a successful user/assistant exchange and
+ * fire fire-and-forget memory ingestion on the pair.
  *
- * The conversation log is written synchronously (for /respin support).
- * Memory extraction via Gemini is fire-and-forget (never blocks the response).
+ * The user turn is NOT persisted here — that now happens BEFORE the agent
+ * runs (Phase 2 fix, 2026-05-21), so an aborted or SIGTERMed run never
+ * leaves an orphan. Call this only on the success path; abort / error
+ * branches should write a direct `logConversationTurn('assistant', ...)`
+ * because we never want to memory-ingest a timeout or crash message.
  */
-export function saveConversationTurn(
+export function logAssistantTurn(
   chatId: string,
   userMessage: string,
-  claudeResponse: string,
+  assistantResponse: string,
   sessionId?: string,
   agentId = 'main',
 ): void {
   try {
-    // Always log full conversation to conversation_log (for /respin)
-    logConversationTurn(chatId, 'user', userMessage, sessionId, agentId);
-    logConversationTurn(chatId, 'assistant', claudeResponse, sessionId, agentId);
+    logConversationTurn(chatId, 'assistant', assistantResponse, sessionId, agentId);
   } catch (err) {
-    logger.error({ err }, 'Failed to log conversation turn');
+    logger.error({ err }, 'Failed to log assistant turn');
   }
 
-  // Fire-and-forget: LLM-powered memory extraction via Gemini
-  // This runs async and never blocks the user's response
-  void ingestConversationTurn(chatId, userMessage, claudeResponse, agentId).catch((err) => {
+  // Fire-and-forget: LLM-powered memory extraction over the full pair.
+  void ingestConversationTurn(chatId, userMessage, assistantResponse, agentId).catch((err) => {
     logger.error({ err }, 'Memory ingestion fire-and-forget failed');
   });
 }

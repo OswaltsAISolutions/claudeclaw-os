@@ -30,10 +30,10 @@ import {
   HOURLY_TOKEN_BUDGET,
   PROJECT_ROOT,
 } from './config.js';
-import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, saveCompactionEvent, getCompactionCount } from './db.js';
+import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, logConversationTurn, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, saveCompactionEvent, getCompactionCount } from './db.js';
 import { logger } from './logger.js';
 import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage } from './media.js';
-import { buildMemoryContext, evaluateMemoryRelevance, saveConversationTurn, shouldNudgeMemory, MEMORY_NUDGE_TEXT } from './memory.js';
+import { buildMemoryContext, evaluateMemoryRelevance, logAssistantTurn, shouldNudgeMemory, MEMORY_NUDGE_TEXT } from './memory.js';
 import { classifyMessageComplexity } from './message-classifier.js';
 import { scanForSecrets, redactSecrets } from './exfiltration-guard.js';
 import { trackUsage, getRateStatus } from './rate-tracker.js';
@@ -123,8 +123,8 @@ const voiceEnabledChats = new Set<string>();
 const chatModelOverride = new Map<string, string>();
 
 const AVAILABLE_MODELS: Record<string, string> = {
-  opus: 'claude-opus-4-6',
-  sonnet: 'claude-sonnet-4-5',
+  opus: 'claude-opus-4-7',
+  sonnet: 'claude-sonnet-4-6',
   haiku: 'claude-haiku-4-5',
 };
 const DEFAULT_MODEL_LABEL = 'opus';
@@ -264,6 +264,38 @@ export function splitMessage(text: string): string[] {
 
   if (remaining) parts.push(remaining);
   return parts;
+}
+
+/**
+ * Send a message to Telegram with HTML formatting, falling back to plain text
+ * if Telegram rejects the HTML. This prevents silent failures where the user
+ * never sees a response because formatForTelegram produced invalid HTML.
+ */
+async function sendTelegramSafe(
+  ctx: Context,
+  _chatId: number,
+  text: string,
+): Promise<void> {
+  const parts = splitMessage(formatForTelegram(text));
+  for (const part of parts) {
+    try {
+      await ctx.reply(part, { parse_mode: 'HTML' });
+    } catch (htmlErr: any) {
+      const desc = String(htmlErr?.description ?? '').toLowerCase();
+      if (desc.includes('parse') || desc.includes('entity') || desc.includes('tag')) {
+        // HTML parse failed -- retry without formatting so the user sees the response
+        logger.warn({ err: htmlErr }, 'Telegram HTML parse failed, retrying as plain text');
+        try {
+          await ctx.reply(text.slice(0, 4096));
+        } catch (plainErr) {
+          logger.error({ err: plainErr }, 'Telegram plain text send also failed');
+        }
+        return; // Already sent the full text as fallback
+      }
+      // Non-formatting error (network, rate limit, etc.), re-throw
+      throw htmlErr;
+    }
+  }
 }
 
 // ── File marker types ─────────────────────────────────────────────────
@@ -452,6 +484,15 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   if (delegation) {
     setProcessing(chatIdStr, true);
     await sendTyping(ctx.api, chatId);
+
+    if (!skipLog) {
+      try {
+        logConversationTurn(chatIdStr, 'user', delegation.prompt, undefined, delegation.agentId);
+      } catch (err) {
+        logger.error({ err, chatId: chatIdStr }, 'Failed to persist delegation user turn');
+      }
+    }
+
     try {
       const delegationResult = await delegateToAgent(
         delegation.agentId,
@@ -468,9 +509,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       const header = `[${delegationResult.agentId} — ${Math.round(delegationResult.durationMs / 1000)}s]`;
 
       if (!skipLog) {
-        // Attribute to the delegated agent, not the caller, so memories
-        // created from this conversation are tagged with the correct agent.
-        saveConversationTurn(chatIdStr, delegation.prompt, response, undefined, delegation.agentId);
+        logAssistantTurn(chatIdStr, delegation.prompt, response, undefined, delegation.agentId);
       }
       emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: response, source: 'telegram' });
 
@@ -480,7 +519,15 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       logger.error({ err, agentId: delegation.agentId }, 'Delegation failed');
-      await ctx.reply(`Delegation to ${delegation.agentId} failed: ${errMsg}`);
+      const failureMsg = `Delegation to ${delegation.agentId} failed: ${errMsg}`;
+      if (!skipLog) {
+        try {
+          logConversationTurn(chatIdStr, 'assistant', failureMsg, undefined, delegation.agentId);
+        } catch (logErr) {
+          logger.error({ err: logErr }, 'Failed to persist delegation failure turn');
+        }
+      }
+      await ctx.reply(failureMsg);
     } finally {
       setProcessing(chatIdStr, false);
     }
@@ -519,7 +566,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   const userModel = chatModelOverride.get(chatIdStr) ?? agentDefaultModel;
   const effectiveModel = (SMART_ROUTING_ENABLED && !userModel && classifyMessageComplexity(message) === 'simple')
     ? SMART_ROUTING_CHEAP_MODEL
-    : (userModel ?? 'claude-opus-4-6');
+    : (userModel ?? 'claude-opus-4-7');
 
   // Start typing immediately, then refresh on interval
   await sendTyping(ctx.api, chatId);
@@ -529,6 +576,16 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   );
 
   setProcessing(chatIdStr, true);
+
+  // Persist user turn BEFORE the agent runs so SIGTERM/abort mid-task does not
+  // orphan the message (Bug 1: 9:40 PM incident, 2026-05-21).
+  if (!skipLog) {
+    try {
+      logConversationTurn(chatIdStr, 'user', message, sessionId, AGENT_ID);
+    } catch (err) {
+      logger.error({ err, chatId: chatIdStr }, 'Failed to persist user turn');
+    }
+  }
 
   try {
     // Progress callback: surface agent activity to Telegram + SSE.
@@ -628,6 +685,13 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       const msg = result.text === null
         ? `Timed out after ${Math.round(AGENT_TIMEOUT_MS / 1000)}s. The task may have been too complex or a command got stuck. Try breaking it into smaller steps.`
         : 'Stopped.';
+      if (!skipLog) {
+        try {
+          logConversationTurn(chatIdStr, 'assistant', msg, result.newSessionId ?? sessionId, AGENT_ID);
+        } catch (err) {
+          logger.error({ err }, 'Failed to persist abort assistant turn');
+        }
+      }
       emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: msg, source: 'telegram' });
       await ctx.reply(msg);
       return;
@@ -664,7 +728,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     // Save conversation turn to memory (including full log).
     // Skip logging for synthetic messages like /respin to avoid self-referential growth.
     if (!skipLog) {
-      saveConversationTurn(chatIdStr, message, rawResponse, result.newSessionId ?? sessionId, AGENT_ID);
+      logAssistantTurn(chatIdStr, message, rawResponse, result.newSessionId ?? sessionId, AGENT_ID);
       // Fire-and-forget: evaluate which surfaced memories were useful
       if (surfacedMemoryIds.length > 0) {
         void evaluateMemoryRelevance(surfacedMemoryIds, surfacedMemorySummaries, message, rawResponse).catch(() => {});
@@ -698,25 +762,20 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     const caps = voiceCapabilities();
     const shouldSpeakBack = caps.tts && (forceVoiceReply || voiceEnabledChats.has(chatIdStr));
 
-    // Send text response (if there's any left after stripping markers)
-    const textWithFooter = responseText ? responseText + costFooter : '';
-    if (textWithFooter) {
-      if (shouldSpeakBack) {
-        try {
-          // Don't speak the cost footer, just the actual response
-          const audioBuffer = await synthesizeSpeech(responseText);
-          await ctx.replyWithVoice(new InputFile(audioBuffer, 'response.ogg'));
-        } catch (ttsErr) {
-          logger.error({ err: ttsErr }, 'TTS failed, falling back to text');
-          for (const part of splitMessage(formatForTelegram(textWithFooter))) {
-            await ctx.reply(part, { parse_mode: 'HTML' });
-          }
-        }
-      } else {
-        for (const part of splitMessage(formatForTelegram(textWithFooter))) {
-          await ctx.reply(part, { parse_mode: 'HTML' });
-        }
+    // Send text response (if there's any left after stripping markers).
+    // Always ensure something goes to Telegram so the user knows the task finished.
+    const textWithFooter = responseText ? responseText + costFooter : costFooter || 'Done.';
+    if (shouldSpeakBack) {
+      try {
+        // Don't speak the cost footer, just the actual response
+        const audioBuffer = await synthesizeSpeech(responseText || 'Done.');
+        await ctx.replyWithVoice(new InputFile(audioBuffer, 'response.ogg'));
+      } catch (ttsErr) {
+        logger.error({ err: ttsErr }, 'TTS failed, falling back to text');
+        await sendTelegramSafe(ctx, chatId, textWithFooter);
       }
+    } else {
+      await sendTelegramSafe(ctx, chatId, textWithFooter);
     }
 
     // Log token usage to SQLite and check for context warnings
@@ -773,16 +832,30 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     setActiveAbort(chatIdStr, null);
     setProcessing(chatIdStr, false);
 
+    let userMsg: string;
+    let agentErrorCategory = 'unclassified';
     if (err instanceof AgentError) {
+      agentErrorCategory = err.category;
       logger.error(
         { category: err.category, recovery: err.recovery },
         'Agent error (classified)',
       );
-      await ctx.reply(err.recovery.userMessage);
+      userMsg = err.recovery.userMessage;
     } else {
       logger.error({ err }, 'Agent error (unclassified)');
-      await ctx.reply('Something went wrong. Check the logs and try again.');
+      userMsg = 'Something went wrong. Check the logs and try again.';
     }
+    // Phase 8 telemetry: structured counter so we can answer "how many timeouts
+    // / SIGTERMs / context overflows happened this hour" from log search.
+    logger.info({ event: 'agent_error', category: agentErrorCategory, agentId: AGENT_ID }, 'agent_error counter');
+    if (!skipLog) {
+      try {
+        logConversationTurn(chatIdStr, 'assistant', userMsg, sessionId, AGENT_ID);
+      } catch (logErr) {
+        logger.error({ err: logErr }, 'Failed to persist error assistant turn');
+      }
+    }
+    await ctx.reply(userMsg);
   }
 }
 
@@ -1618,9 +1691,19 @@ async function processDashboardMessage(
   emitChatEvent({ type: 'user_message', chatId: chatIdStr, content: text, source: 'dashboard' });
   setProcessing(chatIdStr, true);
 
-  try {
-    const sessionId = getSession(chatIdStr, AGENT_ID);
+  // Hoist sessionId out of the try so the catch block can use it when
+  // persisting an error turn (Bug 1 / Phase 2).
+  const sessionId = getSession(chatIdStr, AGENT_ID);
 
+  // Persist user turn BEFORE the agent runs so SIGTERM/abort mid-task does
+  // not orphan the message (Bug 1: 9:40 PM incident, 2026-05-21).
+  try {
+    logConversationTurn(chatIdStr, 'user', text, sessionId, AGENT_ID);
+  } catch (err) {
+    logger.error({ err, chatId: chatIdStr }, 'Failed to persist user turn');
+  }
+
+  try {
     const { contextText: memCtx, surfacedMemoryIds: dashSurfacedIds, surfacedMemorySummaries: dashSummaries } = await buildMemoryContext(chatIdStr, text, AGENT_ID);
     const dashParts: string[] = [];
     if (agentSystemPrompt && !sessionId) dashParts.push(`[Agent role — follow these instructions]\n${agentSystemPrompt}\n[End agent role]`);
@@ -1668,6 +1751,11 @@ async function processDashboardMessage(
       const msg = result.text === null
         ? `Timed out after ${Math.round(AGENT_TIMEOUT_MS / 1000)}s. Try breaking the task into smaller steps.`
         : 'Stopped.';
+      try {
+        logConversationTurn(chatIdStr, 'assistant', msg, result.newSessionId ?? sessionId, AGENT_ID);
+      } catch (err) {
+        logger.error({ err }, 'Failed to persist abort assistant turn');
+      }
       emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: msg, source: 'dashboard' });
       return;
     }
@@ -1678,8 +1766,8 @@ async function processDashboardMessage(
 
     const rawResponse = result.text?.trim() || 'Done.';
 
-    // Save conversation turn
-    saveConversationTurn(chatIdStr, text, rawResponse, result.newSessionId ?? sessionId, AGENT_ID);
+    // Persist assistant turn (user turn was persisted before runAgent).
+    logAssistantTurn(chatIdStr, text, rawResponse, result.newSessionId ?? sessionId, AGENT_ID);
     if (dashSurfacedIds.length > 0) {
       void evaluateMemoryRelevance(dashSurfacedIds, dashSummaries, text, rawResponse).catch(() => {});
     }
@@ -1689,12 +1777,12 @@ async function processDashboardMessage(
     // text. Any photo URLs end up as separate assistant_photo events
     // (handled below) so the SPA can inline-render them.
     const { text: responseText, files: dashFileMarkers } = extractFileMarkers(rawResponse);
-    const cleanedForChat = responseText || (dashFileMarkers.length > 0 ? '' : 'Done.');
+    // Always emit at least 'Done.' so the user sees something on both surfaces
+    const cleanedForChat = responseText || 'Done.';
 
     // Emit assistant response to SSE clients
-    if (cleanedForChat) {
-      emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: cleanedForChat, source: 'dashboard' });
-    }
+    emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: cleanedForChat, source: 'dashboard' });
+
     // Emit one assistant_photo per http(s) photo URL the agent referenced.
     // Filesystem paths (the standard for Telegram-bound files) are skipped
     // here; they get handled by the Telegram leg below.
@@ -1715,30 +1803,40 @@ async function processDashboardMessage(
     // NOT bubble Telegram's raw error description into the chat feed.
     // The dashboard already received the assistant message via SSE
     // above; the Telegram leg is best-effort.
-    if (responseText) {
-      try {
-        for (const part of splitMessage(formatForTelegram(responseText))) {
+    try {
+      const telegramText = responseText || 'Done.';
+      for (const part of splitMessage(formatForTelegram(telegramText))) {
+        try {
           await botApi.sendMessage(parseInt(chatIdStr), part, { parse_mode: 'HTML' });
+        } catch (htmlErr: any) {
+          // HTML parse failed, retry as plain text so user always sees the response
+          const desc = String(htmlErr?.description ?? '').toLowerCase();
+          if (desc.includes('parse') || desc.includes('entity') || desc.includes('tag')) {
+            logger.warn({ err: htmlErr }, 'Telegram HTML relay failed, retrying plain');
+            await botApi.sendMessage(parseInt(chatIdStr), telegramText.slice(0, 4096));
+            break; // Already sent full text as fallback
+          }
+          throw htmlErr; // Non-formatting error, let outer catch handle
         }
-      } catch (relayErr: any) {
-        const code = relayErr?.error_code ?? relayErr?.status ?? null;
-        const desc = String(relayErr?.description ?? relayErr?.message ?? '').toLowerCase();
-        const looksAuth = code === 401 || desc.includes('unauthorized') || desc.includes('not authenticated');
-        if (looksAuth) {
-          logger.warn({ err: relayErr }, 'Telegram relay failed: bot token not authorized');
-          emitChatEvent({
-            type: 'error',
-            chatId: chatIdStr,
-            content: 'Telegram relay skipped: this bot token is not authorized. Update TELEGRAM_BOT_TOKEN in Settings or re-issue with @BotFather.',
-          });
-        } else {
-          logger.warn({ err: relayErr }, 'Telegram relay failed (non-auth)');
-          emitChatEvent({
-            type: 'error',
-            chatId: chatIdStr,
-            content: 'Could not relay reply to Telegram. The dashboard reply above is current.',
-          });
-        }
+      }
+    } catch (relayErr: any) {
+      const code = relayErr?.error_code ?? relayErr?.status ?? null;
+      const desc = String(relayErr?.description ?? relayErr?.message ?? '').toLowerCase();
+      const looksAuth = code === 401 || desc.includes('unauthorized') || desc.includes('not authenticated');
+      if (looksAuth) {
+        logger.warn({ err: relayErr }, 'Telegram relay failed: bot token not authorized');
+        emitChatEvent({
+          type: 'error',
+          chatId: chatIdStr,
+          content: 'Telegram relay skipped: this bot token is not authorized. Update TELEGRAM_BOT_TOKEN in Settings or re-issue with @BotFather.',
+        });
+      } else {
+        logger.warn({ err: relayErr }, 'Telegram relay failed (non-auth)');
+        emitChatEvent({
+          type: 'error',
+          chatId: chatIdStr,
+          content: 'Could not relay reply to Telegram. The dashboard reply above is current.',
+        });
       }
     }
 
@@ -1764,7 +1862,16 @@ async function processDashboardMessage(
   } catch (err) {
     setActiveAbort(chatIdStr, null);
     logger.error({ err }, 'Dashboard message processing error');
-    emitChatEvent({ type: 'error', chatId: chatIdStr, content: 'Something went wrong. Check the logs.' });
+    const category = err instanceof AgentError ? err.category : 'unclassified';
+    const errMsg = err instanceof AgentError ? err.recovery.userMessage : 'Something went wrong. Check the logs.';
+    // Phase 8 telemetry counter (matches the Telegram path).
+    logger.info({ event: 'agent_error', category, agentId: AGENT_ID }, 'agent_error counter');
+    try {
+      logConversationTurn(chatIdStr, 'assistant', errMsg, sessionId, AGENT_ID);
+    } catch (logErr) {
+      logger.error({ err: logErr }, 'Failed to persist error assistant turn');
+    }
+    emitChatEvent({ type: 'error', chatId: chatIdStr, content: errMsg });
   } finally {
     setProcessing(chatIdStr, false);
   }

@@ -10,6 +10,7 @@ export type ErrorCategory =
   | 'auth'
   | 'rate_limit'
   | 'context_exhausted'
+  | 'service_terminated'
   | 'timeout'
   | 'subprocess_crash'
   | 'network'
@@ -108,6 +109,8 @@ const CONTEXT_PATTERNS = [
   'max input tokens',
   'too long',
   'token limit',
+  'context_length_exceeded',
+  'prompt is too long',
 ];
 
 function matchesAny(text: string, patterns: string[]): boolean {
@@ -129,29 +132,32 @@ export function classifyError(err: unknown, contextTokens?: number): AgentError 
   const raw = err instanceof Error ? err : new Error(String(err));
   const text = raw.message;
 
-  // Context exhaustion: process exits with code 1 when context is full
-  if (text.includes('exited with code 1') && contextTokens && contextTokens > 0) {
-    return new AgentError('context_exhausted', {
-      shouldRetry: false,
-      shouldNewChat: true,
-      shouldSwitchModel: false,
-      retryAfterMs: 0,
-      userMessage: `Context window likely exhausted (~${Math.round(contextTokens / 1000)}k tokens). Use /newchat to start fresh, then /respin to pull recent conversation back in.`,
-    }, raw);
-  }
+  // ── Exit-code dispatch ─────────────────────────────────────────────
+  // Parse the exact exit code (regex, not substring — `exited with code 143`
+  // must NOT match an `exited with code 1` rule).
+  //
+  // Phase 4 (2026-05-21): exit 143 (SIGTERM) and 137 (SIGKILL/OOM) mean the
+  // process was terminated externally — usually a systemd restart. Surfacing
+  // this as "context exhausted" (the old behavior) sent users down a useless
+  // /newchat workaround. Real context exhaustion now matches on the Anthropic
+  // API error patterns below, not on process exit codes.
+  const exitMatch = text.match(/exited with code (\d+)/);
+  if (exitMatch) {
+    const exitCode = parseInt(exitMatch[1], 10);
 
-  // Subprocess crash without context data
-  if (text.includes('exited with code 1')) {
-    return new AgentError('subprocess_crash', {
-      shouldRetry: true,
-      shouldNewChat: false,
-      shouldSwitchModel: false,
-      retryAfterMs: 2000,
-      userMessage: 'Claude Code subprocess crashed. Retrying...',
-    }, raw);
-  }
+    if (exitCode === 143 || exitCode === 137) {
+      return new AgentError('service_terminated', {
+        shouldRetry: false,
+        shouldNewChat: false,
+        shouldSwitchModel: false,
+        retryAfterMs: 0,
+        userMessage: "I was restarted mid-task and lost what I was working on. Resend the request and I'll start fresh.",
+      }, raw);
+    }
 
-  if (text.includes('exited with code')) {
+    // Exit 1 (or other non-zero, non-signal codes) = generic subprocess crash.
+    // Retry is safe because the agent is stateless from the OS's POV — Claude
+    // Code will pick up the same session on the next attempt.
     return new AgentError('subprocess_crash', {
       shouldRetry: true,
       shouldNewChat: false,

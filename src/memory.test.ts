@@ -34,7 +34,7 @@ vi.mock('./gemini.js', () => ({
 
 import {
   buildMemoryContext,
-  saveConversationTurn,
+  logAssistantTurn,
   runDecaySweep,
 } from './memory.js';
 
@@ -136,19 +136,19 @@ describe('buildMemoryContext', () => {
   });
 });
 
-describe('saveConversationTurn', () => {
+describe('logAssistantTurn', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it('logs both user and assistant messages to conversation log', () => {
-    saveConversationTurn('chat1', 'hello world from the user!!!', 'Noted.');
-    expect(mockLogConversationTurn).toHaveBeenCalledWith('chat1', 'user', 'hello world from the user!!!', undefined, 'main');
+  it('logs only the assistant message (user persistence now lives at the call site, Phase 2)', () => {
+    logAssistantTurn('chat1', 'hello world from the user!!!', 'Noted.');
+    expect(mockLogConversationTurn).toHaveBeenCalledTimes(1);
     expect(mockLogConversationTurn).toHaveBeenCalledWith('chat1', 'assistant', 'Noted.', undefined, 'main');
   });
 
-  it('fires async ingestion', () => {
-    saveConversationTurn('chat1', 'I prefer TypeScript over JavaScript always and forever', 'Noted.');
+  it('fires async ingestion on the full user/assistant pair', () => {
+    logAssistantTurn('chat1', 'I prefer TypeScript over JavaScript always and forever', 'Noted.');
     expect(mockIngest).toHaveBeenCalledWith('chat1', 'I prefer TypeScript over JavaScript always and forever', 'Noted.', 'main');
   });
 });
