@@ -217,13 +217,17 @@ function AgentCard({ agent, onChange, onOpen, suggestions, onOpenSuggestion }: {
 
   async function run(action: 'restart' | 'stop' | 'start' | 'delete') {
     if (action === 'delete' && !confirm(`Delete agent "${agent.id}"? This unloads the service, removes its config, deletes its bot token from .env, and removes log files.`)) return;
+    if (action === 'restart' && agent.id === 'main' && !confirm('Restart the main bot? The dashboard will disconnect for a few seconds while it bounces.')) return;
     setBusy(action);
     try {
       if (action === 'restart') await apiPost(`/api/agents/${agent.id}/restart`);
       if (action === 'stop') await apiPost(`/api/agents/${agent.id}/deactivate`);
       if (action === 'start') await apiPost(`/api/agents/${agent.id}/activate`);
       if (action === 'delete') await apiDelete(`/api/agents/${agent.id}/full`);
-      setTimeout(onChange, action === 'delete' ? 200 : 1500);
+      // Main restart kills the dashboard briefly. Wait longer so the UI
+      // re-fetches after systemd has finished respawning.
+      const refreshDelay = action === 'delete' ? 200 : (agent.id === 'main' && action === 'restart') ? 5000 : 1500;
+      setTimeout(onChange, refreshDelay);
     } catch (err: any) {
       alert(action + ' failed: ' + (err?.message || err));
     } finally {
@@ -339,9 +343,9 @@ function AgentCard({ agent, onChange, onOpen, suggestions, onOpenSuggestion }: {
         <button
           type="button"
           onClick={() => run('restart')}
-          disabled={busy !== null || isMain}
+          disabled={busy !== null}
           class="inline-flex items-center justify-center px-2 py-1.5 rounded text-[11px] bg-[var(--color-elevated)] text-[var(--color-text-muted)] hover:text-[var(--color-text)] border border-[var(--color-border)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-          title="Restart"
+          title={isMain ? 'Restart main bot (dashboard will briefly disconnect)' : 'Restart'}
         >
           <RotateCcw size={11} class={busy === 'restart' ? 'animate-spin' : ''} />
         </button>

@@ -295,13 +295,36 @@ export async function runAgent(
           lastCallInputTokens = callInputTokens;
         }
 
-        // Extract tool_use blocks from assistant content for progress reporting
+        // Extract tool_use blocks from assistant content for progress reporting.
+        // Include a short detail snippet so the user can tell WHAT is being
+        // run/read/edited, not just the generic tool label.
         if (onProgress) {
-          const content = msg?.['content'] as Array<{ type: string; name?: string }> | undefined;
+          const content = msg?.['content'] as Array<{ type: string; name?: string; input?: Record<string, unknown> }> | undefined;
           if (Array.isArray(content)) {
             for (const block of content) {
               if (block.type === 'tool_use' && block.name) {
-                onProgress({ type: 'tool_active', description: toolLabel(block.name) });
+                let detail = '';
+                if (block.input) {
+                  if (block.name === 'Bash' && typeof block.input['command'] === 'string') {
+                    // Show first 80 chars of the command
+                    const cmd = block.input['command'] as string;
+                    detail = cmd.length > 80 ? cmd.slice(0, 80) + '...' : cmd;
+                  } else if ((block.name === 'Read' || block.name === 'Write' || block.name === 'Edit') && typeof block.input['file_path'] === 'string') {
+                    // Show the filename, not the full path
+                    const fp = block.input['file_path'] as string;
+                    detail = fp.split('/').pop() || fp;
+                  } else if (block.name === 'Grep' && typeof block.input['pattern'] === 'string') {
+                    detail = block.input['pattern'] as string;
+                  } else if (block.name === 'Glob' && typeof block.input['pattern'] === 'string') {
+                    detail = block.input['pattern'] as string;
+                  } else if (block.name === 'WebSearch' && typeof block.input['query'] === 'string') {
+                    detail = block.input['query'] as string;
+                  }
+                }
+                const label = detail
+                  ? `${toolLabel(block.name)}: ${detail}`
+                  : toolLabel(block.name);
+                onProgress({ type: 'tool_active', description: label });
               }
             }
           }

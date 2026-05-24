@@ -299,7 +299,7 @@ export async function createAgent(opts: CreateAgentOpts): Promise<CreateAgentRes
     name,
     description,
     telegram_bot_token_env: envKey,
-    model: model || 'claude-sonnet-4-6',
+    model: model || 'claude-opus-4-7',
   };
   fs.writeFileSync(
     path.join(agentDir, 'agent.yaml'),
