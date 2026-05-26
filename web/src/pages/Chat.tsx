@@ -33,6 +33,12 @@ export function Chat() {
   const [processing, setProcessing] = useState(false);
   const [progressLabel, setProgressLabel] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Locally-tracked count of tasks the user has piled up while the
+  // current one is still running. The send API returns `queued` (1-N).
+  // We display "N queued" until the assistant_message event fires and
+  // we decrement. Lets the user stack tasks without doubting whether
+  // they landed.
+  const [queuedAhead, setQueuedAhead] = useState(0);
   const messagesRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const streamConnected = chatStreamConnected.value;
@@ -55,17 +61,54 @@ export function Chat() {
     30_000,
   );
 
-  // Load conversation history when active agent changes.
-  useEffect(() => {
+  // Load conversation history when active agent changes — and re-fetch when
+  // the tab regains visibility or the SSE stream reconnects. Without these,
+  // a tab that was opened a while ago (browser session restore, etc.) keeps
+  // showing whatever was on screen when it was first loaded, even though
+  // the user has been chatting via Telegram in the meantime. Bug observed
+  // 2026-05-23: tab showed days-old content because it was loaded long
+  // before the visit and chat history never refreshed.
+  const reloadHistory = () => {
     setLoading(true);
     const path = activeAgent === 'all'
       ? `/api/chat/history?chatId=${encodeURIComponent(chatId)}&limit=50`
       : `/api/agents/${activeAgent}/conversation?chatId=${encodeURIComponent(chatId)}&limit=50`;
     apiGet<{ turns: Turn[] }>(path)
-      .then((d) => setTurns(d.turns || []))
+      // Both endpoints return newest-first (ORDER BY id DESC) for cheap
+      // pagination. Chat UI convention is newest at the BOTTOM, so we
+      // reverse to oldest-first before rendering. Without this, the
+      // scroll lands on the oldest message in the window and the user
+      // thinks the chat is stale even though today's message is just
+      // off-screen at the top. Bug observed 2026-05-23.
+      .then((d) => setTurns((d.turns || []).slice().reverse()))
       .catch((e) => setError(e?.message || String(e)))
       .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    reloadHistory();
   }, [activeAgent]);
+
+  // Re-fetch when the tab regains focus. Covers the "tab restored from a
+  // previous session" case where the SPA has been idle for hours/days.
+  useEffect(() => {
+    function onVisible() {
+      if (document.visibilityState === 'visible') {
+        reloadHistory();
+      }
+    }
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [activeAgent]);
+
+  // Re-fetch when the SSE stream reconnects (which happens after every
+  // service restart). The reconnect is the signal that we may have missed
+  // turns while the stream was down.
+  useEffect(() => {
+    if (streamConnected) {
+      reloadHistory();
+    }
+  }, [streamConnected]);
 
   // Auto-scroll only when the user is already near the bottom. New
   // messages arriving while they're reading history shouldn't yank
@@ -101,6 +144,9 @@ export function Chat() {
       } else if (eventName === 'assistant_message') {
         setTurns((prev) => [...prev, { role: 'assistant', content: data.content, source: data.source }]);
         setProcessing(false); setProgressLabel(null);
+        // One queued task just finished. If user piled up more, keep
+        // the count decreasing as each one completes.
+        setQueuedAhead((n) => (n > 0 ? n - 1 : 0));
         health.refresh();
         if (activeAgent !== 'all') agentTokens.refresh();
       } else if (eventName === 'assistant_photo') {
@@ -131,11 +177,16 @@ export function Chat() {
     if (!message) return;
     setSending(true); setError(null);
     try {
-      const res = await apiPost<{ ok?: boolean; error?: string }>('/api/chat/send', { message });
+      const res = await apiPost<{ ok?: boolean; error?: string; queued?: number }>('/api/chat/send', { message });
       if (!res.ok && res.error) {
-        setError(res.error === 'busy' ? 'A turn is already in flight. Wait for it to finish.' : res.error);
-      } else if (!textOverride) {
-        setDraft('');
+        setError(res.error);
+      } else {
+        if (!textOverride) setDraft('');
+        // queued >= 2 means this task is behind at least one other.
+        // Reflect that in the UI so the user can keep stacking.
+        if (typeof res.queued === 'number' && res.queued >= 2) {
+          setQueuedAhead(res.queued - 1);
+        }
       }
     } catch (err: any) {
       setError(err?.message || String(err));
@@ -165,9 +216,17 @@ export function Chat() {
       <PageHeader
         title="Chat"
         actions={
-          <span class="inline-flex items-center gap-1.5 text-[11px] text-[var(--color-text-muted)]">
-            <StatusDot tone={streamConnected ? 'done' : 'cancelled'} />
-            {streamConnected ? 'Stream live' : 'Reconnecting…'}
+          <span class="inline-flex items-center gap-3 text-[11px] text-[var(--color-text-muted)]">
+            {queuedAhead > 0 && (
+              <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-[var(--color-elevated)] border border-[var(--color-border)] text-[var(--color-text)]">
+                <span class="size-1.5 rounded-full bg-[var(--color-accent)] animate-pulse" />
+                {queuedAhead} queued
+              </span>
+            )}
+            <span class="inline-flex items-center gap-1.5">
+              <StatusDot tone={streamConnected ? 'done' : 'cancelled'} />
+              {streamConnected ? 'Stream live' : 'Reconnecting…'}
+            </span>
           </span>
         }
         tabs={
@@ -219,7 +278,7 @@ export function Chat() {
                 key={qa.label}
                 type="button"
                 onClick={() => quick(qa.prompt)}
-                disabled={processing || sending}
+                disabled={sending}
                 class="px-2 py-0.5 rounded text-[10.5px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-elevated)] border border-[var(--color-border)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 {qa.label}
@@ -241,16 +300,17 @@ export function Chat() {
               rows={1}
               class="flex-1 bg-[var(--color-elevated)] border border-[var(--color-border)] rounded-lg px-3 py-2 text-[13px] outline-none focus:border-[var(--color-accent)] resize-none max-h-32"
             />
-            {processing ? (
+            {processing && (
               <button
                 type="button"
                 onClick={abort}
+                title="Stop the task currently running. Queued tasks below are not affected."
                 class="inline-flex items-center gap-1 px-3 py-2 rounded-lg text-[12px] font-medium bg-[var(--color-status-failed)] text-white hover:opacity-90 transition-opacity"
               >
                 <Square size={12} fill="currentColor" /> Stop
               </button>
-            ) : (
-              <button
+            )}
+            <button
                 type="button"
                 onClick={() => void send()}
                 disabled={!draft.trim() || sending}
@@ -258,7 +318,6 @@ export function Chat() {
               >
                 <Send size={12} /> {sending ? 'Sending…' : 'Send'}
               </button>
-            )}
           </div>
         </div>
       </div>

@@ -84,28 +84,66 @@ describe('classifyError', () => {
     expect(classified.recovery.shouldRetry).toBe(false);
   });
 
-  // ── Context exhaustion via exit code ────────────────────────────────
+  // ── Exit-code classification (Phase 4 fix, 2026-05-21) ──────────────
+  // The old code used `text.includes('exited with code 1')`, which
+  // matched "exited with code 143" because "1" is a prefix of "143".
+  // Phase 4 switches to exact regex matching and adds service_terminated.
 
-  it('classifies exit code 1 with context tokens as context_exhausted', () => {
-    const err = new Error('Process exited with code 1');
+  it('classifies exit code 143 (SIGTERM) as service_terminated', () => {
+    const err = new Error('Claude Code process exited with code 143');
+    const classified = classifyError(err);
+    expect(classified.category).toBe('service_terminated');
+    expect(classified.recovery.shouldRetry).toBe(false);
+    expect(classified.recovery.shouldNewChat).toBe(false);
+    expect(classified.recovery.shouldSwitchModel).toBe(false);
+    expect(classified.recovery.userMessage).toContain('restarted mid-task');
+  });
+
+  it('classifies exit code 137 (SIGKILL/OOM) as service_terminated', () => {
+    const err = new Error('Claude Code process exited with code 137');
+    const classified = classifyError(err);
+    expect(classified.category).toBe('service_terminated');
+    expect(classified.recovery.shouldRetry).toBe(false);
+    expect(classified.recovery.shouldNewChat).toBe(false);
+  });
+
+  it('classifies exit code 143 even when contextTokens is supplied (no false context_exhausted)', () => {
+    // Regression guard for the bug Phase 4 fixes: with the old substring
+    // match, exit 143 + non-zero contextTokens classified as context_exhausted.
+    const err = new Error('Claude Code process exited with code 143');
     const classified = classifyError(err, 950000);
+    expect(classified.category).toBe('service_terminated');
+    expect(classified.recovery.shouldNewChat).toBe(false);
+  });
+
+  it('classifies exit code 1 as subprocess_crash regardless of contextTokens', () => {
+    // Phase 4: context_exhausted is no longer inferred from exit codes.
+    // Real context exhaustion comes from the Anthropic API error patterns below.
+    expect(classifyError(new Error('Process exited with code 1')).category).toBe('subprocess_crash');
+    expect(classifyError(new Error('Process exited with code 1'), 950000).category).toBe('subprocess_crash');
+  });
+
+  it('classifies other non-signal exit codes as subprocess_crash', () => {
+    const err = new Error('Process exited with code 99');
+    const classified = classifyError(err);
+    expect(classified.category).toBe('subprocess_crash');
+    expect(classified.recovery.shouldRetry).toBe(true);
+  });
+
+  // ── Anthropic API context-exhaustion patterns ───────────────────────
+
+  it('classifies Anthropic 400 "prompt is too long" as context_exhausted', () => {
+    const err = new Error('HTTP 400: prompt is too long: 250000 tokens > 200000 maximum');
+    const classified = classifyError(err);
     expect(classified.category).toBe('context_exhausted');
     expect(classified.recovery.shouldNewChat).toBe(true);
-    expect(classified.recovery.userMessage).toContain('950k');
   });
 
-  it('classifies exit code 1 without context tokens as subprocess_crash', () => {
-    const err = new Error('Process exited with code 1');
+  it('classifies "context_length_exceeded" code as context_exhausted', () => {
+    const err = new Error('Anthropic API error: context_length_exceeded');
     const classified = classifyError(err);
-    expect(classified.category).toBe('subprocess_crash');
-    expect(classified.recovery.shouldRetry).toBe(true);
-  });
-
-  it('classifies other exit codes as subprocess_crash', () => {
-    const err = new Error('Process exited with code 137');
-    const classified = classifyError(err);
-    expect(classified.category).toBe('subprocess_crash');
-    expect(classified.recovery.shouldRetry).toBe(true);
+    expect(classified.category).toBe('context_exhausted');
+    expect(classified.recovery.shouldNewChat).toBe(true);
   });
 
   // ── Unknown errors ──────────────────────────────────────────────────

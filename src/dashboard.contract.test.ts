@@ -13,9 +13,10 @@
 // Env vars are set by `src/test-env-setup.ts` (vitest setupFiles) so they
 // land BEFORE config.ts evaluates at import time.
 
-import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import { _initTestDatabase } from './db.js';
 import { buildDashboardApp } from './dashboard.js';
+import { setProcessing } from './state.js';
 import type { Hono } from 'hono';
 
 const TOKEN = 'test-contract-token';
@@ -603,5 +604,41 @@ describe('Security headers on /', () => {
   it('X-Content-Type-Options: nosniff is set', async () => {
     const res = await get('/api/health');
     expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+  });
+});
+
+// Phase 1 + Phase 8 (2026-05-21): the /api/agents/main/restart endpoint must
+// refuse to restart while an agent task is in flight, unless the caller
+// explicitly opts in via ?force=true. The success path (force=true) spawns
+// `systemctl --user restart`, so we do NOT cover it here — that branch is
+// exercised by the live verify script and would otherwise attempt a real
+// restart in CI.
+describe('POST /api/agents/main/restart busy guard', () => {
+  afterEach(() => {
+    // The processing flag is module-level state in state.ts; reset it so
+    // unrelated tests don't see a stuck "busy" view of the bot.
+    setProcessing('', false);
+  });
+
+  it('returns 409 with the documented body when an agent task is in flight', async () => {
+    setProcessing('test-chat', true);
+
+    const res = await app.request('/api/agents/main/restart' + Q, { method: 'POST' });
+
+    expect(res.status).toBe(409);
+    const body = await jsonOf(res);
+    expect(body).toMatchObject({
+      error: 'busy',
+      reason: 'agent_in_flight',
+      message: expect.stringContaining('agent task is in progress'),
+    });
+    expect(body.message).toContain('?force=true');
+  });
+
+  it('still returns 409 if ?force is present but not exactly "true"', async () => {
+    setProcessing('test-chat', true);
+
+    const res = await app.request('/api/agents/main/restart?force=1&token=' + TOKEN, { method: 'POST' });
+    expect(res.status).toBe(409);
   });
 });

@@ -1,9 +1,12 @@
 import { Route, Switch, Redirect } from 'wouter-preact';
-import { Menu } from 'lucide-preact';
 import { Sidebar } from '@/components/Sidebar';
+import { BottomTabBar } from '@/components/BottomTabBar';
+import { MoreSheet } from '@/components/MoreSheet';
 import { CommandPalette } from '@/components/CommandPalette';
 import { ToastStack } from '@/components/ToastStack';
+import { TokenGate } from '@/components/TokenGate';
 import { sidebarOpen, closeSidebar } from '@/lib/sidebar';
+import { dashboardToken } from '@/lib/api';
 import { Placeholder } from '@/pages/Placeholder';
 import { MissionControl } from '@/pages/MissionControl';
 import { Memories } from '@/pages/Memories';
@@ -17,23 +20,24 @@ import { Voices } from '@/pages/Voices';
 import { Chat } from '@/pages/Chat';
 import { WarRoom } from '@/pages/WarRoom';
 import { AgentFiles } from '@/pages/AgentFiles';
-import { DEFAULT_ROUTE } from '@/lib/routes';
+import { LocalModels } from '@/pages/LocalModels';
+import { Specialists } from '@/pages/Specialists';
+import { JarvisHome } from '@/pages/JarvisHome';
 
 export function App() {
+  // Token gate: if the SPA loaded without a token in either URL or
+  // sessionStorage, every /api/* call will 401 and each page will render
+  // its own cryptic "Failed to load" error (Mission Control was hit hard
+  // by this on 2026-05-26). Surface a single, recoverable prompt instead
+  // of letting the failures cascade. api.ts already initialized the
+  // module-level `dashboardToken` at load time from URL + sessionStorage,
+  // so a non-empty value here means auth is available.
+  if (!dashboardToken) {
+    return <TokenGate />;
+  }
   const open = sidebarOpen.value;
   return (
     <div class="flex h-screen h-[100dvh] bg-[var(--color-bg)] text-[var(--color-text)]">
-      {/* Mobile-only hamburger. Hidden on >=md where the sidebar is
-       *  always inline. */}
-      <button
-        type="button"
-        onClick={() => { sidebarOpen.value = true; }}
-        class="md:hidden fixed top-3 left-3 z-50 p-2 rounded-md bg-[var(--color-card)] border border-[var(--color-border)] text-[var(--color-text)] shadow-md"
-        aria-label="Open menu"
-      >
-        <Menu size={18} />
-      </button>
-
       {/* Backdrop when the mobile drawer is open. Tapping it closes. */}
       {open && (
         <div
@@ -43,12 +47,15 @@ export function App() {
       )}
 
       <Sidebar />
-      <main class="flex-1 min-w-0 overflow-hidden pl-12 md:pl-0">
+      <main class="flex-1 min-w-0 overflow-hidden pl-0 md:pl-0 pb-[52px] md:pb-0">
         <Switch>
+          <Route path="/"><JarvisHome /></Route>
           <Route path="/mission"><MissionControl /></Route>
           <Route path="/scheduled"><Scheduled /></Route>
           <Route path="/agents"><Agents /></Route>
           <Route path="/agents/:id/files"><AgentFiles /></Route>
+          <Route path="/local-models"><LocalModels /></Route>
+          <Route path="/specialists"><Specialists /></Route>
           <Route path="/chat"><Chat /></Route>
           <Route path="/memories"><Memories /></Route>
           <Route path="/hive"><HiveMind /></Route>
@@ -63,7 +70,6 @@ export function App() {
           <Route path="/hivemind"><Redirect to="/hive" /></Route>
           <Route path="/memory"><Redirect to="/memories" /></Route>
 
-          <Route path="/"><Redirect to={DEFAULT_ROUTE} /></Route>
           <Route>
             <Placeholder
               title="Not found"
@@ -73,6 +79,8 @@ export function App() {
           </Route>
         </Switch>
       </main>
+      <BottomTabBar />
+      <MoreSheet />
       <CommandPalette />
       <ToastStack />
     </div>

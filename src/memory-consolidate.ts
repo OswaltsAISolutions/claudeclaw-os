@@ -1,11 +1,14 @@
-import { generateContent, parseJsonResponse } from './gemini.js';
+import { query } from '@anthropic-ai/claude-agent-sdk';
+
 import {
   getUnconsolidatedMemories,
   saveConsolidationAtomic,
   saveConsolidationEmbedding,
 } from './db.js';
 import { embedText } from './embeddings.js';
+import { requireEnabled } from './kill-switches.js';
 import { logger } from './logger.js';
+import { parseJsonResponse } from './gemini.js';
 
 interface ConsolidationResult {
   summary: string;
@@ -22,6 +25,15 @@ interface ConsolidationResult {
   }>;
 }
 
+// 2026-05-23: upgraded from Haiku 4.5 → Sonnet 4.6 per the intelligence-over-
+// cost principle. Memory consolidation quality matters more than speed —
+// Sonnet produces sharper insights, better connection mapping, and better
+// contradiction detection than Haiku at the cost of slightly higher latency
+// (still <1 minute per consolidation run, well within the 30-min cadence).
+const CONSOLIDATION_MODEL = 'claude-sonnet-4-6';
+const CONSOLIDATION_TIMEOUT_MS = 60_000;
+const RETRY_DELAYS_MS = [1_000, 2_000, 4_000];
+
 const CONSOLIDATION_PROMPT = `You are a memory consolidation agent. You find patterns and connections across a user's recent memories.
 
 Given these unconsolidated memories:
@@ -34,7 +46,7 @@ Your job:
 4. Map connections between specific memories (use their IDs)
 5. Check for CONTRADICTIONS: if any memory updates, corrects, or supersedes an earlier one, flag it. IMPORTANT: Compare the created_at timestamps to determine which is newer. The memory with the LATER timestamp is authoritative (it's the correction). Set stale_id to the OLDER memory's ID and supersedes_id to the NEWER memory's ID.
 
-Return JSON:
+Return ONLY a JSON object — no prose, no markdown fences, no commentary:
 {
   "summary": "A synthesized view across all source memories",
   "insight": "One key pattern or insight that emerges",
@@ -47,6 +59,70 @@ Return JSON:
 }
 
 If memories are unrelated, still summarize but note they cover different topics. Connections and contradictions arrays can be empty if none exist.`;
+
+/**
+ * Run one consolidation pass via Haiku 4.5 (Phase 5 swap, 2026-05-21).
+ *
+ * The previous implementation used `@google/genai` Gemini 2.0 Flash, which
+ * was hitting hard 429 free-tier quotas every 30 minutes. The user is on
+ * Anthropic Max, so we now reuse the existing `claude-agent-sdk` (no
+ * separate API key required — auth flows through `claude login`).
+ */
+async function generateHaikuJson(prompt: string): Promise<string> {
+  requireEnabled('LLM_SPAWN_ENABLED');
+
+  let text = '';
+  const abortController = new AbortController();
+  const timeout = setTimeout(() => abortController.abort(), CONSOLIDATION_TIMEOUT_MS);
+
+  try {
+    for await (const event of query({
+      prompt,
+      options: {
+        model: CONSOLIDATION_MODEL,
+        // Single-turn: consolidation doesn't need tool use or follow-ups.
+        maxTurns: 1,
+        // Skip CLAUDE.md / settings load — we're calling Haiku directly.
+        settingSources: [],
+        permissionMode: 'bypassPermissions',
+        allowDangerouslySkipPermissions: true,
+        abortController,
+      },
+    })) {
+      const ev = event as Record<string, unknown>;
+      if (ev.type !== 'assistant') continue;
+      const msg = ev.message as { content?: Array<{ type: string; text?: string }> } | undefined;
+      if (!msg?.content) continue;
+      for (const block of msg.content) {
+        if (block.type === 'text' && block.text) {
+          text += block.text;
+        }
+      }
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  return text;
+}
+
+async function generateHaikuJsonWithRetry(prompt: string): Promise<string> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      return await generateHaikuJson(prompt);
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      const isRetryable = /\b(429|529)\b|overloaded|rate.?limit/i.test(msg);
+      if (!isRetryable || attempt === RETRY_DELAYS_MS.length) break;
+      const delay = RETRY_DELAYS_MS[attempt];
+      logger.warn({ err, attempt: attempt + 1, delay }, 'Consolidation Haiku call failed, retrying');
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  throw lastErr;
+}
 
 // Guard against overlapping consolidation runs (keyed by chatId)
 const consolidatingChats = new Set<string>();
@@ -71,7 +147,6 @@ export async function runConsolidation(chatId: string): Promise<void> {
       return;
     }
 
-    // Format memories for Gemini
     const memoriesJson = memories.map((m) => ({
       id: m.id,
       summary: m.summary,
@@ -86,7 +161,7 @@ export async function runConsolidation(chatId: string): Promise<void> {
       JSON.stringify(memoriesJson, null, 2),
     );
 
-    const raw = await generateContent(prompt);
+    const raw = await generateHaikuJsonWithRetry(prompt);
     const result = parseJsonResponse<ConsolidationResult>(raw);
 
     if (!result || !result.summary || !result.insight) {
@@ -96,7 +171,6 @@ export async function runConsolidation(chatId: string): Promise<void> {
 
     const sourceIds = memories.map((m) => m.id);
 
-    // Build validated connections list
     const validConnections: Array<{ from_id: number; to_id: number; relationship: string }> = [];
     if (result.connections && result.connections.length > 0) {
       for (const conn of result.connections) {
@@ -106,7 +180,6 @@ export async function runConsolidation(chatId: string): Promise<void> {
       }
     }
 
-    // Build validated contradictions list with timestamp correction
     const validContradictions: Array<{ stale_id: number; superseded_by: number }> = [];
     if (result.contradictions && result.contradictions.length > 0) {
       for (const contra of result.contradictions) {
@@ -137,14 +210,11 @@ export async function runConsolidation(chatId: string): Promise<void> {
       }
     }
 
-    // Atomically save consolidation, wire connections, handle contradictions,
-    // and mark source memories as consolidated. All or nothing.
     const consolidationId = saveConsolidationAtomic(
       chatId, sourceIds, result.summary, result.insight,
       validConnections, validContradictions,
     );
 
-    // Generate embedding (non-critical, outside transaction)
     try {
       const embeddingText = `${result.summary} ${result.insight}`;
       const embedding = await embedText(embeddingText);
@@ -161,6 +231,7 @@ export async function runConsolidation(chatId: string): Promise<void> {
         sourceCount: sourceIds.length,
         connections: result.connections?.length ?? 0,
         insight: result.insight.slice(0, 80),
+        model: CONSOLIDATION_MODEL,
       },
       'Consolidation complete',
     );

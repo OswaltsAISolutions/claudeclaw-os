@@ -503,6 +503,16 @@ function runMigrations(database: Database.Database): void {
     database.exec(`ALTER TABLE conversation_log ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'main'`);
   }
 
+  // Phase 3 (2026-05-21): recovery_log dedupes one-time orphan-message
+  // recovery notices. Without it, every restart would re-notify the user
+  // about the same orphan.
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS recovery_log (
+      audit_id      INTEGER PRIMARY KEY,
+      recovered_at  INTEGER NOT NULL
+    )
+  `);
+
   // Task state machine: add started_at and last_status columns
   const taskColNames = taskCols.map((c) => c.name);
   if (!taskColNames.includes('started_at')) {
