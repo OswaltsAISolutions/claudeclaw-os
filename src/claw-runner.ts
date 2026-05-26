@@ -120,10 +120,52 @@ export interface ClawRunResult {
   workspace: string;
   /** Last reported token usage from assistant_turn. */
   usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number };
+  /** True when the model emitted OpenAI-style `<function=...>` XML tool-call
+   *  syntax that claw doesn't parse (qwen3-coder:30b does this occasionally).
+   *  When set, the subprocess was killed early; runClaw transparently retries
+   *  once. Callers can read this on the FINAL result if they want to log the
+   *  occurrence (specialists.ts logs to hive_mind for dashboard visibility). */
+  strayToolSyntax?: boolean;
+  /** Number of times the run was retried due to strayToolSyntax (0 on first
+   *  successful attempt; max 1 in current implementation). */
+  retryAttempts?: number;
 }
 
-/** Run claw-analog once and return when the agent loop terminates. */
+/** Detection regex for OpenAI-style XML tool-call syntax that occasionally
+ *  shows up in qwen3-coder:30b output instead of the proper OpenAI-compat
+ *  tool_calls JSON. Claw v0.1.3 can't parse this and silently produces
+ *  "no content"; we detect it early, kill the subprocess, and retry once.
+ *  Pattern matches the literal `<function=<name>` opener. */
+const STRAY_TOOL_SYNTAX_RE = /<function=[a-zA-Z_][a-zA-Z0-9_-]*\s*>/;
+
+/** Public entry point. Wraps runClawOnce with retry-on-stray-syntax. */
 export async function runClaw(opts: ClawRunOptions): Promise<ClawRunResult> {
+  const first = await runClawOnce(opts);
+  // Only retry on stray-syntax. Other errors (model-emitted error, abort,
+  // exit code) are real failures the caller should handle as-is. Aborted
+  // runs must not be retried under any circumstance.
+  if (!first.strayToolSyntax || opts.signal?.aborted) {
+    return first;
+  }
+  logger.warn(
+    { model: opts.model, durationMs: first.durationMs },
+    '[claw] stray XML tool-call syntax detected; killing + retrying once',
+  );
+  const second = await runClawOnce(opts);
+  return {
+    ...second,
+    // Mark the result so the caller (specialists.ts) can log to hive_mind
+    // for dashboard visibility. retryAttempts=1 always since we cap there.
+    retryAttempts: 1,
+    // If the retry ALSO hit stray-syntax, preserve the flag so the caller
+    // surfaces it; otherwise clear it (retry succeeded).
+    strayToolSyntax: second.strayToolSyntax === true,
+  };
+}
+
+/** Run claw-analog or claw-full once. Internal — callers use runClaw which
+ *  wraps this with retry logic for stray tool-call syntax. */
+async function runClawOnce(opts: ClawRunOptions): Promise<ClawRunResult> {
   // Pick the binary first so we can fail fast with a clear error message
   // before doing any other setup work.
   const bin = opts.useFullClaw ? CLAW_FULL_BIN : CLAW_ANALOG_BIN;
@@ -264,12 +306,33 @@ export async function runClaw(opts: ClawRunOptions): Promise<ClawRunResult> {
     let stderrBuf = '';
     let stdoutBuf = '';
     let modelEmittedError: string | undefined;
+    // Set when the model emits OpenAI-style XML tool-call syntax that claw
+    // can't parse. Triggers an early subprocess kill so runClaw can retry.
+    let strayToolSyntax = false;
 
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
 
     child.stdout.on('data', (chunk: string) => {
       stdoutBuf += chunk;
+      // Detect stray OpenAI-XML tool-call syntax. We only check until we
+      // have at least one real toolCall recorded, because past that point
+      // the model is functional and a stray `<function=...>` inside an
+      // assistant text body is harmless (model is just quoting it). On
+      // detection, kill the subprocess; the exit handler will see the
+      // strayToolSyntax flag and resolve with it set so runClaw retries.
+      if (!strayToolSyntax && toolCalls === 0 && STRAY_TOOL_SYNTAX_RE.test(stdoutBuf)) {
+        strayToolSyntax = true;
+        logger.warn(
+          { model: opts.model, head: stdoutBuf.slice(0, 300) },
+          '[claw] stray <function=...> tool syntax in stream, killing subprocess for retry',
+        );
+        try { child.kill('SIGTERM'); } catch { /* already dead */ }
+        // Escalate to SIGKILL if it doesn't shut in 2s. Don't unref the
+        // timer: we need it to fire even if everything else is idle.
+        setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* */ } }, 2000).unref();
+        return;
+      }
       if (opts.useFullClaw) {
         // Full claw (v0.1.3) with --output-format json emits ONE JSON object
         // at end-of-run, not NDJSON. We buffer everything and parse on exit.
@@ -419,6 +482,7 @@ export async function runClaw(opts: ClawRunOptions): Promise<ClawRunResult> {
         stopReason: lastStopReason,
         usage: lastUsage,
         error,
+        strayToolSyntax: strayToolSyntax || undefined,
       });
     });
 

@@ -888,6 +888,11 @@ async function delegateClaw(
           durationMs: result.durationMs,
           stopReason: result.stopReason,
           usage: result.usage,
+          // Surface claw-runner's retry telemetry so the dashboard can show
+          // "this specialist retried once due to stray XML tool syntax".
+          // retryAttempts is 0/undefined on clean runs, 1 when a retry fired.
+          retryAttempts: result.retryAttempts,
+          strayToolSyntax: result.strayToolSyntax,
           taskPreview: task.slice(0, 120),
         }),
       );
