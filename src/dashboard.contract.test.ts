@@ -797,3 +797,115 @@ describe('GET /api/warroom/text/list', () => {
     expect(await jsonOf(res)).toMatchObject({ ok: true, meetings: expect.any(Array) });
   });
 });
+
+// ── Mutation input-validation contracts (rejection branches only) ────────
+// Every case below drives an input the handler REJECTS, so it returns at the
+// validation guard BEFORE the side effect. That is deliberate and load-
+// bearing: the kill-switch and agent-create happy paths write the real .env /
+// create a real agent+service, which must never happen in a test. Pinning the
+// rejection contract is what has value anyway: it locks the guards so a
+// refactor can't silently widen what reaches a side effect (e.g. accept an
+// unknown kill-switch name, or skip a required agent field). CSRF allows a
+// missing Origin header (proven by the auth-gate suite above), so these reach
+// the validation logic rather than 403ing.
+
+describe('POST /api/security/kill-switch validation', () => {
+  it('rejects a missing key (never reaches the .env write)', async () => {
+    const res = await app.request('/api/security/kill-switch' + Q, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled: true }),
+    });
+    expect(res.status).toBe(400);
+    expect(await jsonOf(res)).toMatchObject({ error: expect.any(String) });
+  });
+
+  it('rejects an unknown switch name with 400 (never reaches the .env write)', async () => {
+    const res = await app.request('/api/security/kill-switch' + Q, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ key: 'NOT_A_REAL_SWITCH', enabled: true }),
+    });
+    expect(res.status).toBe(400);
+    expect(await jsonOf(res)).toMatchObject({ error: expect.stringContaining('unknown kill switch') });
+  });
+});
+
+describe('POST /api/specialists/:callsign/tier validation', () => {
+  it('rejects an unknown callsign with 400', async () => {
+    const res = await app.request('/api/specialists/not_a_callsign/tier' + Q, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tier: 'cloud' }),
+    });
+    expect(res.status).toBe(400);
+    expect(await jsonOf(res)).toMatchObject({ error: 'unknown callsign' });
+  });
+
+  it('rejects an invalid tier value with 400', async () => {
+    const res = await app.request('/api/specialists/' + ALL_CALLSIGNS[0] + '/tier' + Q, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tier: 'banana' }),
+    });
+    expect(res.status).toBe(400);
+    expect(await jsonOf(res)).toMatchObject({ error: expect.stringContaining('invalid tier') });
+  });
+});
+
+describe('GET /api/specialists/route', () => {
+  it('rejects an empty task with 400', async () => {
+    const res = await get('/api/specialists/route?task=');
+    expect(res.status).toBe(400);
+  });
+
+  it('returns { suggestion } for a real task', async () => {
+    const res = await get('/api/specialists/route?task=' + encodeURIComponent('refactor the database migration script'));
+    expect(res.status).toBe(200);
+    expect(await jsonOf(res)).toMatchObject({ suggestion: expect.any(String) });
+  });
+});
+
+describe('POST /api/agents/create validation', () => {
+  it('rejects an empty body with 400 (never reaches createAgent)', async () => {
+    const res = await app.request('/api/agents/create' + Q, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+    expect(await jsonOf(res)).toMatchObject({ error: expect.any(String) });
+  });
+
+  it('rejects a body missing botToken with 400 (never reaches createAgent)', async () => {
+    const res = await app.request('/api/agents/create' + Q, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'probe', name: 'Probe', description: 'a probe' }),
+    });
+    expect(res.status).toBe(400);
+    expect(await jsonOf(res)).toMatchObject({ error: expect.stringContaining('botToken') });
+  });
+});
+
+describe('PATCH /api/mission/tasks/:id reassign validation', () => {
+  it('rejects a missing assigned_agent with 400 (never reaches reassign)', async () => {
+    const res = await app.request('/api/mission/tasks/any-id' + Q, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+    expect(await jsonOf(res)).toMatchObject({ error: expect.stringContaining('assigned_agent') });
+  });
+
+  it('rejects an unknown target agent with 400 (never reaches reassign)', async () => {
+    const res = await app.request('/api/mission/tasks/any-id' + Q, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ assigned_agent: 'nonexistent_agent_xyz' }),
+    });
+    expect(res.status).toBe(400);
+    expect(await jsonOf(res)).toMatchObject({ error: 'Unknown agent' });
+  });
+});
