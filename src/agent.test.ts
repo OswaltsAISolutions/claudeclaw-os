@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { AgentError } from './errors.js';
 
 // Mock the SDK query function before importing agent
@@ -56,6 +56,16 @@ function resultEvent(text: string) {
 describe('runAgentWithRetry', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Fake timers collapse the retry backoff (2s, then 8s, plus jitter) to
+    // instant so the retry paths are deterministic and run in ms instead of
+    // ~16s. runAgent's typing setInterval is always cleared in its finally
+    // before runAgent settles, so runAllTimersAsync only ever drains the
+    // retry-loop sleeps and never spins on a live interval.
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('returns result on first try when no error', async () => {
@@ -90,15 +100,17 @@ describe('runAgentWithRetry', () => {
     });
 
     const onRetry = vi.fn();
-    const result = await runAgentWithRetry(
+    const promise = runAgentWithRetry(
       'hi', undefined, noop, undefined, undefined, undefined, undefined, onRetry,
     );
+    await vi.runAllTimersAsync();
+    const result = await promise;
 
     expect(result.text).toBe('Recovered!');
     expect(callCount).toBe(2);
     expect(onRetry).toHaveBeenCalledTimes(1);
     expect(onRetry).toHaveBeenCalledWith(1, expect.objectContaining({ category: 'rate_limit' }));
-  }, 15000);
+  });
 
   it('does not retry non-retryable errors', async () => {
     const authError = new AgentError('auth', {
@@ -127,14 +139,17 @@ describe('runAgentWithRetry', () => {
     mockQuery.mockImplementation(() => { throw retryableError; });
 
     const onRetry = vi.fn();
-    await expect(
-      runAgentWithRetry('hi', undefined, noop, undefined, undefined, undefined, undefined, onRetry),
-    ).rejects.toThrow(AgentError);
+    const promise = runAgentWithRetry(
+      'hi', undefined, noop, undefined, undefined, undefined, undefined, onRetry,
+    );
+    const expectation = expect(promise).rejects.toThrow(AgentError);
+    await vi.runAllTimersAsync();
+    await expectation;
 
     // 1 initial + 2 retries = 3 total calls
     expect(mockQuery).toHaveBeenCalledTimes(3);
     expect(onRetry).toHaveBeenCalledTimes(2);
-  }, 30000);
+  });
 
   it('returns aborted result when abort controller is pre-aborted', async () => {
     const abortCtrl = new AbortController();
@@ -192,11 +207,13 @@ describe('runAgentWithRetry', () => {
       ])();
     });
 
-    const result = await runAgentWithRetry(
+    const promise = runAgentWithRetry(
       'hi', undefined, noop, undefined,
       'claude-opus-4-6', undefined, undefined, undefined,
       ['claude-sonnet-4-6', 'claude-haiku-4-5'],
     );
+    await vi.runAllTimersAsync();
+    const result = await promise;
 
     expect(result.text).toBe('Fallback worked');
     expect(capturedModels[0]).toBe('claude-opus-4-6');
