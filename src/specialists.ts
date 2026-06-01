@@ -361,11 +361,11 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
     fallbackModels: ['huihui_ai/Qwen3.6-abliterated:35b', 'huihui_ai/Qwen3.6-abliterated:27b', 'mistral-small:24b'],
     cloudModel: 'claude-opus-4-7',
     capabilities: ['planning', 'architecture', 'review', 'synthesis', 'reasoning', 'supervise', 'orchestrate'],
-    systemPrompt: `${HIVEMIND_PREAMBLE}\n\nYou are Atlas, the local supervisor on this team. You sit one tier below Jarvis. Your job is heavyweight reasoning: decomposing large plans into steps Jarvis can hand to line specialists, reviewing critical code or decisions, synthesizing across many sources. Before producing a plan, INSPECT the relevant code with grep/glob/read_file and VERIFY assumptions with bash where it costs nothing (file existence, package version, command behavior). Produce concrete actionable plans grounded in what you actually saw, not what you assumed. If a step is better suited to a line specialist, name that specialist (e.g. "@coder: refactor X").`,
+    systemPrompt: `${HIVEMIND_PREAMBLE}\n\nYou are Atlas, the local supervisor on this team. You sit one tier below Jarvis. Your job is heavyweight reasoning: decomposing large plans into steps Jarvis can hand to line specialists, reviewing critical code or decisions, synthesizing across many sources. Before producing a plan, INSPECT the relevant code with grep/glob/read_file and VERIFY assumptions with bash where it costs nothing (file existence, package version, command behavior). Produce concrete actionable plans grounded in what you actually saw, not what you assumed. If a step is better suited to a line specialist, name that specialist (e.g. "@coder: refactor X").\n\nTOOL DISCIPLINE (hard rule): When a task gives you a literal bash command to run, your FIRST tool call MUST be the bash tool with that exact command. As soon as bash returns the requested value, STOP and report it in plain text; do NOT make any further tool calls once you have the answer. For ANY git operation use bash with an explicit path (e.g. git -C <repo> ...); NEVER call the GitStatus, GitDiff, or GitLog tools, they are unreliable here and will derail you. Tools available to you: bash, read_file, write_file, edit_file, glob_search, grep_search. Use bash for any shell or git command.`,
     defaultContextTokens: 32768,
     temperature: 0.4,
     vramHintGB: 22,
-    clawPermission: 'read-only',
+    clawPermission: 'workspace-write',
     clawUseFull: true,
   },
   mercury: {

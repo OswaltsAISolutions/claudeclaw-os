@@ -283,7 +283,7 @@ run_test cipher \
   "python3 2^20 compute"
 
 run_test atlas \
-  "Run via bash: git -C /home/gcruise/repos/claudeclaw-os log -1 --pretty=%h. Report the 7-char short hash of HEAD. Run the command, do not narrate." \
+  "Run via bash: git -C /home/gcruise/repos/claudeclaw-os log -1 --pretty=%h. Report the 7-char short hash of HEAD. Run it via bash; do not call git_status, git_diff, GitLog, or any other tool before bash, and do not narrate." \
   "$GT_LAST_HASH" \
   "git -C /home/gcruise/repos/claudeclaw-os log -1 --pretty=%h" \
   "git HEAD short hash"
