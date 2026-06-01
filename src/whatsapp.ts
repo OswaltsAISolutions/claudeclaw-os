@@ -122,16 +122,26 @@ export function isWhatsAppReady(): boolean {
 
 function startOutboxPoller(): void {
   setInterval(async () => {
-    if (!client) return;
-    const pending = getPendingWaMessages();
-    for (const item of pending) {
-      try {
-        await client.sendMessage(item.to_chat_id, item.body);
-        markWaMessageSent(item.id);
-        logger.info({ to: item.to_chat_id, id: item.id }, 'Outbox message sent');
-      } catch (err) {
-        logger.error({ err, id: item.id }, 'Failed to send outbox message');
+    // Whole body guarded: this fires every 3s for the process lifetime, so an
+    // unguarded throw from getPendingWaMessages() (a DB read, prime SQLITE_BUSY
+    // candidate) would reject this async callback. setInterval ignores the
+    // returned promise, so that becomes an unhandledRejection and crash-loops the
+    // bot every 3s. Per-message sends keep their own try/catch below so one bad
+    // recipient doesn't skip the rest.
+    try {
+      if (!client) return;
+      const pending = getPendingWaMessages();
+      for (const item of pending) {
+        try {
+          await client.sendMessage(item.to_chat_id, item.body);
+          markWaMessageSent(item.id);
+          logger.info({ to: item.to_chat_id, id: item.id }, 'Outbox message sent');
+        } catch (err) {
+          logger.error({ err, id: item.id }, 'Failed to send outbox message');
+        }
       }
+    } catch (err) {
+      logger.error({ err }, 'WhatsApp outbox poll failed');
     }
   }, 3000);
 }

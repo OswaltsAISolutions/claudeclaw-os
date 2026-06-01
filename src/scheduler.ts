@@ -54,7 +54,17 @@ export function initScheduler(send: Sender, agentId = 'main'): void {
     logger.warn({ recovered: recoveredMission, agentId }, 'Reset stuck mission tasks from previous crash');
   }
 
-  setInterval(() => void runDueTasks(), 60_000);
+  // .catch() so a rejection from the tick's outer orchestration (getDueTasks /
+  // computeNextRun / markTaskRunning, or the awaited runDueMissionTasks) — e.g.
+  // a SQLITE_BUSY read or one malformed schedule string — is logged instead of
+  // becoming an unhandledRejection. The old `void runDueTasks()` let that reject
+  // the floating promise; on Node's default unhandled-rejections=throw that
+  // crashes the bot, and since this fires every 60s a persistent condition (a
+  // corrupt schedule row) would crash-loop it. Per-task execution is already
+  // guarded inside the enqueue callback; this covers the orchestration around it.
+  setInterval(() => {
+    runDueTasks().catch((err) => logger.error({ err }, 'Scheduler tick failed'));
+  }, 60_000);
   logger.info({ agentId }, 'Scheduler started (checking every 60s)');
 }
 
@@ -157,11 +167,20 @@ async function runDueMissionTasks(): Promise<void> {
     // SQLite, this poll picks it up within 5s and aborts the runAgent call.
     let cancelledByUser = false;
     const cancelPoll = setInterval(() => {
-      const current = getMissionTask(mission.id);
-      if (current?.status === 'cancelled') {
-        cancelledByUser = true;
-        abortController.abort();
-        clearInterval(cancelPoll);
+      // Guarded: this fires every 5s for the whole task lifetime, concurrent
+      // with the agent's own DB writes, so the read is a prime SQLITE_BUSY
+      // candidate. An unguarded sync throw in a setInterval callback is an
+      // uncaughtException (the tick's .catch() can't reach a separate tick),
+      // which would crash the bot — so swallow+log and retry next poll.
+      try {
+        const current = getMissionTask(mission.id);
+        if (current?.status === 'cancelled') {
+          cancelledByUser = true;
+          abortController.abort();
+          clearInterval(cancelPoll);
+        }
+      } catch (err) {
+        logger.warn({ err, missionId: mission.id }, 'Mission cancel-poll read failed; will retry');
       }
     }, 5_000);
 

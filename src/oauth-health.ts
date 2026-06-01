@@ -157,11 +157,19 @@ export function initOAuthHealthCheck(sender: Sender): void {
   const checkIntervalMs = getCheckIntervalMs();
   const alertThresholdMs = getAlertThresholdMs();
 
+  // .catch() on both: checkOAuthHealth has no top-level guard and does
+  // `await sender(...)` (a Telegram send), which rejects on a transient network
+  // blip — exactly the condition an OAuth alert fires under. The old
+  // `void checkOAuthHealth(...)` floated that rejection into an unhandledRejection
+  // (process-crashing on Node's default), so a flaky Telegram would crash the bot.
+  const safeCheck = () =>
+    checkOAuthHealth(sender).catch((err) => logger.error({ err }, 'OAuth health check failed'));
+
   // Initial check after 10s (let bot fully start)
-  setTimeout(() => void checkOAuthHealth(sender), 10_000);
+  setTimeout(safeCheck, 10_000);
 
   // Periodic checks
-  setInterval(() => void checkOAuthHealth(sender), checkIntervalMs);
+  setInterval(safeCheck, checkIntervalMs);
 
   logger.info(
     { intervalMin: checkIntervalMs / 60_000, alertThresholdHours: alertThresholdMs / (60 * 60 * 1000) },
