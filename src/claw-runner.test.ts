@@ -365,7 +365,7 @@ describe('runClaw failure-mode resilience', () => {
 
   it('skips a malformed (non-JSON) NDJSON line and still parses the valid lines after it', async () => {
     children.push(makeFakeChild((c) => {
-      c.stdout.emit('data', 'not json at all — a stray log line\n');
+      c.stdout.emit('data', 'not json at all, a stray log line\n');
       c.stdout.emit('data', ndjson('assistant_turn', { text: 'survived the garbage', stop_reason: 'end_turn' }));
       c._exit(0, null);
     }));
