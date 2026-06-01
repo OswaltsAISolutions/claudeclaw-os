@@ -31,7 +31,7 @@ const PROXY_PORT = parseInt(process.env.OLLAMA_PROXY_PORT || '11435', 10);
  *  rust/crates/api/src/providers/openai_compat.rs. */
 const ROUTING_PREFIXES = new Set(['openai', 'xai', 'grok', 'qwen', 'kimi']);
 
-function stripRoutingPrefix(model: string): string {
+export function stripRoutingPrefix(model: string): string {
   if (!model) return model;
   const slash = model.indexOf('/');
   if (slash < 0) return model;
@@ -47,7 +47,7 @@ function stripRoutingPrefix(model: string): string {
  *  / mercury / coder produce direct answers instead of dying inside a
  *  thinking buffer. Recognises both `qwen3-coder:30b` and prefix-stripped
  *  abliterated variants like `huihui_ai/Qwen3.6-abliterated:35b`. */
-function isQwen3Family(model: string): boolean {
+export function isQwen3Family(model: string): boolean {
   const m = model.toLowerCase();
   return m.includes('qwen3');
 }
@@ -56,7 +56,7 @@ function isQwen3Family(model: string): boolean {
  *  assistant's content. Belt-and-suspenders for the case where
  *  `think: false` isn't honored upstream — the user sees the final
  *  answer cleanly even if the model emits a stray thinking tag. */
-function stripThinkingTags(text: string): string {
+export function stripThinkingTags(text: string): string {
   if (!text) return text;
   // Closed pairs: <think>...</think>
   let out = text.replace(/<think>[\s\S]*?<\/think>\s*/gi, '');
@@ -80,7 +80,7 @@ function stripThinkingTags(text: string): string {
  *  closures, so a thinking block split across two HTTP packets still
  *  closes cleanly.
  */
-function processSseLine(
+export function processSseLine(
   line: string,
   getInside: () => boolean,
   setInside: (v: boolean) => void,
@@ -125,7 +125,7 @@ function processSseLine(
  *  enter/exit a thinking block mid-fragment. Tracks open/close state
  *  across calls via getInside/setInside so a thinking block split
  *  across many SSE chunks resolves cleanly. */
-function stripFromContent(
+export function stripFromContent(
   content: string,
   getInside: () => boolean,
   setInside: (v: boolean) => void,
