@@ -3,12 +3,14 @@ import path from 'path';
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
 
-import { AGENT_MAX_TURNS, PROJECT_ROOT, agentCwd } from './config.js';
+import { AGENT_MAX_TURNS, PROJECT_ROOT, agentCwd, agentSystemPrompt } from './config.js';
 import { readEnvFile } from './env.js';
 import { classifyError, AgentError } from './errors.js';
 import { logger } from './logger.js';
 import { getScrubbedSdkEnv } from './security.js';
 import { requireEnabled } from './kill-switches.js';
+import { intelligentRoute, delegate as delegateToSpecialist } from './specialists.js';
+import { toolLabel } from './tool-labels.js';
 
 // ── MCP server loading ──────────────────────────────────────────────
 // The Agent SDK's settingSources loads CLAUDE.md and permissions from
@@ -100,33 +102,14 @@ export interface UsageInfo {
 
 /** Progress event emitted during agent execution for Telegram feedback. */
 export interface AgentProgressEvent {
-  type: 'task_started' | 'task_completed' | 'tool_active';
+  type: 'task_started' | 'task_completed' | 'tool_active' | 'tool_use' | 'tool_result';
   description: string;
-}
-
-/** Map SDK tool names to human-readable labels. */
-const TOOL_LABELS: Record<string, string> = {
-  Read: 'Reading file',
-  Write: 'Writing file',
-  Edit: 'Editing file',
-  Bash: 'Running command',
-  Grep: 'Searching code',
-  Glob: 'Finding files',
-  WebSearch: 'Web search',
-  WebFetch: 'Fetching page',
-  Agent: 'Sub-agent',
-  NotebookEdit: 'Editing notebook',
-  AskUserQuestion: 'User question',
-};
-
-function toolLabel(toolName: string): string {
-  if (TOOL_LABELS[toolName]) return TOOL_LABELS[toolName];
-  // MCP tools: mcp__server__tool → "server: tool"
-  if (toolName.startsWith('mcp__')) {
-    const parts = toolName.split('__');
-    return parts.length >= 3 ? `${parts[1]}: ${parts.slice(2).join(' ')}` : toolName;
-  }
-  return toolName;
+  // Set on type='tool_use' and 'tool_result' so the SSE frontend can pair
+  // them and show input → output as a collapsible card.
+  toolUseId?: string;
+  toolName?: string;
+  input?: string;   // serialized tool input (truncated)
+  output?: string;  // serialized tool result content (truncated)
 }
 
 export interface AgentResult {
@@ -181,6 +164,7 @@ export async function runAgent(
   abortController?: AbortController,
   onStreamText?: (accumulatedText: string) => void,
   mcpAllowlist?: string[],
+  routingOptions?: { skip?: boolean; chatId?: string; userText?: string },
 ): Promise<AgentResult> {
   // Centralized kill-switch enforcement. Throws KillSwitchDisabledError if
   // LLM_SPAWN_ENABLED has been flipped off — caller is expected to surface
@@ -189,6 +173,76 @@ export async function runAgent(
   // path that ends up here; the war-room and voice paths have their own
   // requireEnabled calls at their own SDK boundaries.
   requireEnabled('LLM_SPAWN_ENABLED');
+
+  // ── Specialist routing ──────────────────────────────────────────────
+  // Before invoking the main Jarvis agent, ask intelligentRoute() whether
+  // this task belongs to a specialist (coder, scribe, sleuth, archivist,
+  // sentinel, cipher, eye, reaper, atlas, mercury). 3-stage chain:
+  //   1) Keyword heuristic (~1ms)
+  //   2) Opus 4.7 LLM router (~3-4s) for ambiguous tasks ≥ 20 chars
+  //   3) Local mistral-small:24b fallback if Opus fails
+  // Documented never-throws (try/catch + 'self' fallback inside), but we
+  // wrap defensively anyway — a routing failure must never block Jarvis.
+  // The routingOptions.skip arg is reserved for future internal callers
+  // that need to bypass (delegate() itself doesn't reach back into
+  // runAgent today, but this keeps the door closed).
+  if (!routingOptions?.skip) {
+    try {
+      // Route on the clean user text when the caller supplied it. The
+      // `message` parameter is typically a prebuilt prompt with a
+      // [Memory context] preamble jammed on top, which (a) makes the
+      // keyword heuristic miss short prompts, (b) sends the LLM router a
+      // wall of noise, and (c) gets persisted under the specialist's
+      // agent_id where it bleeds into the chat view.
+      const routeInput = routingOptions?.userText ?? message;
+      const delegateInput = routingOptions?.userText ?? message;
+      const route = await intelligentRoute(routeInput);
+      logger.info(
+        { callsign: route.callsign, source: route.source, reason: route.reason },
+        '[router] task routing decision',
+      );
+      // Also write a plain console line so it shows up clearly in
+      // `journalctl --user -u com.claudeclaw.main.service -f`.
+      console.log(`[router] ${route.callsign} (${route.source}): ${route.reason}`);
+
+      if (route.callsign !== 'self') {
+        // Surface the routing decision on the chat stream so the
+        // dashboard's activity panel can attribute subsequent tool
+        // events to the chosen specialist callsign.
+        onProgress?.({ type: 'tool_active', description: '▸ Routed to @' + route.callsign });
+        const result = await delegateToSpecialist(route.callsign, delegateInput, {
+          chatId: routingOptions?.chatId,
+          shareMemory: true,
+          onProgress: onProgress
+            ? (ev) => onProgress({
+                type: ev.type,
+                description: ev.description,
+                toolUseId: ev.toolUseId,
+                toolName: ev.toolName,
+                input: ev.input,
+                output: ev.output,
+              })
+            : undefined,
+        });
+        // Preserve sessionId so subsequent user messages can resume Jarvis's
+        // session (specialists run stateless single-turns; the main session
+        // remains continuous for the user's conversation thread).
+        return {
+          text: result.output,
+          newSessionId: sessionId,
+          usage: null,
+          aborted: false,
+        };
+      }
+      // 'self' → fall through to the existing main-agent path below.
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error).message ?? String(err) },
+        '[router] routing failed, falling through to main agent',
+      );
+      // Intentionally swallow — the main agent path below handles the task.
+    }
+  }
 
   // Read secrets from .env without polluting process.env.
   // CLAUDE_CODE_OAUTH_TOKEN is optional — the subprocess finds auth via ~/.claude/
@@ -237,6 +291,17 @@ export async function runAgent(
 
         // 'project' loads CLAUDE.md from cwd; 'user' loads ~/.claude/skills/ and user settings
         settingSources: ['project', 'user'],
+
+        // Append the personalized CLAUDE.md from CLAUDECLAW_CONFIG (loaded
+        // at startup by index.ts via setAgentOverrides). cwd's CLAUDE.md is
+        // the public template with [PLACEHOLDERS]; this is the real persona
+        // (Jarvis identity, Ollama HARD RULE, em-dash rule, recall queries).
+        // Has to be appended on every query — `resume: sessionId` causes the
+        // SDK to reuse the prior turn's system prompt, so without this the
+        // persona is frozen at session start and never reflects later edits.
+        // Bug observed 2026-05-24: persona edits were no-ops because setAgentOverrides
+        // stored the prompt but no code read it back into the SDK.
+        ...(agentSystemPrompt ? { appendSystemPrompt: agentSystemPrompt } : {}),
 
         // Skip all permission prompts — this is a trusted personal bot on your own machine
         permissionMode: 'bypassPermissions',
@@ -295,22 +360,28 @@ export async function runAgent(
           lastCallInputTokens = callInputTokens;
         }
 
-        // Extract tool_use blocks from assistant content for progress reporting.
-        // Include a short detail snippet so the user can tell WHAT is being
-        // run/read/edited, not just the generic tool label.
+        // Extract tool_use blocks from assistant content. Emit BOTH a
+        // short 'tool_active' label (back-compat with Telegram) AND a
+        // richer 'tool_use' event carrying the full input — the chat
+        // SPA pairs the latter with the matching 'tool_result' event
+        // (see user-role handler below) to show a Claude-Code-style
+        // collapsible card with command + output.
         if (onProgress) {
-          const content = msg?.['content'] as Array<{ type: string; name?: string; input?: Record<string, unknown> }> | undefined;
+          const content = msg?.['content'] as Array<{
+            type: string;
+            id?: string;
+            name?: string;
+            input?: Record<string, unknown>;
+          }> | undefined;
           if (Array.isArray(content)) {
             for (const block of content) {
               if (block.type === 'tool_use' && block.name) {
                 let detail = '';
                 if (block.input) {
                   if (block.name === 'Bash' && typeof block.input['command'] === 'string') {
-                    // Show first 80 chars of the command
                     const cmd = block.input['command'] as string;
                     detail = cmd.length > 80 ? cmd.slice(0, 80) + '...' : cmd;
                   } else if ((block.name === 'Read' || block.name === 'Write' || block.name === 'Edit') && typeof block.input['file_path'] === 'string') {
-                    // Show the filename, not the full path
                     const fp = block.input['file_path'] as string;
                     detail = fp.split('/').pop() || fp;
                   } else if (block.name === 'Grep' && typeof block.input['pattern'] === 'string') {
@@ -324,8 +395,69 @@ export async function runAgent(
                 const label = detail
                   ? `${toolLabel(block.name)}: ${detail}`
                   : toolLabel(block.name);
+                // Short label (Telegram-compatible).
                 onProgress({ type: 'tool_active', description: label });
+                // Rich event with full input — capped at 4000 chars so a
+                // 100KB Edit's full file content doesn't flood the wire.
+                if (block.id) {
+                  const inputJson = (() => {
+                    try { return JSON.stringify(block.input ?? {}, null, 2); }
+                    catch { return String(block.input ?? ''); }
+                  })();
+                  onProgress({
+                    type: 'tool_use',
+                    description: label,
+                    toolUseId: block.id,
+                    toolName: block.name,
+                    input: inputJson.length > 4000 ? inputJson.slice(0, 4000) + '\n…[truncated]' : inputJson,
+                  });
+                }
               }
+            }
+          }
+        }
+      }
+
+      // Tool RESULTS arrive as user-role events with content arrays
+      // containing tool_result blocks. Pair them with the tool_use by
+      // tool_use_id so the chat SPA can fill in the matching card.
+      if (ev['type'] === 'user' && onProgress) {
+        const msg = ev['message'] as Record<string, unknown> | undefined;
+        const content = msg?.['content'] as Array<{
+          type: string;
+          tool_use_id?: string;
+          content?: unknown;
+          is_error?: boolean;
+        }> | undefined;
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block.type === 'tool_result' && block.tool_use_id) {
+              // tool_result.content can be a string OR an array of content
+              // parts (each with type='text' + text). Flatten to plain text.
+              let output = '';
+              if (typeof block.content === 'string') {
+                output = block.content;
+              } else if (Array.isArray(block.content)) {
+                output = block.content
+                  .map((p: unknown) => {
+                    if (typeof p === 'string') return p;
+                    if (p && typeof p === 'object' && 'text' in p) return String((p as { text: unknown }).text ?? '');
+                    return '';
+                  })
+                  .join('\n');
+              } else if (block.content != null) {
+                try { output = JSON.stringify(block.content); }
+                catch { output = String(block.content); }
+              }
+              const trimmed = output.length > 4000
+                ? output.slice(0, 4000) + '\n…[truncated]'
+                : output;
+              onProgress({
+                type: 'tool_result',
+                description: block.is_error ? '[error]' : '',
+                toolUseId: block.tool_use_id,
+                output: trimmed,
+              });
             }
           }
         }
@@ -444,6 +576,7 @@ export async function runAgentWithRetry(
   onRetry?: (attempt: number, error: AgentError) => void,
   fallbackModels?: string[],
   mcpAllowlist?: string[],
+  routingOptions?: { skip?: boolean; chatId?: string; userText?: string },
 ): Promise<AgentResult> {
   let lastError: AgentError | undefined;
 
@@ -458,7 +591,7 @@ export async function runAgentWithRetry(
       return await runAgent(
         message, sessionId, onTyping, onProgress,
         currentModel, abortController, onStreamText,
-        mcpAllowlist,
+        mcpAllowlist, routingOptions,
       );
     } catch (err) {
       if (!(err instanceof AgentError)) throw err;
