@@ -247,6 +247,65 @@ slices (suite now 518 / 36, build green throughout):
   Documented in `.env.example`. Runtime-additive but behavior-identical when
   unset, so no redeploy. Bonus: operators can relocate the store via env now.
 
+### Coverage expansion (2026-06-01, second slice) - DONE
+
+After the reliability fixes above, kept the autonomous run going by adding
+unit tests to previously-uncovered pure-logic / security modules. Picked
+targets that are deterministic and safe to test (no live services, no real
+side effects) and skipped paths that can't be tested honestly. Suite grew
+514 -> 633 passed (4 skipped); build + full `tsc` green throughout; 9 commits,
+all pushed. NO deploy: every change is test-only except the oauth-health
+extraction, which is behavior-identical and the feature is opt-in/off.
+
+- `src/warroom-tool-policy.test.ts` (commit `a19241f`, 21 tests): the
+  security boundary that stops a prompt-injected war-room message from
+  driving Chrome / writing files / reaching M365 / Slack. Pins default-deny
+  of side-effect tools, always-allow of read-only built-ins, explicit
+  allowlist replacing per-agent defaults, and MCP staying unexposed unless an
+  `mcp:` override names it.
+- `src/security.test.ts` (commit `9515c2b`, 26 tests): `getScrubbedSdkEnv`
+  (drops enumerated + pattern-matched secrets and nested Claude-Code vars from
+  the subprocess env, preserves/ re-injects the two SDK auth vars), PIN
+  hashing + lock state machine incl. legacy bare-hash + idle auto-lock (fake
+  timers), kill-phrase matching, audit callback error-swallowing. Added a
+  test-only `resetSecurity()` export (initSecurity intentionally never clears a
+  live PIN, so without it a PIN leaks across tests). `executeEmergencyKill`
+  left uncovered on purpose (process.exit + service-control spawns).
+- `src/message-queue.test.ts` (commit `588efc3`, 6 tests): per-chat FIFO
+  ordering, cross-chat parallelism, synchronous pending counts, drain cleanup,
+  throwing-handler isolation.
+- `src/tool-labels.test.ts` + `src/platform.test.ts` + `src/state.test.ts`
+  (commit `20fbbe4`, 27 tests): label mapping incl. `mcp__server__tool`
+  parsing; platform IS_* flags / venv path / label + handoff builders / PID
+  guards (no real kills; signal-0 self-probe + dead-PID check only); state bot
+  info + telegram flag + chatEvents bus + processing flag + abort registry incl.
+  `abortByPrefix`.
+- `src/oauth-health.ts` + `.test.ts` (commit `d2acb0b`, 9 tests): extracted
+  the alert-level state machine (none/warning/expired + when to actually
+  notify) out of the non-exported `checkOAuthHealth` into a pure
+  `decideOAuthAlert(remainingMs, thresholdMs, lastLevel)` and rewired the
+  caller to use it (one source of truth). Behavior-identical (same boundaries,
+  same one-shot dedup, healthy never alerts); verified by inspection + tsc.
+  Feature is opt-in (`OAUTH_HEALTH_ENABLED`), so dormant unless turned on.
+- `src/embeddings.test.ts` (commit `7e846d1`, 12 tests): `cosineSimilarity`
+  pure math + `embedText`'s bge-m3 NaN-retry logic (mock `ollamaEmbed` at the
+  boundary: success passthrough, retry-with-sanitized only on NaN/unsupported,
+  no retry on unrelated errors or when sanitizing is a no-op, empty short-circuits).
+- `src/warroom-text-router.test.ts` (commit `79dc52c`, 18 tests): the
+  `_internal` helpers it exports for tests - `parseJson` (fences/commentary
+  tolerance), `sanitizeDecision` (rejects out-of-roster primary, drops
+  invalid/dup/primary-equal interveners, caps at 2, bounds reason),
+  `routerFallback` determinism, and prompt builders neutralizing `"""`
+  delimiters in untrusted user text / roster descriptions / replies.
+
+Remaining untested-but-candidate modules (for a future slice; each needs
+either heavier mocking or a judgment call): `agent-config.ts`, `config.ts`
+(pure helpers, but reads files at module load), `env-write.ts` (file writes),
+`slack.ts` / `whatsapp.ts` / `daily-client.ts` (network clients), the
+`*-html.ts` template strings (low value), and `orchestrator.ts` (large,
+side-effecting). The web typecheck gate (20 deferred errors above) is still
+the other open longevity item.
+
 ## Guardrails in force
 
 Push + service-deploy now AUTHORIZED (see intro). Still NO PC restart /
