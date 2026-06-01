@@ -9,7 +9,7 @@ vi.hoisted(() => {
   process.env.NODE_ENV = 'production';
 });
 
-import { redactSecrets, scrubErrSerializer } from './logger.js';
+import { redactSecrets, redactLogArgs, scrubErrSerializer } from './logger.js';
 
 // A clearly-fake, correctly-shaped Telegram bot token: numeric id, colon,
 // then >=20 url-safe chars. Never a real credential.
@@ -110,5 +110,31 @@ describe('scrubErrSerializer', () => {
     const serialized = scrubErrSerializer(cyclic) as { message?: string };
     expect(serialized.message).toContain('bot7654321:<redacted>');
     expect(serialized.message).not.toContain('AAH-FAKE_token_value_1234567890abcDEF');
+  });
+});
+
+describe('redactLogArgs', () => {
+  it('redacts a token-bearing URL passed as a plain message argument', () => {
+    const [msg] = redactLogArgs(['dashboard url https://dash.local/api?token=supersecretvalue123 hit']);
+    expect(msg).toBe('dashboard url https://dash.local/api?token=<redacted> hit');
+  });
+
+  it('redacts every string positional arg but passes objects/numbers through by reference', () => {
+    const ctx = { meeting: 'wr_1', url: 'https://x/?key=leakme' };
+    const out = redactLogArgs([ctx, `connecting ${FAKE_TOKEN}`, 42]);
+    // object arg is untouched (same reference, not mutated) ...
+    expect(out[0]).toBe(ctx);
+    expect((out[0] as { url: string }).url).toBe('https://x/?key=leakme');
+    // ... string arg is scrubbed ...
+    expect(out[1]).toBe('connecting bot7654321:<redacted>');
+    // ... non-string primitives pass through.
+    expect(out[2]).toBe(42);
+  });
+
+  it('returns a new array (does not mutate the caller args in place)', () => {
+    const args: unknown[] = ['?token=abc123'];
+    const out = redactLogArgs(args);
+    expect(out).not.toBe(args);
+    expect(args[0]).toBe('?token=abc123');
   });
 });
