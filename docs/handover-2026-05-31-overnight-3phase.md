@@ -531,17 +531,49 @@ no source change, nothing to deploy.
 
 Suite 864 -> 882 passed (4 skipped, 68 files); web tsc unchanged at 13.
 
-KNOWN BEHAVIOR worth a focused look later (NOT fixed - served code, runtime
-change, out of scope for a test slice): `formatForTelegram` step 3 re-escapes
-inline-code content that step 2 already escaped, so inline code literally
-containing `<`, `>`, or `&` double-escapes. e.g. `` `a<b` `` emits
-`<code>a&amp;lt;b</code>`, which Telegram then displays as the literal text
-`a&lt;b` instead of `a<b`. Fenced blocks are fine (escaped once, in step 1).
-Low impact (inline code with raw angle brackets is rare in model output) and
-the new tests deliberately avoid special chars in inline code so they pin
-current behavior rather than asserting the bug. Fix = drop the re-escape in
-step 3 since step 2 already ran; verify against the protected-placeholder
-flow before changing.
+KNOWN BEHAVIOR (NOT fixed here - served code, behavior change, wants an
+eyes-on session not a blind overnight deploy; QUEUED as a spawn_task chip
+for Gabe): `formatForTelegram` step 3 re-escapes inline-code content that
+step 2 already escaped, so inline code literally containing `<`, `>`, or `&`
+double-escapes. e.g. `` `a<b` `` emits `<code>a&amp;lt;b</code>`, which
+Telegram then displays as the literal text `a&lt;b` instead of `a<b`. Fenced
+blocks are fine (escaped once, in step 1). For a coding bot this is NOT rare
+(`Array<T>`, `a < b`, `foo && bar`, `<div>` all trip it), so it is worth
+fixing. The new tests deliberately avoid special chars in inline code so they
+pin CURRENT behavior; the queued task updates them to assert the corrected
+output. Fix = drop the re-escape in step 3 since step 2 already ran (verified
+not to weaken XSS protection: step 2 escapes the whole string before step 3
+extracts spans, so the captured content can't contain a raw angle bracket).
+
+### Coverage expansion (2026-06-01, seventh slice) - DONE
+
+Extended the HTTP API contract suite. `dashboard.contract.test.ts` exists to
+fail CI when the backend drifts from the shape the web rewrite consumes, but
+~40 of 63 GET routes were unpinned. Added shape + status-code contracts for
+the SPA-depended, DB/config-only read endpoints. Test-only, no source change,
+nothing to deploy.
+
+- `dashboard.contract.test.ts` (`d2e2851`, +16 -> file now 81 tests):
+  `/api/mission/tasks/:id` (404 + the create->read `{task}` round-trip),
+  `/api/memories/pinned`, `/api/agents/:id/{tasks,tokens,status}`,
+  `/api/agents/{suggestions,templates,validate-id}` (validate-id pins the
+  `{ok:false,error}` reserved-name branch and the `{ok:true, suggestions:
+  {displayName,username}}` happy path), `/api/specialists/stats` (the
+  [1,168] hours clamp), `/api/specialists/:callsign/history` (unknown ->
+  400), and `/api/warroom/{meetings, meeting/:id/transcript, text/list}`.
+
+Deliberately excluded so the suite stays hermetic against the in-memory test
+DB: `/api/agents/:id/details` (spawns `systemctl show`), `/api/specialists`
+(awaits Ollama model resolution), all SSE streams (`/api/chat/stream`,
+`/api/warroom/text/stream`), and Ollama/web-search/Daily endpoints (network).
+
+Suite 882 -> 898 passed (4 skipped, 68 files); web tsc unchanged at 13;
+backend `npm run build` green. With this, the backend test surface is broadly
+exhausted for low-risk targets: every src file has a test, security-critical
+files (exfiltration-guard, warroom-tool-policy, security) are fully covered,
+and the remaining uncovered code is async-network clients (slack/whatsapp/
+daily) + CLI entry points, where a unit test would be a fragile mock with
+little signal.
 
 ## Guardrails in force
 
