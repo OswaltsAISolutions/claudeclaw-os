@@ -334,7 +334,7 @@ Batch A (6 commits, 633 -> 687) - previously-uncovered pure helpers:
   bare host gets fallback port) out of resolveOllamaBaseUrl and rewired it (one
   source of truth). Behavior-identical.
 
-Batch B (3 commits, 687 -> 730) - security/reliability primitives:
+Batch B (4 commits, 687 -> 738) - security/reliability primitives:
 - `src/warroom-text-picker-html.ts` + `.test.ts` (commit `71ac15a`, 7 tests):
   hardened the inline-`<script>` embedding. getWarRoomPickerHtml put token /
   chatId into a `<script>` block via JSON.stringify alone, which leaves
@@ -360,6 +360,18 @@ Batch B (3 commits, 687 -> 730) - security/reliability primitives:
   validators (accept the documented shapes; reject wrong prefix/version/variant,
   traversal attempts, illegal chars). Export-only; contract tests still cover
   auth over HTTP, these pin the primitives.
+- `src/dashboard-html.ts` + `.test.ts` (commit `5515c8f`, 8 tests): same
+  inline-`<script>` hardening as the warroom picker, found during a
+  consistency audit of the HTML generators. getDashboardHtml reflected the
+  unvalidated `?chatId=` query param into a `<script>` (bare JSON.stringify)
+  AND, when the War Room is enabled, raw into a navigation onclick attribute.
+  Added a module-level `jsLiteral()` (escapes `<` `>` `&`) for TOKEN / CHAT_ID,
+  and rebuilt the War Room link from the safe runtime constants with
+  encodeURIComponent so no tainted data is reflected into the attribute at all
+  (also fixes a latent bug where an unencoded `&` / space in the token would
+  have corrupted the URL). The legacy page is off by default
+  (`DASHBOARD_LEGACY`) and token-gated, so practical severity is low; this is
+  the SECOND served-code change of the slice - see Deploy note.
 
 Assessed-and-skipped this slice (poor extraction-to-value ratio - the
 meaningful behavior IS the I/O): `daily-client.ts`, `slack.ts`, `whatsapp.ts`
@@ -385,16 +397,18 @@ of Phases 0-2 are now live. Origin/main at the deployed HEAD (0 ahead).
 Next deploys this session follow the same gate: build + full vitest green,
 commit, push, restart, verify health 200 + clean logs.
 
-PENDING (2026-06-01 third slice): the warroom-text-picker `jsLiteral`
-hardening (commit `71ac15a`) is the only served-code change since the last
-restart and is NOT yet live. Deliberately deferred: its functional impact on
-real traffic is nil (it only changes output when a token / chatId contains
-`<` `>` `&`, which operator tokens never do), so an unattended overnight
-restart of the live Jarvis service was judged not worth the small downtime /
-in-flight-interruption risk for a never-triggered code path. The other two
-third-slice source edits (`ollama-prefix-proxy`, `dashboard`) are export-only
-and byte-identical at runtime, so they need no deploy at all. Action for the
-next active window: `npm run build` then restart via the busy-guarded
-`POST /api/agents/main/restart` (or bundle with the next served-code change)
-and verify health 200. Origin/main is otherwise at the deployed HEAD plus
-these three pushed-but-runtime-inert commits.
+PENDING (2026-06-01 third slice): TWO served-code changes since the last
+restart are pushed but NOT yet live - the warroom-text-picker `jsLiteral`
+hardening (commit `71ac15a`) and the matching dashboard-html chatId hardening
+(commit `5515c8f`). Both are deliberately deferred: their functional impact on
+real traffic is nil (output only changes when a token / chatId contains
+`<` `>` `&` or, for the dashboard onclick, a `&` / space in the token - none
+of which operator tokens or numeric Telegram chatIds ever contain), so an
+unattended overnight restart of the live Jarvis service was judged not worth
+the small downtime / in-flight-interruption risk for never-triggered code
+paths. The other two third-slice source edits (`ollama-prefix-proxy`,
+`dashboard`) are export-only and byte-identical at runtime, so they need no
+deploy at all. Action for the next active window: `npm run build` then restart
+via the busy-guarded `POST /api/agents/main/restart` (or bundle with the next
+served-code change) and verify health 200. Origin/main is otherwise at the
+deployed HEAD plus these pushed-but-runtime-inert commits.
