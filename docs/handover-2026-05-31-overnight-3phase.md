@@ -168,7 +168,7 @@ Finding: `web/tsconfig.json` is strict (`noUnusedLocals`,
 build's `tsc` only covers the backend (`rootDir ./src`). So every frontend
 type error has been shipping unchecked. A clean run surfaced 37 errors.
 
-Closed 11 of 37 at the root (commits `6c07180`, `f86c0bd`):
+Closed 14 of 37 at the root (commits `6c07180`, `f86c0bd`, `b1be253`):
 - Added a runnable `typecheck:web` script (`tsc -p web/tsconfig.json`).
 - `web/src/vite-env.d.ts` (`/// <reference types="vite/client" />`) types
   `import.meta.env` - clears 2 errors in BrainGraph3D.
@@ -179,11 +179,15 @@ Closed 11 of 37 at the root (commits `6c07180`, `f86c0bd`):
   at the source. HiveMind and Scheduled now typecheck clean.
 - Dropped genuinely-unused imports (HiveMind `useEffect`; Specialists
   `useEffect` + `apiPost`; Scheduled `Pencil`).
+- `AgentSuggestions.tsx`: `act()` now guards a real null-deref (its sibling
+  `dismiss()` already asserts non-null; closures don't inherit the line-35
+  guard's narrowing). Plus dropped a dead `willRun` compute in StandupConfig
+  that the `inCap` check on the next line already supersedes.
 
 Not deployed: type-only / cleanup, runtime is byte-identical (privacy.ts
 emit unchanged, unused imports tree-shaken already, the .d.ts is not bundled).
 
-REMAINING 26 errors (deferred - these touch the visual centerpiece or need a
+REMAINING 23 errors (deferred - these touch the visual centerpiece or need a
 small design call, so they are left for a session where the user can weigh in
 rather than autonomously deleting creative WIP):
 
@@ -192,12 +196,10 @@ rather than autonomously deleting creative WIP):
 | pages/JarvisHome.tsx | 12 | 10 unused shader consts (PLASMA_VERT, ORB_FRAG, CORE_*, SHELL_*, BACKDROP_*, playBootSweep, makeCurvedHologramPlane) + 2 three.js type mismatches (Float32Array@993, OrbUniforms index sig@1596) | orb visual centerpiece; deleting parked shaders / changing render types is a creative+design judgment |
 | pages/Settings.tsx | 6 | 5 unused helper components (Section/Card/Row/Divider/ReadOnlyRow) + CardGroup missing `children`@217 | unused set looks like a parked component kit; CardGroup needs a children decision |
 | components/BrainGraph3D.tsx | 3 | unused locals x@146, radial@202, i@1746 | visual file; low-risk but batch with the visual review |
-| components/AgentSuggestions.tsx | 2 | null-guard on `suggestion`@52-53 (TS18047 + TS2345) | real latent null bug; safe to fix next, just kept out of this slice |
-| pages/StandupConfig.tsx | 1 | unused `willRun`@197 | trivial; bundle with next cleanup |
 | components/SpecialistFloor.tsx | 1 | `tone="warn"`@157 not in Pill `Tone` union | needs a palette/design call (add a `warn` tone + color token) |
-| components/Sidebar.tsx | 1 | unused `open`@22 | trivial; bundle with next cleanup |
+| components/Sidebar.tsx | 1 | unused `open`@22 (from `sidebarOpen`) | `closeSidebar` is still used, so a mobile drawer may be half-wired; left intact rather than rip out possible WIP |
 
-To finish the gate later: clear these 26, then wire `typecheck:web` into the
+To finish the gate later: clear these 23, then wire `typecheck:web` into the
 `build` script (or a pre-push check) so frontend type errors can never ship
 unchecked again.
 
