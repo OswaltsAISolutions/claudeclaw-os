@@ -136,6 +136,78 @@ independently-read backend contracts. They were NOT browser-verified: the
 dashboard needs a live backend, an auth token, and seeded mission data,
 and the running service is the old build (deploy is gated, see below).
 
+## Post-Phase-2 - continued autonomous run (2026-06-01)
+
+### #13 - frontend test harness + Mission Control coverage - DONE
+
+Stood up a jsdom DOM-testing harness as a SECOND vitest project so the
+Preact UI is testable without disturbing the node backend suite:
+`vitest.workspace.ts` (defineWorkspace: the existing node config + a `web`
+project, jsdom env, `@/` + preact/compat aliases, `web/src/test-setup.ts`).
+Added 16 tests (suite now 510 / 35, up from 494 / 32):
+
+- `web/src/pages/missionTasks.test.ts` (9) - extracted pure view-logic
+  (`partitionTasks`, `isTerminal`/`TERMINAL`, `statusTone`, `hasMoreHistory`)
+  into `web/src/pages/missionTasks.ts` so it is unit-testable with no DOM.
+- `web/src/components/Pill.test.tsx` (3) - tone palette + neutral default.
+- `web/src/pages/MissionControl.test.tsx` (4) - queue grouping, click-to-open
+  detail drawer (fresh server copy), Completed archive + Load-more pager, and
+  the reassign honesty contract (server `ok:false` race shows "Task is no
+  longer queued.", never a phantom success - locks the no-mock-data rule on
+  the live mutation surface).
+
+Bug fixed in passing: completed-task Pills rendered with no color because the
+status `completed` had no palette entry (the palette key is `done`). Added a
+tested `statusTone()` mapping. Exported `Tone` from Pill.tsx. All committed,
+pushed, deployed, verified earlier in the run.
+
+### Web typecheck hole - PARTIALLY closed
+
+Finding: `web/tsconfig.json` is strict (`noUnusedLocals`,
+`noUnusedParameters`, `strict`) and `noEmit`, but NOTHING ran it - the
+build's `tsc` only covers the backend (`rootDir ./src`). So every frontend
+type error has been shipping unchecked. A clean run surfaced 37 errors.
+
+Closed 11 of 37 at the root (commits `6c07180`, `f86c0bd`):
+- Added a runnable `typecheck:web` script (`tsc -p web/tsconfig.json`).
+- `web/src/vite-env.d.ts` (`/// <reference types="vite/client" />`) types
+  `import.meta.env` - clears 2 errors in BrainGraph3D.
+- `web/src/lib/privacy.ts`: `_signals` was typed
+  `ReturnType<typeof signal<boolean>>`, which resolves via the signal no-arg
+  overload to `Signal<boolean | undefined>` and leaked an optional boolean to
+  every consumer (5 errors in HiveMind + Scheduled). Typed it `Signal<boolean>`
+  at the source. HiveMind and Scheduled now typecheck clean.
+- Dropped genuinely-unused imports (HiveMind `useEffect`; Specialists
+  `useEffect` + `apiPost`; Scheduled `Pencil`).
+
+Not deployed: type-only / cleanup, runtime is byte-identical (privacy.ts
+emit unchanged, unused imports tree-shaken already, the .d.ts is not bundled).
+
+REMAINING 26 errors (deferred - these touch the visual centerpiece or need a
+small design call, so they are left for a session where the user can weigh in
+rather than autonomously deleting creative WIP):
+
+| File | Count | What | Why deferred |
+|---|---|---|---|
+| pages/JarvisHome.tsx | 12 | 10 unused shader consts (PLASMA_VERT, ORB_FRAG, CORE_*, SHELL_*, BACKDROP_*, playBootSweep, makeCurvedHologramPlane) + 2 three.js type mismatches (Float32Array@993, OrbUniforms index sig@1596) | orb visual centerpiece; deleting parked shaders / changing render types is a creative+design judgment |
+| pages/Settings.tsx | 6 | 5 unused helper components (Section/Card/Row/Divider/ReadOnlyRow) + CardGroup missing `children`@217 | unused set looks like a parked component kit; CardGroup needs a children decision |
+| components/BrainGraph3D.tsx | 3 | unused locals x@146, radial@202, i@1746 | visual file; low-risk but batch with the visual review |
+| components/AgentSuggestions.tsx | 2 | null-guard on `suggestion`@52-53 (TS18047 + TS2345) | real latent null bug; safe to fix next, just kept out of this slice |
+| pages/StandupConfig.tsx | 1 | unused `willRun`@197 | trivial; bundle with next cleanup |
+| components/SpecialistFloor.tsx | 1 | `tone="warn"`@157 not in Pill `Tone` union | needs a palette/design call (add a `warn` tone + color token) |
+| components/Sidebar.tsx | 1 | unused `open`@22 | trivial; bundle with next cleanup |
+
+To finish the gate later: clear these 26, then wire `typecheck:web` into the
+`build` script (or a pre-push check) so frontend type errors can never ship
+unchecked again.
+
+### Flaky-test note
+
+`src/agent.test.ts` retry/timeout cases (real ~2-10s waits, e.g. "gives up
+after max retries") occasionally flake under load - saw one spurious
+`1 failed | 509 passed` that went green on immediate re-run. Worth making
+those deterministic (fake timers) so green stays a trustworthy signal.
+
 ## Guardrails in force
 
 Push + service-deploy now AUTHORIZED (see intro). Still NO PC restart /
