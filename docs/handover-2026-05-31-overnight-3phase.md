@@ -84,13 +84,54 @@ What landed:
 Committed in logical chunks on local `main` (still unpushed). Not
 deployed (see deploy note).
 
-## Phase 2 - Mission Control completion (NOT STARTED)
+## Phase 2 - Mission Control completion - DONE
 
-- Surface `GET /api/mission/history` archive view.
-- Mount the dead `TaskDetailsModal` + `GET /api/mission/tasks/:id`.
-- Floor card drill-in.
-- Reassign via `PATCH /api/mission/tasks/:id`.
-- Priority queue view.
+Build GREEN (vite + tsc), full suite GREEN (still 494 tests / 32 files;
+this slice is frontend-only, no new unit tests). One commit on local
+`main` (unpushed): `feat(web): Mission Control task drill-in, reassign,
+history archive`.
+
+IMPORTANT: the original 5-item list below was written from a stale plan.
+Verifying against the actual files (MissionControl.tsx is 529 lines, not
+the 1085 an Explore agent fabricated) showed most of it was already
+built (4-tab Queue/Active/Completed/Floor UI, SpecialistFloor, create
+modal, auto-route, cancel, delete). All backend endpoints already exist
+in `src/dashboard.ts` (1635-1743) and `src/db.ts` (2288-2392), verified
+by reading them. The real, remaining gaps were narrower:
+
+What landed:
+
+1. Mounted the dead `TaskDetailsModal` as a click-to-open drill-in (click
+   a task title). It pulls a fresh copy via `GET /api/mission/tasks/:id`
+   so a running task shows its latest result, and shows status / prompt /
+   result / error / created+started+finished timing. Replaces the old
+   inline row expand with one richer detail surface.
+2. Reassign via `PATCH /api/mission/tasks/:id`, queued-only (matches the
+   backend `reassignMissionTask` `WHERE status='queued'` constraint). The
+   handler checks the returned `ok` flag, so a task that just raced into
+   `running` is reported honestly ("Task is no longer queued.") instead
+   of a false success. This consumed the previously dead `apiPatch`
+   import and the dead `agents` prop.
+3. Completed tab is now a true archive backed by `GET /api/mission/history`
+   (`{ tasks, total }`) with a real total badge and a "Load more" pager
+   (30/page), replacing the old client-side cap of 50 off the live poll.
+   Also excluded terminal tasks from the Queue group and removed the
+   unused `StatusDot` import.
+
+Deliberately NOT done (these two stale items contradict current design):
+
+- "Floor card drill-in" - SpecialistFloor.tsx (line 241) intentionally
+  defers per-specialist history to the `/specialists` page; the Floor is
+  the live-ops grid. Building a drill-in here would fight that decision.
+- "Priority queue view" - the create modal (CreateTaskModal comment)
+  explicitly abandons priority: every task routes to Jarvis (main) who
+  picks the specialist via intelligentRoute. A priority UI would
+  contradict that product decision.
+
+UI note: changes are verified by tsc + the full test suite + matching the
+independently-read backend contracts. They were NOT browser-verified: the
+dashboard needs a live backend, an auth token, and seeded mission data,
+and the running service is the old build (deploy is gated, see below).
 
 ## Guardrails in force
 
