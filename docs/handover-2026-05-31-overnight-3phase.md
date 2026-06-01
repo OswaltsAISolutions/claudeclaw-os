@@ -449,6 +449,67 @@ non-redundantly covered across all four generators. Also reconciled the stale
 "Web typecheck hole" REMAINING table above (it still listed Settings.tsx +
 SpecialistFloor.tsx as deferred though Batch C had closed them) to the true 13.
 
+### Coverage expansion (2026-06-01, fifth slice) - DONE
+
+Sustained web-frontend pure-logic test-coverage push across `web/src/lib`.
+All test-only: no source / runtime change, nothing to deploy (SPA test files
+aren't shipped, and the live bundle was untouched). Suite 750 -> 864 passed
+(4 skipped throughout, 68 test files); web tsc held at exactly 13 errors the
+whole time (the parked JarvisHome orb + Sidebar items, unchanged). Every new
+file passed on first run, confirming the source traces. 11 new files:
+
+- `cron.test.ts` (`b74e7cd`, 31): parseSchedule / buildSchedule / describeCron
+  for the visual schedule picker - 12/24h formatting, weekday/weekend/custom
+  dow, every-N-min/hour, day-of-month + month branches, raw-cron fallback for
+  multi-minute x multi-hour grids, dow=7->Sunday, and a parse->build round-trip.
+- `format.test.ts` (`36ba8ae`, 19): formatRelativeTime (fake-timer buckets +
+  future-clamp), formatDuration, formatNumber quirks (1999->"2k", 999999->
+  "1000k"), formatCost (<$0.01 floor), safeJsonArray.
+- `markdown.test.ts` (`68552b6`, 7): renderMarkdown XSS contract - script
+  strip (text survives), images dropped, javascript: neutralized, event-handler
+  attrs removed, safe https href kept.
+- `command-palette.test.ts` (`8c9ce89`, 7): filterActions token/initials match,
+  empty-query same-reference, case-insensitivity, no-mutation (synthetic
+  actions, decoupled from ROUTES).
+- `personalization.test.ts` (`93a25b8`, 15): setWorkspaceName sanitize/cap/
+  default, mission-width [240,640] clamp + round (merge vs replace),
+  toggleSectionCollapsed immutability, matchesModKey/modKeyLabel explicit modes
+  (./api stubbed, fake timers kill the 600ms debounce; 'auto' platform branch
+  left untested on purpose).
+- `privacy.test.ts` (`12b1ded`, 7): screenshot-blur persistence - default
+  unblurred only when unset, new key wins over legacy blurred/revealed, per-
+  section memoized signal, toggle flips + persists on/off (reset-module +
+  seeded localStorage per case).
+- `toasts.test.ts` (`12b1ded`, 8): default 4s duration + caller override,
+  durationMs:0 persists, auto-dismiss exactly at the duration, unique ids,
+  dismiss-only-the-match (fake timers).
+- `theme.test.ts` (`ead9adf`, 7): load* initializers reject malformed/out-of-
+  range stored values (defaults ios-dark / accent null / scale 1.0 / costs OFF
+  / boot-audio ON) and setters guard input (accent #rrggbb, scale [0.8,1.6]).
+- `routes.test.ts` (`ead9adf`, 5): ROUTES invariants - unique paths + shortcuts,
+  every section has a SECTION_LABEL, DEFAULT_ROUTE resolves, rooted paths /
+  non-empty labels (guards the hand-edited sidebar/palette/router source of truth).
+- `api.test.ts` (`d8bd929`, 5): token-append (withToken via tokenizedSseUrl) -
+  ? vs & separator, encodeURIComponent, sessionStorage token cache, ApiError
+  shape (reset-module + seeded sessionStorage).
+- `useDebounce.test.tsx` (`d8bd929`, 3): useDebouncedValue initial value,
+  propagate-after-delay, timer-reset on rapid change so an intermediate value
+  never lands (fake timers + act()).
+
+Techniques reused: reset-module + seeded localStorage/sessionStorage to drive
+module-load initializers through each branch; fake timers for debounce /
+auto-dismiss / hook delay; `act()` to flush the preact hook re-render.
+
+Deliberately left uncovered in `web/src/lib` (poor unit-test value, not gaps):
+`chat-stream.ts` (heavy EventSource / window / history side effects, no pure
+seam), `sidebar.ts` (a one-line setter), `webgl.ts` (needs a real WebGL
+context jsdom lacks). In `web/src/pages` the only pure helper is
+`missionTasks.ts`, already covered; everything else there + in `components` is
+a `.tsx` component (render-harness territory, mostly thin useFetch wiring that
+`useFetch.test.tsx` already exercises). The web pure-logic surface is now
+broadly pinned; further web gains would be component render tests (higher
+fragility, lower value) rather than more lib coverage.
+
 ## Guardrails in force
 
 Push + service-deploy now AUTHORIZED (see intro). Still NO PC restart /
