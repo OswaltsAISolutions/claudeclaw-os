@@ -332,3 +332,21 @@ export function getSecurityStatus(): {
     lastActivity: _lastActivity,
   };
 }
+
+/**
+ * Reset all module-level security state to defaults.
+ *
+ * For test isolation only: `initSecurity` deliberately never clears a
+ * configured PIN (the process configures security once at startup and
+ * keeps it), so without this a PIN set by one test would leak into the
+ * next. Not called in production.
+ */
+export function resetSecurity(): void {
+  _pinHash = '';
+  _pinSalt = '';
+  _idleLockMinutes = 0;
+  _killPhrase = '';
+  _locked = false;
+  _lastActivity = Date.now();
+  _auditCallback = null;
+}
