@@ -985,6 +985,54 @@ uploads gap (slice 18) was the genuine outlier (media files are KB-MB each,
 truly unbounded), NOT a symptom of a broader pattern. No DB pruning added (would
 cross the no-truncation guardrail for zero real benefit).
 
+### Reliability fix: guard always-on daemon timers against crash (2026-06-01, twentieth slice) - DONE + DEPLOYED
+
+Generalized the slice-19 crash-path into a defect-class sweep. Pattern: a
+process-lifetime timer whose async callback can reject, where the rejection
+FLOATS (setInterval ignores the returned promise, or the call site uses `void`).
+On Node's default unhandled-rejections=throw that is an unhandledRejection ->
+process crash, and there is NO global handler in src/ to catch it (confirmed
+slice 19). Swept every always-on (boot-started) daemon timer; fixed three:
+
+- scheduler.ts:57 (60s tick): `void runDueTasks()` floated rejections from the
+  tick's OUTER orchestration - getDueTasks (DB read), computeNextRun (throws on
+  a malformed schedule string), markTaskRunning, and the awaited
+  runDueMissionTasks. A SQLITE_BUSY read or ONE corrupt schedule row would
+  crash-loop the bot every 60s. Now `.catch()` at the call site. Per-task
+  EXECUTION was already guarded inside the enqueue callback. ALSO guarded the 5s
+  mission cancel-poll (scheduler.ts:159, a getMissionTask read running
+  concurrently with the agent's own writes = prime SQLITE_BUSY) so its sync
+  throw can't become an uncaughtException (separate tick, unreachable by the
+  tick's .catch()).
+- oauth-health.ts:161/164 (10s initial + 30m periodic): checkOAuthHealth has no
+  top-level guard and does `await sender(...)` (a Telegram send). That rejects on
+  exactly the transient network blip an OAuth alert fires under (cf. slices
+  15-17), so `void checkOAuthHealth()` could crash the bot precisely when
+  Telegram is flaky. Both sites now route through a `.catch()` wrapper.
+- whatsapp.ts:124 (3s outbox poll, the HIGHEST-frequency daemon timer):
+  getPendingWaMessages() (DB read) sat OUTSIDE the per-message try/catch, so it
+  could reject the 3s callback and crash-loop every 3s. Whole body now guarded;
+  per-message sends keep their own catch so one bad recipient doesn't skip the
+  rest.
+
+DELIBERATELY LEFT ALONE: the war-room idle-channel sweep
+(warroom-text-events.ts:191) is synchronous + pure in-memory (Map iteration,
+ch.close(), delete) with no DB/network/IO, so no realistic throw path - guarding
+it would be over-engineering for a scenario that can't happen. Drew the line at
+timers that touch DB/network (real transient-failure profile). NOT swept this
+slice (session/connection-scoped, not boot-daemons; larger audit, possible
+follow-up): dashboard SSE ping/heartbeat intervals (dashboard.ts:1088/2810/3877)
+and war-room orchestrator cancelWatcher (warroom-text-orchestrator.ts:1556).
+
+All mirror the `.catch()` convention the consolidation timer (index.ts:188-192)
+already uses. Happy path unchanged. tsc exit 0, build green, full suite 965
+passed / 4 skipped (scheduler.test.ts 27/27). DEPLOYED via busy-guarded restart
+(no force) -> 200 (no turn in flight), health 200 attempt 1, clean boot (PID
+336727: DB ready, "Scheduler started (checking every 60s)", dashboard + war room
+up; ZERO error/tick-failed/poll-failed lines). Session preserved (8d,
+claude-opus-4-7, telegramConnected true, kill switches intact). Origin/main at
+deployed HEAD (`298e58d`, 0 ahead).
+
 ### Security: dependency audit (2026-06-01) - NEEDS EYES-ON
 
 Ran `npm audit` as a longevity check. Findings (prod tree): 9
@@ -1145,6 +1193,15 @@ poll attempt 1, clean boot (PID 331851: DB ready, ollama-proxy listening,
 dashboard + war room up; ZERO sweep/cleanup error lines, boot-time
 runMaintenance ran clean; session preserved 8d, telegramConnected true).
 Origin/main at deployed HEAD (`df34b9e`, 0 ahead).
+
+DONE 2026-06-01 ~05:15. Deployed the daemon-timer crash-guard sweep (`298e58d`,
+twentieth slice: scheduler 60s tick + 5s cancel-poll, oauth-health 10s/30m,
+whatsapp 3s outbox). tsc exit 0, build green, full suite 965/4-skipped;
+busy-guarded restart WITHOUT force -> 200 (no turn in flight), health 200 on
+poll attempt 1, clean boot (PID 336727: DB ready, "Scheduler started (checking
+every 60s)", dashboard + war room up; ZERO error/tick-failed/poll-failed lines;
+session preserved 8d, telegramConnected true, kill switches intact). Origin/main
+at deployed HEAD (`298e58d`, 0 ahead).
 
 FOLLOW-UP (refactor, not urgent): the four generators duplicate security
 helpers, but a 2026-06-01 audit found the duplication is NOT uniform - do NOT
