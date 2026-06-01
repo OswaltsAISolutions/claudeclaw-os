@@ -575,6 +575,34 @@ and the remaining uncovered code is async-network clients (slack/whatsapp/
 daily) + CLI entry points, where a unit test would be a fragile mock with
 little signal.
 
+### Coverage expansion (2026-06-01, eighth slice) - DONE
+
+Pinned the rejection branches of the mutating endpoints. The seventh
+slice covered read shapes; this one covers the input-validation guards
+that the web rewrite relies on returning 400 (not 500, not a silent
+side effect) for bad input. Only the guards that bail *before* any
+write are exercised, so the suite stays hermetic.
+
+- `dashboard.contract.test.ts` (`6cf04a2`, +10 -> file now 91 tests):
+  POST `/api/security/kill-switch` (missing key, unknown switch), POST
+  `/api/specialists/:callsign/tier` (unknown callsign, invalid tier),
+  GET `/api/specialists/route` (empty task -> 400; valid task stays the
+  pure `{suggestion}` path), POST `/api/agents/create` (empty body,
+  missing botToken), PATCH `/api/mission/tasks/:id` (missing and
+  unknown assigned_agent).
+
+Happy paths deliberately untested here and called out in the file's
+lead comment: kill-switch writes the real `.env` and agents/create
+provisions a real agent + systemd service, so the suite never crosses
+those boundaries. suggestRoute / suggestBotNames happy paths are
+already pinned elsewhere (route's valid-task case, validate-id suite).
+
+Suite 898 -> 908 passed (4 skipped, 68 files); web tsc unchanged at 13;
+backend `npm run build` green. This closes out the low-risk contract
+lane: GET shapes and mutation rejection guards are both pinned, leaving
+only side-effecting happy paths (need a sandbox the in-memory DB can't
+provide) and the network/SSE routes excluded above.
+
 ## Guardrails in force
 
 Push + service-deploy now AUTHORIZED (see intro). Still NO PC restart /
