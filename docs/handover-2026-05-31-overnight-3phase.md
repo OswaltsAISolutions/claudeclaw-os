@@ -2,8 +2,11 @@
 
 Living progress doc for the approved ~8h overnight run. Updated at each
 phase checkpoint so the next session bootstraps from truth. Working on
-branch `main`, committing locally in logical chunks, NOT pushing (push
-is classifier-gated and was not requested).
+branch `main`. UPDATE 2026-05-31 late: the user granted full autonomous
+authority for the night and explicitly required that all work be "pushed
+implimented, and implimented correctly without breaking anything else."
+So push AND deploy are now authorized and being done in verified
+increments (was previously hold-and-ask).
 
 ## The plan (user-approved: "Full 3-phase, recommended")
 
@@ -135,13 +138,20 @@ and the running service is the old build (deploy is gated, see below).
 
 ## Guardrails in force
 
-No push. No PC restart / plugin install / permission-OAuth / `.env` /
-Jarvis-persona edits without explicit approval. No mock data. No
-em/en dashes. Intelligence > cost (Max plan; cloud Claude is default for
-main Jarvis, local for specialists per the 2026-05-25 pivot).
+Push + service-deploy now AUTHORIZED (see intro). Still NO PC restart /
+plugin install / permission-OAuth / `.env` / Jarvis-persona edits without
+explicit approval (a `systemctl --user restart` of the app is NOT a PC
+restart and is allowed). No mock data. No em/en dashes. Intelligence >
+cost (Max plan; cloud Claude is default for main Jarvis, local for
+specialists per the 2026-05-25 pivot).
 
 ## Deploy note
 
-The live service still runs old in-memory code. Deploying any of this to
-Jarvis needs `systemctl --user restart com.claudeclaw.main.service` -
-NOT done (deploy is a separate decision, and the run is mid-flight).
+DONE 2026-05-31 23:41. Restarted `com.claudeclaw.main.service`; came back
+active/running (new PID, 0 restarts), clean boot logs ("Database ready",
+"Dashboard server running" :3141, "ClaudeClaw online: @GCruiseJarvisBot").
+Token-gated `GET /api/health` returns HTTP 200 with model
+`claude-opus-4-7`, `telegramConnected: true`, no kill-switch refusals. All
+of Phases 0-2 are now live. Origin/main at the deployed HEAD (0 ahead).
+Next deploys this session follow the same gate: build + full vitest green,
+commit, push, restart, verify health 200 + clean logs.
