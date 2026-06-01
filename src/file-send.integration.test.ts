@@ -6,8 +6,12 @@
  * 2. Grammy's InputFile + replyWithDocument/replyWithPhoto via mocked context
  * 3. Real Telegram Bot API call to actually send a file to the chat
  *
- * The real API tests require TELEGRAM_BOT_TOKEN and ALLOWED_CHAT_ID in .env.
- * They're skipped automatically if those aren't set.
+ * The real API tests send REAL files to your Telegram chat, so they are
+ * opt-in: set RUN_TELEGRAM_INTEGRATION=1 and have TELEGRAM_BOT_TOKEN +
+ * ALLOWED_CHAT_ID in .env. Otherwise they skip, keeping `npm test`
+ * deterministic and side-effect-free even on the production box (which
+ * always has a live token in .env and would otherwise spam the chat on
+ * every test run).
  */
 import fs from 'fs';
 import os from 'os';
@@ -179,12 +183,17 @@ describe('file sending: mocked Grammy context', () => {
 });
 
 // ── Real Telegram API tests ─────────────────────────────────────────
-// These actually send a file to your Telegram chat.
-// Skipped if TELEGRAM_BOT_TOKEN or ALLOWED_CHAT_ID are not in .env.
+// These actually send a file to your Telegram chat, so they are opt-in:
+// run with RUN_TELEGRAM_INTEGRATION=1 (and TELEGRAM_BOT_TOKEN +
+// ALLOWED_CHAT_ID in .env). Otherwise they skip.
 
 describe('file sending: real Telegram API', () => {
   const { token, chatId } = loadEnv();
-  const canRunRealTests = !!(token && chatId);
+  // Require an explicit opt-in flag on top of credentials: the production
+  // box always has a live token, so gating on token alone would fire real
+  // sends on every `npm test` and make the suite network-dependent.
+  const canRunRealTests =
+    !!(token && chatId) && process.env.RUN_TELEGRAM_INTEGRATION === '1';
 
   // Create a real temp file for the test
   let tmpFile: string;
