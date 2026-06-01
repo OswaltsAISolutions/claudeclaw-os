@@ -1033,6 +1033,53 @@ up; ZERO error/tick-failed/poll-failed lines). Session preserved (8d,
 claude-opus-4-7, telegramConnected true, kill switches intact). Origin/main at
 deployed HEAD (`298e58d`, 0 ahead).
 
+### Reliability + security fix: redact-on-crash global handler (2026-06-01, twenty-first slice) - DONE + DEPLOYED
+
+Closes the residual gap the nineteenth slice deliberately left open. Slices
+19/20 guarded every KNOWN always-on timer at its call site, but the slice-19
+entry recorded the truth that "there is NO global handler in src/ to catch it":
+any unhandled rejection or sync throw from a path we did NOT sweep (or a future
+one) still crashed with Node's RAW stack dump straight to stderr. That dump
+BYPASSES the `err` serializer's redaction (added the fourteenth slice), so a
+token-bearing error - canonically grammy's HttpError, whose `.message` is the
+full `https://api.telegram.org/bot<id>:<token>/...` URL - would leak the bot
+credential to journald on crash, defeating the very redaction that module
+exists for.
+
+Added to src/logger.ts:
+- `handleFatal(kind, reason, opts)`: normalizes a non-Error reason, writes one
+  REDACTED `FATAL <kind>: <stack>` line, then exits non-zero. `write`/`exit` are
+  injectable purely for tests; defaults are `writeSync(2, ...)` and
+  `process.exit(1)`. The whole body is wrapped so the handler can NEVER throw.
+- `installCrashHandlers()` (idempotent): registers `uncaughtException` +
+  `unhandledRejection` -> `handleFatal`.
+
+Two design points, both deliberate:
+- SYNCHRONOUS `fs.writeSync(2, ...)`, not `logger.fatal()`. NODE_ENV is unset on
+  this service, so pino runs the pino-pretty WORKER-THREAD transport, which can
+  be torn down before it flushes on exit - an async log line would be lost
+  exactly when we need it. The sync fd-2 write bypasses stream buffering and is
+  guaranteed before exit.
+- We do NOT swallow-and-continue. After an uncaughtException the process may be
+  in an undefined state, and Node treats unhandledRejection as fatal by default;
+  so the handler only makes the already-happening crash OBSERVABLE and
+  SECRET-SAFE, then exits 1 so systemd restarts clean. This is strictly safer
+  than the bare default, never less safe.
+
+`installCrashHandlers()` is called first thing in src/index.ts (before `--agent`
+parsing) so a throw during startup is covered too. +3 tests in logger.test.ts
+(injected write/exit): redacts a leaked token from crash output and exits 1;
+normalizes a non-Error string reason and still exits 1; survives a write sink
+that itself throws without re-throwing. tsc exit 0, build green, full suite 968
+passed / 4 skipped (was 965; +3 this slice). DEPLOYED via busy-guarded restart
+(no force) -> 200 (no turn in flight), health 200 attempt 1, clean boot (PID
+341655: DB ready, Orchestrator initialized, consolidation enabled, War Room WS
+proxy active, "Scheduler started (checking every 60s)", ollama-proxy listening,
+dashboard 3141 + war room 7860 up, "ClaudeClaw online: @GCruiseJarvisBot"; ZERO
+error/fatal/warn/exception lines from the new PID). Session preserved (8d,
+claude-opus-4-7, telegramConnected true, kill switches intact). Origin/main at
+deployed HEAD (`359c42d`, 0 ahead).
+
 ### Security: dependency audit (2026-06-01) - NEEDS EYES-ON
 
 Ran `npm audit` as a longevity check. Findings (prod tree): 9
@@ -1202,6 +1249,20 @@ poll attempt 1, clean boot (PID 336727: DB ready, "Scheduler started (checking
 every 60s)", dashboard + war room up; ZERO error/tick-failed/poll-failed lines;
 session preserved 8d, telegramConnected true, kill switches intact). Origin/main
 at deployed HEAD (`298e58d`, 0 ahead).
+
+DONE 2026-06-01 ~05:22. Deployed the redact-on-crash global handler (`359c42d`,
+twenty-first slice: `installCrashHandlers()` + `handleFatal`, called first thing
+in index.ts). This is the one deploy of the daemon-reliability arc that changes
+the ENTRY POINT, so boot was watched closely (a bug here exits the process
+immediately). tsc exit 0, build green, full suite 968/4-skipped (+3 crash-handler
+tests); busy-guarded restart WITHOUT force -> 200 (no turn in flight), health 200
+on poll attempt 1, clean boot (PID 341655: DB ready, Orchestrator initialized,
+consolidation enabled, War Room WS proxy active, "Scheduler started (checking
+every 60s)", ollama-proxy listening, dashboard 3141 + war room 7860 up,
+"ClaudeClaw online: @GCruiseJarvisBot", "ClaudeClaw is running"; a dedicated
+grep for error/fatal/warn/unhandled/uncaught/exception across the new PID
+returned NOTHING). Session preserved 8d, claude-opus-4-7, telegramConnected true,
+kill switches intact. Origin/main at deployed HEAD (`359c42d`, 0 ahead).
 
 FOLLOW-UP (refactor, not urgent): the four generators duplicate security
 helpers, but a 2026-06-01 audit found the duplication is NOT uniform - do NOT
