@@ -36,6 +36,7 @@ import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessa
 import { buildMemoryContext, createPinnedMemory, evaluateMemoryRelevance, logAssistantTurn, shouldNudgeMemory, MEMORY_NUDGE_TEXT } from './memory.js';
 import { classifyMessageComplexity } from './message-classifier.js';
 import { scanForSecrets, redactSecrets } from './exfiltration-guard.js';
+import { createTelegramRetryTransformer } from './telegram-retry.js';
 import { trackUsage, getRateStatus } from './rate-tracker.js';
 import { buildCostFooter } from './cost-footer.js';
 import { setHighImportanceCallback } from './memory-ingest.js';
@@ -975,6 +976,12 @@ export function createBot(): Bot {
   }
 
   const bot = new Bot(token);
+
+  // Transparently retry transient outbound-send failures (429 flood control,
+  // network blips, 5xx) so a finished Opus turn can't be silently dropped on a
+  // momentary glitch. Installed on the shared Api instance, so it covers every
+  // send path: ctx.reply, the dashboard relay, and war-room notifications.
+  bot.api.config.use(createTelegramRetryTransformer());
 
   // Reject group chats. ClaudeClaw only works in private (1-on-1) chats.
   // This prevents message leakage if the bot is added to a group.
