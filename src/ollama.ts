@@ -303,10 +303,21 @@ export async function ollamaChat(
   signal?: AbortSignal,
 ): Promise<void> {
   const baseUrl = resolveOllamaBaseUrl();
+  // Disable Qwen3 thinking mode at the /api/chat layer. Per Ollama docs
+  // (ollama.com/blog/thinking), `think: false` makes the model emit its
+  // final answer directly instead of wrapping reasoning in <think> blocks
+  // that can eat the entire output budget. Native /api/chat honors this;
+  // OpenAI-compat /v1/chat/completions doesn't always, which is why we
+  // route Qwen3 work through direct Ollama instead of via claw.
+  const isQwen3 = /qwen3/i.test(model);
+  const body: Record<string, unknown> = { model, messages, stream: true, options };
+  if (isQwen3) {
+    body.think = false;
+  }
   const res = await fetch(`${baseUrl}/api/chat`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ model, messages, stream: true, options }),
+    body: JSON.stringify(body),
     signal,
   });
   if (!res.ok) {

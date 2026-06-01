@@ -51,6 +51,9 @@ scripts/waste-reminder.sh
 start-main.sh
 start-main.bat
 WARROOM_TEST_PLAN.md
+# Machine-specific boot wrappers (hardcoded user/distro/paths, like win/).
+scripts/claudeclaw-startup.vbs
+scripts/wsl-boot.sh
 
 # ── Working docs / planning artifacts ─────────────────────────────────
 # Anything matching here is personal scratch work that must never reach
@@ -120,3 +123,13 @@ agents/*/agent.yaml.backup
 # CWDs (sub-agents start with cwd=agents/<id>).
 .claude/claudex/
 agents/*/.claude/claudex/
+
+# Claw harness runtime sandbox dirs — per-run working/home/tmp trees the
+# Rust claw harness creates for local specialists. Pure runtime state.
+.claw/
+.sandbox-home/
+.sandbox-tmp/
+
+# Dot-prefixed scratch under scripts/ — throwaway verify/diag/probe/deploy
+# helpers from autonomous sessions. Canonical scripts are never dot-prefixed.
+/scripts/.*

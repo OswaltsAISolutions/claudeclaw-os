@@ -16,6 +16,7 @@ import { recoverOrphanMessages } from './recovery.js';
 import { runWarroomAvatarMigration } from './avatars.js';
 import { initOAuthHealthCheck } from './oauth-health.js';
 import { initOrchestrator } from './orchestrator.js';
+import { startOllamaPrefixProxy } from './ollama-prefix-proxy.js';
 import { initScheduler } from './scheduler.js';
 import { setTelegramConnected, setBotInfo } from './state.js';
 import { getVenvPython, killProcess } from './platform.js';
@@ -146,6 +147,12 @@ async function main(): Promise<void> {
   });
 
   initOrchestrator();
+
+  // Ollama prefix-strip proxy on 127.0.0.1:11435. Lets full-claw
+  // specialists (atlas, mercury, sentinel) talk to local Ollama by
+  // stripping the `openai/` routing prefix claw requires but Ollama
+  // doesn't understand. See src/ollama-prefix-proxy.ts for rationale.
+  startOllamaPrefixProxy();
 
   // Decay and consolidation run ONLY in the main process to prevent
   // multi-process over-decay (5x decay on simultaneous restart) and
