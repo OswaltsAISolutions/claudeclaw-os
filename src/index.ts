@@ -160,7 +160,12 @@ async function main(): Promise<void> {
   if (AGENT_ID === 'main') {
     runDecaySweep();
     cleanupOldMissionTasks(7);
-    setInterval(() => { runDecaySweep(); cleanupOldMissionTasks(7); }, 24 * 60 * 60 * 1000);
+    // Telegram media downloads (voice/photo/document) accumulate in
+    // workspace/uploads. Only main runs the bot handlers that write them, so
+    // sweep here at boot AND every 24h. Without the interval, disk grows
+    // unbounded between restarts on a service meant to run for weeks.
+    cleanupOldUploads();
+    setInterval(() => { runDecaySweep(); cleanupOldMissionTasks(7); cleanupOldUploads(); }, 24 * 60 * 60 * 1000);
 
     // One-time bundled→mutable avatar migration. After this lands, any
     // previously user-uploaded main avatar that we wrote into the
@@ -190,8 +195,6 @@ async function main(): Promise<void> {
   } else {
     logger.info({ agentId: AGENT_ID }, 'Skipping decay/consolidation (main process owns these)');
   }
-
-  cleanupOldUploads();
 
   const bot = createBot();
 
