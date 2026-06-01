@@ -52,8 +52,10 @@ import {
   getWarRoomMeetings,
   getWarRoomTranscript,
   getAllDashboardSettings,
+  getAllSpecialistTierOverrides,
   getDashboardSetting,
   setDashboardSetting,
+  setSpecialistTierOverride,
   insertAuditLog,
   appendAgentFileHistory,
   listAgentFileHistory,
@@ -107,6 +109,7 @@ import {
   getTextMeetings,
   logConversationTurn,
   getRecentConversation,
+  getSpecialistStats,
   logToHiveMind,
 } from './db.js';
 import { messageQueue } from './message-queue.js';
@@ -115,6 +118,7 @@ import { getIngestionQuotaStatus, extractViaClaude } from './memory-ingest.js';
 import { WARROOM_ENABLED, WARROOM_PORT } from './config.js';
 import { logger } from './logger.js';
 import { getTelegramConnected, getBotInfo, chatEvents, getIsProcessing, abortActiveQuery, ChatEvent, emitChatEvent } from './state.js';
+import { transcribeAudio, synthesizeSpeech, synthesizeSpeechLocal, UPLOADS_DIR } from './voice.js';
 import { killProcess, isProcessAlive, findProcessesByPattern } from './platform.js';
 import {
   ollamaHealth,
@@ -128,7 +132,8 @@ import {
   resolveOllamaBaseUrl,
   type ChatMessage,
 } from './ollama.js';
-import { buildMemoryContext } from './memory.js';
+import { buildMemoryContext, createPinnedMemory } from './memory.js';
+import { readEnvFile } from './env.js';
 import {
   SPECIALISTS,
   ALL_CALLSIGNS,
@@ -510,6 +515,34 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       headers: {
         'Content-Type': ctype,
         'Cache-Control': 'public, max-age=86400',
+      },
+    });
+  });
+
+  // ── Audio assets (Vite public/ → dist/web/sounds/) ────────────────────
+  // The JARVIS Home boot sequence loads a background music clip from
+  // /sounds/jarvis-boot.mp3 (copied from web/public/sounds/ at build).
+  // Range requests are honored so browsers can stream/seek the clip.
+  app.get('/sounds/:filename{.+\\.(mp3|ogg|wav|m4a|opus)}', (c) => {
+    const filename = c.req.param('filename');
+    const filePath = path.join(PROJECT_ROOT, 'dist', 'web', 'sounds', filename);
+    const root = path.join(PROJECT_ROOT, 'dist', 'web', 'sounds');
+    if (!filePath.startsWith(root + path.sep)) return c.text('', 403);
+    if (!fs.existsSync(filePath)) return c.text('', 404);
+    const data = fs.readFileSync(filePath);
+    const ext = path.extname(filePath).toLowerCase();
+    const ctype = ext === '.mp3' ? 'audio/mpeg'
+      : ext === '.ogg' ? 'audio/ogg'
+      : ext === '.wav' ? 'audio/wav'
+      : ext === '.m4a' ? 'audio/mp4'
+      : ext === '.opus' ? 'audio/opus'
+      : 'application/octet-stream';
+    return new Response(new Uint8Array(data), {
+      headers: {
+        'Content-Type': ctype,
+        'Content-Length': data.length.toString(),
+        'Cache-Control': 'public, max-age=86400',
+        'Accept-Ranges': 'bytes',
       },
     });
   });
@@ -1861,6 +1894,25 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const sortBy = (c.req.query('sort') || 'importance') as 'importance' | 'salience' | 'recent';
     const result = getDashboardMemoriesList(chatId, limit, offset, sortBy);
     return c.json(result);
+  });
+
+  // Promote arbitrary text to a permanent (pinned) memory. Used by the
+  // chat composer's `/pin <text>` shortcut and any future "pin this
+  // message" UI affordance. Same backend as the Telegram /pin command.
+  app.post('/api/memory/pin', async (c) => {
+    let body: { text?: string; chatId?: string };
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    const text = (body?.text || '').trim();
+    if (!text) return c.json({ error: 'text is required' }, 400);
+    if (text.length > 2000) return c.json({ error: 'text too long (max 2000 chars)' }, 400);
+    const chatId = body?.chatId || ALLOWED_CHAT_ID || '';
+    if (!chatId) return c.json({ error: 'no chatId resolved' }, 500);
+    try {
+      const result = await createPinnedMemory(chatId, text, AGENT_ID);
+      return c.json({ ok: true, id: result.id, summary: result.summary });
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 500);
+    }
   });
 
   // System health
@@ -3219,38 +3271,237 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     });
   });
 
+  // ── Web search via Brave Search API ──────────────────────────────
+  // Backs the local pivot's web research capability. Sleuth (claw-analog,
+  // no MCP) gets pre-fetched results via this endpoint when Jarvis-main
+  // detects a research-shaped task. Atlas/mercury can curl it directly
+  // from bash inside their claw subprocess (`curl http://127.0.0.1:3141/api/web/search?q=...`).
+  //
+  // Auth: requires the same dashboard token as every other endpoint.
+  // Anyone with shell access can curl this from localhost; the token
+  // is the boundary.
+  //
+  // Brave key: read from process.env.BRAVE_API_KEY (loaded from .env
+  // via readEnvFile on service startup). If absent, returns 503 so the
+  // caller can fall back to "I have no live web access" gracefully.
+  app.get('/api/web/search', async (c) => {
+    const q = (c.req.query('q') || '').trim();
+    if (!q) return c.json({ error: 'query (q) required' }, 400);
+    if (q.length > 400) return c.json({ error: 'query too long (max 400 chars)' }, 400);
+    // count: how many results to return. Brave's max per request is 20.
+    const countRaw = parseInt(c.req.query('count') || '5', 10);
+    const count = Math.max(1, Math.min(20, isNaN(countRaw) ? 5 : countRaw));
+    // freshness: pd|pw|pm|py (past day/week/month/year) — optional.
+    const freshness = c.req.query('freshness');
+
+    // Read BRAVE_API_KEY from .env on each request (matches the ollama.ts
+    // pattern). Cheap (file is small) and resilient to the user updating
+    // .env without a service restart. Falls back to process.env if .env
+    // doesn't have it (e.g. when key is exported in the shell env).
+    const envCfg = readEnvFile(['BRAVE_API_KEY']);
+    const apiKey = envCfg.BRAVE_API_KEY || process.env.BRAVE_API_KEY;
+    if (!apiKey) {
+      return c.json({ error: 'BRAVE_API_KEY not configured' }, 503);
+    }
+
+    const url = new URL('https://api.search.brave.com/res/v1/web/search');
+    url.searchParams.set('q', q);
+    url.searchParams.set('count', String(count));
+    if (freshness && /^(pd|pw|pm|py)$/.test(freshness)) {
+      url.searchParams.set('freshness', freshness);
+    }
+
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 10_000);
+      const upstream = await fetch(url, {
+        headers: {
+          'Accept': 'application/json',
+          'Accept-Encoding': 'gzip',
+          'X-Subscription-Token': apiKey,
+        },
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      if (!upstream.ok) {
+        const body = await upstream.text().catch(() => '');
+        return c.json(
+          { error: `brave api ${upstream.status}`, body: body.slice(0, 400) },
+          upstream.status as 400 | 401 | 403 | 429 | 500 | 502 | 503,
+        );
+      }
+      const data = await upstream.json() as {
+        web?: { results?: Array<{ title: string; url: string; description?: string; age?: string }> };
+        news?: { results?: Array<{ title: string; url: string; description?: string; age?: string }> };
+      };
+      const web = data.web?.results || [];
+      const news = data.news?.results || [];
+      // Slim down to a model-friendly shape — drop nested junk so the
+      // specialist's context window doesn't fill up with metadata.
+      const results = [...web, ...news].slice(0, count).map((r) => ({
+        title: r.title,
+        url: r.url,
+        snippet: (r.description || '').slice(0, 280),
+        age: r.age || null,
+      }));
+      return c.json({ query: q, count: results.length, results });
+    } catch (err) {
+      return c.json(
+        { error: 'brave fetch failed', message: (err as Error).message },
+        502,
+      );
+    }
+  });
+
+  // ── Vision via local Ollama qwen3-vl ─────────────────────────────
+  // OCR + image description for any caller (Jarvis-main, specialists
+  // with bash, the dashboard's photo workflow). Backed by qwen3-vl:8b
+  // running on the Windows-host Ollama. Pairs with eye, but is callable
+  // independently so e.g. coder can curl this when it needs to read a
+  // screenshot in the middle of a refactor task.
+  //
+  // Accepts either an absolute path (under WSL, e.g. `/tmp/foo.png` or
+  // `/mnt/c/Users/.../foo.png`) or a base64-encoded data URL. Returns
+  // text. Default prompt is generic OCR + description; caller can pass
+  // their own focused prompt.
+  app.post('/api/vision/describe', async (c) => {
+    let body: { path?: string; data_url?: string; prompt?: string; model?: string };
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    const prompt = (body.prompt || 'Describe what is in this image. Extract any visible text verbatim. Note layout, colors, and key visual elements. Be concise.').trim();
+    const model = (body.model || 'qwen3-vl:8b').trim();
+
+    let imageB64: string | null = null;
+    if (body.data_url) {
+      const m = body.data_url.match(/^data:image\/[a-z]+;base64,(.+)$/);
+      if (!m) return c.json({ error: 'data_url must be data:image/<type>;base64,<...>' }, 400);
+      imageB64 = m[1];
+    } else if (body.path) {
+      // Restrict to absolute paths under known-safe roots to avoid
+      // arbitrary file reads via this endpoint. Allowed: /tmp, /mnt/c,
+      // /home/gcruise, /var/tmp.
+      const p = body.path;
+      const ALLOWED = ['/tmp/', '/mnt/c/', '/var/tmp/', '/home/gcruise/'];
+      if (!ALLOWED.some((root) => p.startsWith(root))) {
+        return c.json({ error: 'path must be absolute and under /tmp, /mnt/c, /var/tmp, or /home/gcruise' }, 400);
+      }
+      try {
+        const buf = fs.readFileSync(p);
+        if (buf.length > 8 * 1024 * 1024) {
+          return c.json({ error: 'image too large (max 8 MB)' }, 400);
+        }
+        imageB64 = buf.toString('base64');
+      } catch (err) {
+        return c.json({ error: `cannot read image: ${(err as Error).message}` }, 400);
+      }
+    } else {
+      return c.json({ error: 'one of `path` or `data_url` is required' }, 400);
+    }
+
+    // Call Ollama's chat endpoint with the image attached. Use the
+    // existing base-URL resolver (handles WSL→Windows-host gateway).
+    const startedAt = Date.now();
+    try {
+      const ollamaUrl = `${resolveOllamaBaseUrl()}/api/chat`;
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 60_000);
+      const res = await fetch(ollamaUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          stream: false,
+          messages: [
+            { role: 'user', content: prompt, images: [imageB64] },
+          ],
+        }),
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) {
+        const errBody = await res.text().catch(() => '');
+        return c.json(
+          { error: `ollama vision call failed: HTTP ${res.status}`, body: errBody.slice(0, 400) },
+          502,
+        );
+      }
+      const data = await res.json() as { message?: { content?: string } };
+      const text = (data.message?.content || '').trim();
+      return c.json({
+        model,
+        durationMs: Date.now() - startedAt,
+        text,
+      });
+    } catch (err) {
+      return c.json({ error: 'vision call failed', message: (err as Error).message }, 502);
+    }
+  });
+
   // ── Specialist roster + dispatch ──────────────────────────────────
   // The 8 callsigns (Scribe, Coder, Eye, Sleuth, Reaper, Archivist,
   // Sentinel, Cipher) plus a sync delegate endpoint and a routing hint.
   // Mission Control panel and Jarvis tool calls both hit these.
 
-  // List the full roster annotated with current model availability.
-  // Used by the /specialists dashboard panel.
+  // List the full roster annotated with current model availability and
+  // any runtime tier override (set via Settings → Specialist routing).
+  // The Settings page reads `defaultTier` + `tierOverride` to pre-fill
+  // the dropdown; Mission Control + Specialists pages render `tier`
+  // (the EFFECTIVE tier) as the live label.
   app.get('/api/specialists', async (c) => {
+    const overrides = getAllSpecialistTierOverrides();
     const annotated = await Promise.all(
       ALL_CALLSIGNS.map(async (cs) => {
         const spec = SPECIALISTS[cs];
         const resolved = await resolveSpecialistModel(cs).catch(() => null);
+        const override = overrides[cs] || null;
+        // Effective tier: override wins, fall back to static config.
+        const effectiveTier = (override as 'claw' | 'cloud' | 'local' | null) || spec.tier;
         return {
           callsign: spec.callsign,
-          tier: spec.tier,
+          tier: effectiveTier,
+          defaultTier: spec.tier,
+          tierOverride: override,
           role: spec.role,
           preferredModel: spec.preferredModel,
           fallbackModels: spec.fallbackModels,
           fallbackCallsign: spec.fallbackCallsign || null,
+          cloudModel: spec.cloudModel || null,
           capabilities: spec.capabilities,
           vramHintGB: spec.vramHintGB,
           temperature: spec.temperature,
           contextTokens: spec.defaultContextTokens,
           // Cloud specialists are always "available" — auth lives at call
           // time. Local specialists need a resolved Ollama model.
-          available: spec.tier === 'cloud' ? true : !!resolved,
-          modelInUse: spec.tier === 'cloud' ? spec.preferredModel : (resolved?.model || null),
+          available: effectiveTier === 'cloud' ? true : !!resolved,
+          modelInUse: effectiveTier === 'cloud'
+            ? (spec.cloudModel || spec.preferredModel)
+            : (resolved?.model || null),
           fellBackFrom: resolved?.fellBackFrom || null,
         };
       }),
     );
     return c.json({ specialists: annotated });
+  });
+
+  // Set or clear the runtime tier override for a specialist. body:
+  //   { tier: 'claw' | 'cloud' | 'local' }   → set override
+  //   { tier: null }                         → clear, revert to default
+  // Restricting cloud to specs that declare a cloudModel keeps the user
+  // from accidentally routing a local-only specialist (eye, reaper) to
+  // an Anthropic SDK call that would fail at request time.
+  app.post('/api/specialists/:callsign/tier', async (c) => {
+    const callsign = c.req.param('callsign').toLowerCase() as SpecialistCallsign;
+    if (!ALL_CALLSIGNS.includes(callsign)) return c.json({ error: 'unknown callsign' }, 400);
+    let body: { tier?: string | null };
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    const tier = body?.tier === null ? null : String(body?.tier || '').toLowerCase();
+    if (tier !== null && tier !== 'claw' && tier !== 'cloud' && tier !== 'local') {
+      return c.json({ error: 'invalid tier (must be claw, cloud, local, or null)' }, 400);
+    }
+    if (tier === 'cloud' && !SPECIALISTS[callsign].cloudModel) {
+      return c.json({ error: `${callsign} has no cloudModel configured; cannot route to cloud` }, 400);
+    }
+    setSpecialistTierOverride(callsign, tier);
+    return c.json({ ok: true, callsign, tier });
   });
 
   // Suggest a route for a task. Returns 'self' (Jarvis handles) or a
@@ -3287,6 +3538,17 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
         500,
       );
     }
+  });
+
+  // Per-specialist usage statistics over a configurable window. Backs
+  // the Activity panel in the Specialists page (and any future "Usage"
+  // dashboard). Aggregates from hive_mind where the action is one of
+  // specialist-delegate / specialist-delegate-claw / specialist-delegate-cloud.
+  app.get('/api/specialists/stats', (c) => {
+    const hoursRaw = parseInt(c.req.query('hours') || '24', 10);
+    const hours = Math.max(1, Math.min(168, isNaN(hoursRaw) ? 24 : hoursRaw));
+    const stats = ALL_CALLSIGNS.map((cs) => getSpecialistStats(cs, hours));
+    return c.json({ hours, stats });
   });
 
   // Recent task history per specialist, drawn from conversation_log
@@ -3711,6 +3973,91 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     }
 
     return c.json({ ok: true, telegram: telegramOk });
+  });
+
+  // ── Voice endpoints (Phase 2) ─────────────────────────────────────
+
+  // POST /api/voice/transcribe — multipart audio blob → { text }
+  app.post('/api/voice/transcribe', async (c) => {
+    let bytes: Buffer;
+    const ct = c.req.header('content-type') || '';
+    try {
+      if (ct.startsWith('multipart/form-data')) {
+        const form = await c.req.formData();
+        const file = form.get('audio');
+        if (!file || typeof file === 'string') {
+          return c.json({ error: 'missing "audio" file field' }, 400);
+        }
+        bytes = Buffer.from(await (file as File).arrayBuffer());
+      } else {
+        // Raw audio bytes (application/octet-stream)
+        const buf = await c.req.arrayBuffer();
+        if (buf.byteLength === 0) return c.json({ error: 'empty body' }, 400);
+        bytes = Buffer.from(buf);
+      }
+    } catch {
+      return c.json({ error: 'failed to read upload' }, 400);
+    }
+
+    if (!bytes || bytes.length === 0) return c.json({ error: 'empty upload' }, 400);
+    if (bytes.length > 25 * 1024 * 1024) return c.json({ error: 'audio too large (max 25 MB)' }, 400);
+
+    // Write to temp file for the transcriber
+    const tmpPath = path.join(UPLOADS_DIR, `voice_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.webm`);
+    try {
+      fs.writeFileSync(tmpPath, bytes);
+      const text = await transcribeAudio(tmpPath);
+      return c.json({ text });
+    } catch (err) {
+      logger.error({ err }, 'Voice transcription failed');
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: 'transcription failed: ' + msg }, 500);
+    } finally {
+      try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+    }
+  });
+
+  // POST /api/voice/tts — { text } → audio bytes
+  app.post('/api/voice/tts', async (c) => {
+    const body = await c.req.json<{ text?: string }>().catch(() => ({} as { text?: string }));
+    const text = (body?.text || '').trim();
+    if (!text) return c.json({ error: 'text required' }, 400);
+    if (text.length > 5000) return c.json({ error: 'text too long (max 5000 chars)' }, 400);
+
+    try {
+      const audio = await synthesizeSpeech(text);
+      // Detect format from the buffer magic bytes.
+      // OggS = 4F 67 67 53; MP3 = FF Ex or 'ID3'; RIFF...WAVE = 52 49 46 46 ... 57 41 56 45
+      const isOgg = audio[0] === 0x4F && audio[1] === 0x67 && audio[2] === 0x67 && audio[3] === 0x53;
+      const isMp3 = (audio[0] === 0xFF && (audio[1] & 0xE0) === 0xE0) || (audio[0] === 0x49 && audio[1] === 0x44 && audio[2] === 0x33);
+      const isWav = audio[0] === 0x52 && audio[1] === 0x49 && audio[2] === 0x46 && audio[3] === 0x46
+                 && audio[8] === 0x57 && audio[9] === 0x41 && audio[10] === 0x56 && audio[11] === 0x45;
+      const contentType = isWav ? 'audio/wav' : isOgg ? 'audio/ogg' : isMp3 ? 'audio/mpeg' : 'audio/wav';
+      return new Response(audio, {
+        headers: {
+          'Content-Type': contentType,
+          'Content-Length': audio.length.toString(),
+          'Cache-Control': 'no-store',
+        },
+      });
+    } catch (err) {
+      // Cloud TTS failed entirely, try local fallback
+      logger.warn({ err }, 'synthesizeSpeech cascade failed, trying synthesizeSpeechLocal');
+      try {
+        const audio = await synthesizeSpeechLocal(text);
+        return new Response(audio, {
+          headers: {
+            'Content-Type': 'audio/ogg',
+            'Content-Length': audio.length.toString(),
+            'Cache-Control': 'no-store',
+          },
+        });
+      } catch (localErr) {
+        logger.error({ err: localErr }, 'All TTS providers failed');
+        const msg = localErr instanceof Error ? localErr.message : String(localErr);
+        return c.json({ error: 'TTS failed: ' + msg }, 500);
+      }
+    }
   });
 
   // Abort current processing

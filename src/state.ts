@@ -29,7 +29,7 @@ export function setTelegramConnected(v: boolean): void {
 // ── Chat event bus (SSE broadcasting) ────────────────────────────────
 
 export interface ChatEvent {
-  type: 'user_message' | 'assistant_message' | 'assistant_photo' | 'processing' | 'progress' | 'error' | 'hive_mind';
+  type: 'user_message' | 'assistant_message' | 'assistant_photo' | 'processing' | 'progress' | 'error' | 'hive_mind' | 'tool_use' | 'tool_result';
   chatId: string;
   agentId?: string;
   content?: string;
@@ -41,6 +41,14 @@ export interface ChatEvent {
   // SPA renders this as an <img> bubble.
   url?: string;
   caption?: string;
+  // Tool transcript payload — emitted as tool_use (when the agent is about
+  // to call a tool) and tool_result (when the tool returns). The frontend
+  // pairs them by toolUseId to render Claude-Code-style collapsible cards
+  // showing command/file/query → output.
+  toolUseId?: string;
+  toolName?: string;
+  input?: string;
+  output?: string;
   timestamp: number;
 }
 

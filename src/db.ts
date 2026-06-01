@@ -1566,11 +1566,18 @@ export function getConversationPage(
   limit = 40,
   beforeId?: number,
 ): ConversationTurn[] {
+  // Exclude specialist:* turns from the user-facing chat view. Specialists
+  // log their own (full prompt, full response) under agent_id =
+  // 'specialist:<callsign>' for memory + history bookkeeping, but the
+  // logged prompt is the bloated memory-context preamble we built
+  // upstream and is NOT meant to render as a chat bubble. The /chat tab
+  // should only show the conversation between the user and the main agent.
   if (beforeId) {
     return db
       .prepare(
         `SELECT * FROM conversation_log
          WHERE chat_id = ? AND id < ?
+           AND (agent_id IS NULL OR agent_id NOT LIKE 'specialist:%')
          ORDER BY id DESC LIMIT ?`,
       )
       .all(chatId, beforeId, limit) as ConversationTurn[];
@@ -1579,6 +1586,7 @@ export function getConversationPage(
     .prepare(
       `SELECT * FROM conversation_log
        WHERE chat_id = ?
+         AND (agent_id IS NULL OR agent_id NOT LIKE 'specialist:%')
        ORDER BY id DESC LIMIT ?`,
     )
     .all(chatId, limit) as ConversationTurn[];
@@ -2011,6 +2019,88 @@ export function getOtherAgentActivity(
        ORDER BY created_at DESC LIMIT ?`,
     )
     .all(excludeAgentId, cutoff, limit) as HiveMindEntry[];
+}
+
+// ── Per-specialist usage stats (for the Specialists health dashboard) ─
+// Aggregates every `specialist-delegate-*` row in hive_mind for a given
+// callsign over a window, mining the JSON `artifacts` blob for per-call
+// metadata (durationMs, model, toolCalls, taskPreview). Returns one
+// SpecialistStats per callsign — the API endpoint maps these onto the
+// roster so even unused specialists appear with zero counts.
+
+export interface SpecialistStats {
+  callsign: string;
+  invocations: number;
+  totalDurationMs: number;
+  avgDurationMs: number;
+  totalToolCalls: number;
+  lastInvokedAt: number | null;  // unix seconds, null if never invoked
+  lastModel: string | null;
+  recentTasks: Array<{ when: number; preview: string; durationMs: number; tier: string }>;
+}
+
+interface SpecialistArtifacts {
+  callsign?: string;
+  model?: string;
+  tier?: string;
+  toolCalls?: number;
+  evalCount?: number;
+  durationMs?: number;
+  taskPreview?: string;
+  fellBackFrom?: string;
+}
+
+export function getSpecialistStats(callsign: string, hoursBack = 24): SpecialistStats {
+  const cutoff = Math.floor(Date.now() / 1000) - hoursBack * 3600;
+  const agentNs = `specialist:${callsign}`;
+  const rows = db
+    .prepare(
+      `SELECT created_at, action, summary, artifacts
+       FROM hive_mind
+       WHERE agent_id = ? AND created_at > ? AND action LIKE 'specialist-delegate%'
+       ORDER BY created_at DESC LIMIT 200`,
+    )
+    .all(agentNs, cutoff) as Array<{
+      created_at: number;
+      action: string;
+      summary: string;
+      artifacts: string | null;
+    }>;
+
+  let totalDurationMs = 0;
+  let totalToolCalls = 0;
+  let lastModel: string | null = null;
+  const recentTasks: SpecialistStats['recentTasks'] = [];
+
+  for (const row of rows) {
+    let art: SpecialistArtifacts = {};
+    if (row.artifacts) {
+      try { art = JSON.parse(row.artifacts) as SpecialistArtifacts; } catch { /* skip */ }
+    }
+    const dur = typeof art.durationMs === 'number' ? art.durationMs : 0;
+    totalDurationMs += dur;
+    totalToolCalls += typeof art.toolCalls === 'number' ? art.toolCalls : 0;
+    if (lastModel === null && art.model) lastModel = art.model;
+    if (recentTasks.length < 5) {
+      recentTasks.push({
+        when: row.created_at,
+        preview: art.taskPreview || row.summary.slice(0, 120),
+        durationMs: dur,
+        tier: art.tier || (row.action.endsWith('-claw') ? 'claw' : row.action.endsWith('-cloud') ? 'cloud' : 'local'),
+      });
+    }
+  }
+
+  return {
+    callsign,
+    invocations: rows.length,
+    totalDurationMs,
+    avgDurationMs: rows.length > 0 ? Math.round(totalDurationMs / rows.length) : 0,
+    totalToolCalls,
+    lastInvokedAt: rows.length > 0 ? rows[0].created_at : null,
+    lastModel,
+    recentTasks,
+  };
 }
 
 /**
@@ -2919,6 +3009,44 @@ export function getAllDashboardSettings(): Record<string, string> {
   const rows = db.prepare(`SELECT key, value FROM dashboard_settings`).all() as { key: string; value: string }[];
   const out: Record<string, string> = {};
   for (const row of rows) out[row.key] = row.value;
+  return out;
+}
+
+export function deleteDashboardSetting(key: string): void {
+  db.prepare(`DELETE FROM dashboard_settings WHERE key = ?`).run(key);
+}
+
+// ── Specialist tier overrides ───────────────────────────────────────
+// Stored in the dashboard_settings kv with a `specialist.<callsign>.tier`
+// key prefix so the user can flip individual specialists between local
+// (claw / direct-ollama) and cloud (paid Anthropic) without editing
+// specialists.ts. Returning null means "no override; use the static
+// default tier from SPECIALISTS[callsign].tier".
+const SPECIALIST_TIER_KEY = (callsign: string) => `specialist.${callsign}.tier`;
+
+export function getSpecialistTierOverride(callsign: string): string | null {
+  return getDashboardSetting(SPECIALIST_TIER_KEY(callsign));
+}
+
+export function setSpecialistTierOverride(callsign: string, tier: string | null): void {
+  const key = SPECIALIST_TIER_KEY(callsign);
+  if (tier == null) {
+    deleteDashboardSetting(key);
+  } else {
+    setDashboardSetting(key, tier);
+  }
+}
+
+export function getAllSpecialistTierOverrides(): Record<string, string> {
+  const rows = db.prepare(
+    `SELECT key, value FROM dashboard_settings WHERE key LIKE 'specialist.%.tier'`,
+  ).all() as { key: string; value: string }[];
+  const out: Record<string, string> = {};
+  for (const row of rows) {
+    // key shape: specialist.<callsign>.tier
+    const m = row.key.match(/^specialist\.([^.]+)\.tier$/);
+    if (m) out[m[1]] = row.value;
+  }
   return out;
 }
 
