@@ -287,3 +287,90 @@ describe('runClaw retry policy', () => {
     expect(res.timedOut).toBe(true);
   });
 });
+
+// The full `claw` binary (useFullClaw, for sentinel-shaped shell specialists)
+// emits ONE JSON object at end-of-run, not NDJSON, and is parsed in the exit
+// handler on a code path entirely separate from claw-analog. The existing
+// full-claw test only pins argv assembly; this pins the RESULT extraction
+// (message->text, iterations->turns, tool_uses/tool_results->onProgress pairs,
+// usage aggregation) so a claw schema-field rename can't silently blank out a
+// sentinel run's answer and activity panel.
+describe('runClaw full-claw result parsing', () => {
+  it('maps the end-of-run JSON to text/turns/toolCalls/usage and emits paired progress events', async () => {
+    const events: Array<{ type: string; toolName?: string; toolUseId?: string; description?: string }> = [];
+    children.push(makeFakeChild((c) => {
+      c.stdout.emit('data', JSON.stringify({
+        message: 'Analysis complete',
+        iterations: 3,
+        tool_uses: [
+          { id: 'u1', name: 'read_file', input: { path: '/etc/hosts' } },
+          { id: 'u2', name: 'grep_workspace', input: { pattern: 'TODO' } },
+        ],
+        tool_results: [
+          { tool_use_id: 'u1', output: '127.0.0.1 localhost', is_error: false },
+          { tool_use_id: 'u2', output: 'boom', is_error: true },
+        ],
+        usage: { input_tokens: 100, output_tokens: 40 },
+      }));
+      c._exit(0, null);
+    }));
+    const res = await runClaw({
+      model: 'qwen3-coder:30b',
+      task: 'audit',
+      workspace: '/tmp/ws',
+      useFullClaw: true,
+      onProgress: (e) => events.push(e),
+    });
+    expect(res.text).toBe('Analysis complete');
+    expect(res.turns).toBe(3);
+    expect(res.toolCalls).toBe(2);
+    // total_tokens is COMPUTED from input+output for full-claw, not read.
+    expect(res.usage).toEqual({ input_tokens: 100, output_tokens: 40, total_tokens: 140 });
+    expect(res.error).toBeUndefined();
+    // Both tool_uses surface as paired tool_use events keyed by id.
+    expect(events.filter((e) => e.type === 'tool_use').map((e) => [e.toolName, e.toolUseId])).toEqual([
+      ['read_file', 'u1'],
+      ['grep_workspace', 'u2'],
+    ]);
+    // tool_result for the errored call is flagged '[error]'; the clean one is not.
+    const results = events.filter((e) => e.type === 'tool_result');
+    expect(results.find((e) => e.toolUseId === 'u1')!.description).toBe('');
+    expect(results.find((e) => e.toolUseId === 'u2')!.description).toBe('[error]');
+  });
+});
+
+// runClawOnce wraps the whole spawn lifecycle in a Promise and must ALWAYS
+// resolve with a populated ClawRunResult — never reject, never hang — so the
+// specialist dispatcher can treat a launch failure like any other failed run.
+// These pin the two distinct failure mechanisms (synchronous spawn throw vs.
+// async 'error' event) plus malformed-stream resilience.
+describe('runClaw failure-mode resilience', () => {
+  it('resolves (not rejects) with a spawn-failed error when spawn throws synchronously', async () => {
+    mockSpawn.mockImplementationOnce((() => { throw new Error('EINVAL bad args'); }) as typeof spawn);
+    const res = await runClaw({ model: 'm', task: 'go', workspace: '/tmp/ws' });
+    expect(res.error).toContain('claw spawn failed');
+    expect(res.error).toContain('EINVAL bad args');
+    // A spawn failure carries an error, so it is NOT a retryable no-op.
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("resolves with a process-error when the child emits an async 'error' event", async () => {
+    children.push(makeFakeChild((c) => {
+      // ENOENT/EACCES surface as an 'error' event, never as 'exit'.
+      c.emit('error', new Error('spawn ENOENT'));
+    }));
+    const res = await runClaw({ model: 'm', task: 'go', workspace: '/tmp/ws' });
+    expect(res.error).toBe('claw process error: spawn ENOENT');
+  });
+
+  it('skips a malformed (non-JSON) NDJSON line and still parses the valid lines after it', async () => {
+    children.push(makeFakeChild((c) => {
+      c.stdout.emit('data', 'not json at all — a stray log line\n');
+      c.stdout.emit('data', ndjson('assistant_turn', { text: 'survived the garbage', stop_reason: 'end_turn' }));
+      c._exit(0, null);
+    }));
+    const res = await runClaw({ model: 'm', task: 'go', workspace: '/tmp/ws' });
+    expect(res.text).toBe('survived the garbage');
+    expect(res.error).toBeUndefined();
+  });
+});
