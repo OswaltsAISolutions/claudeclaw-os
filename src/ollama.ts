@@ -63,6 +63,23 @@ interface PullProgress {
 let cachedHost: { value: string; expiresAt: number } | null = null;
 
 /**
+ * Normalize an explicit OLLAMA_HOST value into a base URL. Pure helper,
+ * extracted so the host-formatting rules are testable without env/network.
+ * `explicit` is assumed already-trimmed and non-empty. `port` is only used
+ * as the fallback when `explicit` carries no port and no scheme of its own.
+ *
+ *   - full URL (http/https) -> returned verbatim, minus one trailing slash
+ *   - host:port (no scheme)  -> "http://host:port"
+ *   - bare host (no scheme)  -> "http://host:<port>"
+ */
+export function buildOllamaUrlFromHost(explicit: string, port: string): string {
+  if (explicit.startsWith('http://') || explicit.startsWith('https://')) {
+    return explicit.replace(/\/$/, '');
+  }
+  return `http://${explicit.includes(':') ? explicit : `${explicit}:${port}`}`;
+}
+
+/**
  * Resolve the Ollama base URL.
  *
  * Priority:
@@ -78,10 +95,7 @@ export function resolveOllamaBaseUrl(): string {
   const port = envVal('OLLAMA_PORT') || '11434';
   const explicit = envVal('OLLAMA_HOST')?.trim();
   if (explicit) {
-    if (explicit.startsWith('http://') || explicit.startsWith('https://')) {
-      return explicit.replace(/\/$/, '');
-    }
-    return `http://${explicit.includes(':') ? explicit : `${explicit}:${port}`}`;
+    return buildOllamaUrlFromHost(explicit, port);
   }
 
   const now = Date.now();
