@@ -404,11 +404,19 @@ hardening (commit `71ac15a`) and the matching dashboard-html chatId hardening
 real traffic is nil (output only changes when a token / chatId contains
 `<` `>` `&` or, for the dashboard onclick, a `&` / space in the token - none
 of which operator tokens or numeric Telegram chatIds ever contain), so an
-unattended overnight restart of the live Jarvis service was judged not worth
-the small downtime / in-flight-interruption risk for never-triggered code
-paths. The other two third-slice source edits (`ollama-prefix-proxy`,
-`dashboard`) are export-only and byte-identical at runtime, so they need no
-deploy at all. Action for the next active window: `npm run build` then restart
-via the busy-guarded `POST /api/agents/main/restart` (or bundle with the next
+unattended restart was judged not worth its specific cost: the main-restart
+handler (dashboard.ts ~2718) emits a Telegram message to ALLOWED_CHAT_ID
+worded "Restarting the service now. Any in-flight task did not finish." -
+which would ping the sleeping operator at ~01:50 with an inaccurate
+"you lost work" message for a change that alters nothing on real traffic. The
+other two third-slice source edits (`ollama-prefix-proxy`, `dashboard`) are
+export-only and byte-identical at runtime, so they need no deploy at all.
+
+`dist/` IS already rebuilt (2026-06-01 ~01:49) and verified to contain the
+hardening (jsLiteral + encodeURIComponent(TOKEN) in dist/dashboard-html.js),
+so the change is armed: ANY restart (the next active-window deploy, or any
+natural/systemd restart) picks it up cleanly with no further build step. Only
+the restart itself is deferred. Action for the next active window: restart via
+the busy-guarded `POST /api/agents/main/restart` (or bundle with the next
 served-code change) and verify health 200. Origin/main is otherwise at the
 deployed HEAD plus these pushed-but-runtime-inert commits.
