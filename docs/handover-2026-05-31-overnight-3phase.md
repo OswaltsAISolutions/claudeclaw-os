@@ -233,6 +233,19 @@ slices (suite now 518 / 36, build green throughout):
   sending works" / PDF test files landed in the chat during this run before the
   fix). Now require an explicit `RUN_TELEGRAM_INTEGRATION=1` flag; default runs
   skip them (suite reads 514 passed / 4 skipped) and are network-free.
+- schedule-cli test store isolated (commit `c6bf5a1`): the routing tests spawn
+  the real `dist/schedule-cli.js` as a child process, which resolved its own DB
+  independent of the in-process test hooks (the imported `_initTestDatabase`
+  was never even called), so every `npm test` wrote scheduled tasks into the
+  production `claudeclaw.db` - and an interrupted run could orphan a cron that
+  fires daily at 09:00. Added a `CLAUDECLAW_STORE_DIR` override in `config.ts`
+  (mirrors `CLAUDECLAW_CONFIG`; every store consumer - db, PID files, logs,
+  avatars, waweb - routes through `STORE_DIR`, so it relocates the whole store
+  coherently) and pointed the child CLI at a per-test temp dir. Verified the
+  override lands the DB in the temp dir and the real `store/claudeclaw.db` is
+  untouched, and confirmed no orphan test tasks remain in the real scheduler.
+  Documented in `.env.example`. Runtime-additive but behavior-identical when
+  unset, so no redeploy. Bonus: operators can relocate the store via env now.
 
 ## Guardrails in force
 
