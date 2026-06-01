@@ -273,11 +273,35 @@ export function splitMessage(text: string): string[] {
 }
 
 /**
+ * Best-effort inverse of formatForTelegram for the plain-text fallback path.
+ * It only runs when Telegram has ALREADY rejected our HTML (e.g. splitMessage
+ * cut a <pre> block across the 4096-char boundary, leaving an unbalanced tag),
+ * so it must tolerate partial / unbalanced tags. Strips the limited tag set we
+ * emit, turns links into "text (url)" so the URL is not lost, and unescapes
+ * the three entities we introduce (&amp; last, so &lt;/&gt; are not re-mangled).
+ */
+export function htmlToPlain(html: string): string {
+  return html
+    // Links first, before generic tag stripping, so the href is preserved.
+    .replace(/<a href="([^"]*)">([\s\S]*?)<\/a>/g, '$2 ($1)')
+    // Strip the formatting tags we emit, open or close, balanced or not.
+    .replace(/<\/?(?:b|i|s|u|code|pre)>/g, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
+/**
  * Send a message to Telegram with HTML formatting, falling back to plain text
  * if Telegram rejects the HTML. This prevents silent failures where the user
  * never sees a response because formatForTelegram produced invalid HTML.
+ *
+ * The fallback is PER-CHUNK: if one chunk's HTML fails to parse (typically a
+ * long <pre> split across the 4096 boundary), only that chunk is resent as
+ * plain text and the loop continues, so a single bad chunk can neither drop
+ * the rest of a long reply nor duplicate the chunks already delivered.
  */
-async function sendTelegramSafe(
+export async function sendTelegramSafe(
   ctx: Context,
   _chatId: number,
   text: string,
@@ -289,14 +313,17 @@ async function sendTelegramSafe(
     } catch (htmlErr: any) {
       const desc = String(htmlErr?.description ?? '').toLowerCase();
       if (desc.includes('parse') || desc.includes('entity') || desc.includes('tag')) {
-        // HTML parse failed -- retry without formatting so the user sees the response
-        logger.warn({ err: htmlErr }, 'Telegram HTML parse failed, retrying as plain text');
-        try {
-          await ctx.reply(text.slice(0, 4096));
-        } catch (plainErr) {
-          logger.error({ err: plainErr }, 'Telegram plain text send also failed');
+        // HTML parse failed for THIS chunk -- resend just this chunk as plain
+        // text (tags stripped) so its content still reaches the user.
+        logger.warn({ err: htmlErr }, 'Telegram HTML parse failed, sending chunk as plain text');
+        for (const plainPart of splitMessage(htmlToPlain(part))) {
+          try {
+            await ctx.reply(plainPart);
+          } catch (plainErr) {
+            logger.error({ err: plainErr }, 'Telegram plain text send also failed');
+          }
         }
-        return; // Already sent the full text as fallback
+        continue; // Keep going: later chunks may be valid HTML.
       }
       // Non-formatting error (network, rate limit, etc.), re-throw
       throw htmlErr;
@@ -519,9 +546,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       }
       emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: response, source: 'telegram' });
 
-      for (const part of splitMessage(formatForTelegram(`${header}\n\n${response}`))) {
-        await ctx.reply(part, { parse_mode: 'HTML' });
-      }
+      await sendTelegramSafe(ctx, ctx.chat?.id ?? 0, `${header}\n\n${response}`);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       logger.error({ err, agentId: delegation.agentId }, 'Delegation failed');

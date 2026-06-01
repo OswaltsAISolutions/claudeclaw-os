@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { splitMessage, extractFileMarkers, formatForTelegram } from './bot.js';
+import { describe, it, expect, vi } from 'vitest';
+import { splitMessage, extractFileMarkers, formatForTelegram, htmlToPlain, sendTelegramSafe } from './bot.js';
 
 describe('splitMessage', () => {
   it('returns single-element array for short messages', () => {
@@ -363,5 +363,93 @@ describe('formatForTelegram', () => {
 
   it('collapses 3+ consecutive blank lines down to a single blank line', () => {
     expect(formatForTelegram('a\n\n\n\nb')).toBe('a\n\nb');
+  });
+});
+
+describe('htmlToPlain', () => {
+  it('strips the bold/italic/strike/underline formatting tags', () => {
+    expect(htmlToPlain('<b>hi</b> <i>x</i> <s>y</s> <u>z</u>')).toBe('hi x y z');
+  });
+
+  it('keeps code/pre content and unescapes the entities we emit', () => {
+    expect(htmlToPlain('<pre>const x = 1 &lt; 2 &amp;&amp; 3 &gt; 0;</pre>')).toBe(
+      'const x = 1 < 2 && 3 > 0;',
+    );
+    expect(htmlToPlain('use <code>Map&lt;string&gt;</code>')).toBe('use Map<string>');
+  });
+
+  it('turns a link into "text (url)" so the URL survives the fallback', () => {
+    expect(htmlToPlain('see <a href="https://x.com/a?token=k">here</a>')).toBe(
+      'see here (https://x.com/a?token=k)',
+    );
+  });
+
+  it('tolerates a partial/unbalanced tag (the split-mid-<pre> case)', () => {
+    // A <pre> opened in one chunk and closed in the next leaves each chunk
+    // with a lone tag; both must degrade cleanly to readable text.
+    expect(htmlToPlain('start of code <pre>half a block')).toBe('start of code half a block');
+    expect(htmlToPlain('rest of the block</pre> and tail')).toBe('rest of the block and tail');
+  });
+
+  it('does not re-strip text that only becomes tag-like after unescaping', () => {
+    // &lt;b&gt; is the user literally typing "<b>"; after unescape it stays
+    // literal text, not stripped as a tag.
+    expect(htmlToPlain('typed &lt;b&gt; on purpose')).toBe('typed <b> on purpose');
+  });
+});
+
+describe('sendTelegramSafe', () => {
+  const PARSE_ERR = { description: "Bad Request: can't parse entities" };
+
+  it('sends a normal message once as HTML with no plain fallback', async () => {
+    const reply = vi.fn().mockResolvedValue(undefined);
+    await sendTelegramSafe({ reply } as any, 0, 'hello world');
+    expect(reply).toHaveBeenCalledTimes(1);
+    expect(reply).toHaveBeenCalledWith('hello world', { parse_mode: 'HTML' });
+  });
+
+  it('falls back to plain text (tags stripped) when HTML parsing is rejected', async () => {
+    const reply = vi
+      .fn()
+      .mockRejectedValueOnce(PARSE_ERR) // HTML attempt
+      .mockResolvedValueOnce(undefined); // plain retry
+    await sendTelegramSafe({ reply } as any, 0, 'use `Map<string>` now');
+    expect(reply).toHaveBeenCalledTimes(2);
+    // The HTML attempt carried parse_mode; the retry is plain (no options) and
+    // shows readable text rather than tags/entities.
+    expect(reply.mock.calls[0][1]).toEqual({ parse_mode: 'HTML' });
+    expect(reply.mock.calls[1][1]).toBeUndefined();
+    expect(reply.mock.calls[1][0]).toBe('use Map<string> now');
+  });
+
+  it('re-throws a non-formatting error (network / rate limit) instead of swallowing it', async () => {
+    const reply = vi.fn().mockRejectedValue({ description: 'Too Many Requests: retry after 5' });
+    await expect(sendTelegramSafe({ reply } as any, 0, 'hi')).rejects.toBeDefined();
+  });
+
+  it('delivers EVERY chunk of a long reply when a later chunk fails to parse (no data loss, no duplicate)', async () => {
+    // Two chunks: the second exceeds the 4096 limit boundary and (pretend)
+    // fails HTML parsing. The pre-fix code resent text.slice(0, 4096) and lost
+    // everything after it; here all content must arrive exactly once.
+    const partA = 'A'.repeat(4000);
+    const big = `${partA}\nMARKER_B ${'B'.repeat(4000)}`;
+    const reply = vi.fn().mockImplementation((text: string, opts?: unknown) => {
+      const isHtml = !!opts && (opts as any).parse_mode === 'HTML';
+      if (isHtml && text.includes('B')) return Promise.reject(PARSE_ERR);
+      return Promise.resolve(undefined);
+    });
+
+    await sendTelegramSafe({ reply } as any, 0, big);
+
+    // 3 sends: chunk A as HTML (ok), chunk B as HTML (rejected), chunk B plain (ok).
+    expect(reply).toHaveBeenCalledTimes(3);
+    // The 'B' content reached the user via a PLAIN send (no parse_mode).
+    const plainBCall = reply.mock.calls.find(
+      (c: unknown[]) => typeof c[0] === 'string' && c[0].includes('MARKER_B') && c[1] === undefined,
+    );
+    expect(plainBCall).toBeDefined();
+    // Chunk A was sent exactly once (not re-sent by the fallback => no duplicate).
+    const aSends = reply.mock.calls.filter((c: unknown[]) => typeof c[0] === 'string' && c[0].includes(partA));
+    expect(aSends).toHaveLength(1);
   });
 });
