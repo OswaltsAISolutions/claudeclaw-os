@@ -226,6 +226,13 @@ slices (suite now 518 / 36, build green throughout):
   type-checks, and removed three dead locals in BrainGraph3D (unused
   `lobeWeights` x param -> `_x`, unused `radial`, unused map index `i`).
   BrainGraph3D is now tsc-clean.
+- Real Telegram send tests made opt-in (commit `46c496f`): `file-send.integration.test.ts`
+  gated its real-API sends only on token+chatId presence, but THIS box always
+  has a live token in `.env`, so they fired on every `npm test` and sent real
+  files to your Telegram chat (HEADS UP: a handful of "Integration test: file
+  sending works" / PDF test files landed in the chat during this run before the
+  fix). Now require an explicit `RUN_TELEGRAM_INTEGRATION=1` flag; default runs
+  skip them (suite reads 514 passed / 4 skipped) and are network-free.
 
 ## Guardrails in force
 
