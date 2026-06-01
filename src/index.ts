@@ -8,7 +8,7 @@ import { ALLOWED_CHAT_ID, activeBotToken, STORE_DIR, PROJECT_ROOT, CLAUDECLAW_CO
 import { startDashboard } from './dashboard.js';
 import { initDatabase, cleanupOldMissionTasks, insertAuditLog } from './db.js';
 import { initSecurity, setAuditCallback } from './security.js';
-import { logger } from './logger.js';
+import { logger, installCrashHandlers } from './logger.js';
 import { cleanupOldUploads } from './media.js';
 import { runConsolidation } from './memory-consolidate.js';
 import { runDecaySweep } from './memory.js';
@@ -20,6 +20,11 @@ import { startOllamaPrefixProxy } from './ollama-prefix-proxy.js';
 import { initScheduler } from './scheduler.js';
 import { setTelegramConnected, setBotInfo } from './state.js';
 import { getVenvPython, killProcess } from './platform.js';
+
+// Install crash handlers first thing: any unhandled exception/rejection during
+// startup or runtime must be logged through our redactor (Node's default crash
+// dump bypasses it and could leak a bot token) before the process exits.
+installCrashHandlers();
 
 // Parse --agent flag
 const agentFlagIndex = process.argv.indexOf('--agent');

@@ -9,7 +9,7 @@ vi.hoisted(() => {
   process.env.NODE_ENV = 'production';
 });
 
-import { redactSecrets, redactLogArgs, scrubErrSerializer } from './logger.js';
+import { redactSecrets, redactLogArgs, scrubErrSerializer, handleFatal } from './logger.js';
 
 // A clearly-fake, correctly-shaped Telegram bot token: numeric id, colon,
 // then >=20 url-safe chars. Never a real credential.
@@ -136,5 +136,44 @@ describe('redactLogArgs', () => {
     const out = redactLogArgs(args);
     expect(out).not.toBe(args);
     expect(args[0]).toBe('?token=abc123');
+  });
+});
+
+describe('handleFatal (crash handler)', () => {
+  it('redacts a leaked bot token from the crash output and exits non-zero', () => {
+    let written = '';
+    const codes: number[] = [];
+    handleFatal('uncaughtException', new Error(`crashed talking to ${FAKE_TOKEN}`), {
+      write: (m) => { written += m; },
+      exit: (c) => { codes.push(c); },
+    });
+    expect(written).toContain('bot7654321:<redacted>');
+    expect(written).not.toContain('AAH-FAKE_token_value_1234567890abcDEF');
+    expect(written).toContain('uncaughtException');
+    expect(codes).toEqual([1]);
+  });
+
+  it('normalizes a non-Error rejection reason (e.g. a raw string) and still exits 1', () => {
+    let written = '';
+    const codes: number[] = [];
+    handleFatal('unhandledRejection', `boom ${FAKE_TOKEN}`, {
+      write: (m) => { written += m; },
+      exit: (c) => { codes.push(c); },
+    });
+    expect(written).toContain('unhandledRejection');
+    expect(written).toContain('bot7654321:<redacted>');
+    expect(written).not.toContain('AAH-FAKE_token_value_1234567890abcDEF');
+    expect(codes).toEqual([1]);
+  });
+
+  it('still exits 1 even if the write sink itself throws (handler must never throw)', () => {
+    const codes: number[] = [];
+    expect(() =>
+      handleFatal('uncaughtException', new Error('boom'), {
+        write: () => { throw new Error('stderr gone'); },
+        exit: (c) => { codes.push(c); },
+      }),
+    ).not.toThrow();
+    expect(codes).toEqual([1]);
   });
 });

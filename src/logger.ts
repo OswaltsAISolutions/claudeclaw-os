@@ -1,3 +1,5 @@
+import { writeSync } from 'node:fs';
+
 import pino from 'pino';
 
 // Secrets leak into logs two ways. The one we actually observed comes through
@@ -56,6 +58,44 @@ export function scrubErrSerializer(err: Error): unknown {
   } catch {
     return serialized;
   }
+}
+
+/** Last-gasp crash logging. An unhandled exception/rejection otherwise prints
+ *  Node's RAW stack to stderr, which BYPASSES the `err` serializer's redaction —
+ *  so a token-bearing error (e.g. grammy's HttpError, whose message is the full
+ *  bot-token URL) would leak the credential to journald on crash, defeating the
+ *  redaction this module exists for. We also can't trust the async pino transport
+ *  here: this service runs without NODE_ENV set, so it uses the pino-pretty worker
+ *  thread, which may be torn down before it flushes on exit. So write a REDACTED
+ *  line SYNCHRONOUSLY to fd 2 (bypasses stream buffering, guaranteed before exit),
+ *  then preserve fatal-crash semantics by exiting non-zero so systemd restarts
+ *  clean. We do NOT swallow-and-continue: after an uncaughtException the process
+ *  may be in an undefined state, and Node treats unhandledRejection as fatal by
+ *  default, so exiting just makes the existing crash observable + secret-safe.
+ *  `exit`/`write` are injectable purely for tests. */
+export function handleFatal(
+  kind: 'uncaughtException' | 'unhandledRejection',
+  reason: unknown,
+  opts: { exit?: (code: number) => void; write?: (msg: string) => void } = {},
+): void {
+  const exit = opts.exit ?? ((code: number) => process.exit(code));
+  const write = opts.write ?? ((msg: string) => { writeSync(2, msg); });
+  try {
+    const err = reason instanceof Error ? reason : new Error(String(reason));
+    write(`FATAL ${kind}: ${redactSecrets(err.stack || err.message || String(err))}\n`);
+  } catch {
+    // The crash handler must never throw.
+  }
+  exit(1);
+}
+
+let crashHandlersInstalled = false;
+/** Register process-level crash handlers exactly once (idempotent). */
+export function installCrashHandlers(): void {
+  if (crashHandlersInstalled) return;
+  crashHandlersInstalled = true;
+  process.on('uncaughtException', (err) => handleFatal('uncaughtException', err));
+  process.on('unhandledRejection', (reason) => handleFatal('unhandledRejection', reason));
 }
 
 export const logger = pino({
