@@ -1,6 +1,6 @@
 import type { ComponentChildren } from 'preact';
 
-export type Tone = 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | 'high' | 'medium' | 'low' | 'neutral' | 'accent';
+export type Tone = 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | 'warn' | 'high' | 'medium' | 'low' | 'neutral' | 'accent';
 
 interface Props {
   tone?: Tone;
@@ -13,6 +13,7 @@ const TONE_STYLE: Record<Tone, string> = {
   done: 'bg-[color-mix(in_srgb,var(--color-status-done)_18%,transparent)] text-[var(--color-status-done)]',
   failed: 'bg-[color-mix(in_srgb,var(--color-status-failed)_18%,transparent)] text-[var(--color-status-failed)]',
   cancelled: 'bg-[var(--color-elevated)] text-[var(--color-text-muted)]',
+  warn: 'bg-[color-mix(in_srgb,var(--color-priority-medium)_18%,transparent)] text-[var(--color-priority-medium)]',
   high: 'bg-[color-mix(in_srgb,var(--color-priority-high)_18%,transparent)] text-[var(--color-priority-high)]',
   medium: 'bg-[color-mix(in_srgb,var(--color-priority-medium)_18%,transparent)] text-[var(--color-priority-medium)]',
   low: 'bg-[var(--color-elevated)] text-[var(--color-text-muted)]',
@@ -35,6 +36,7 @@ export function StatusDot({ tone }: { tone: Tone }) {
     done: 'var(--color-status-done)',
     failed: 'var(--color-status-failed)',
     cancelled: 'var(--color-text-faint)',
+    warn: 'var(--color-priority-medium)',
     high: 'var(--color-priority-high)',
     medium: 'var(--color-priority-medium)',
     low: 'var(--color-text-faint)',

@@ -17,4 +17,9 @@ describe('Pill', () => {
     render(<Pill>plain</Pill>);
     expect(screen.getByText('plain').className).toContain('var(--color-text-muted)');
   });
+
+  it('styles the warn tone (used for specialist fallbacks)', () => {
+    render(<Pill tone="warn">fallback</Pill>);
+    expect(screen.getByText('fallback').className).toContain('var(--color-priority-medium)');
+  });
 });
