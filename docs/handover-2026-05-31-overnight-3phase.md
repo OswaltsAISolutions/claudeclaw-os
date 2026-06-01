@@ -911,6 +911,33 @@ HTML); nested same-type emphasis like `*a _b_ c*` can produce `<i>..<i>..</i>..<
 (Telegram is lenient; if it ever rejects, the fallback catches it). Not worth
 the regex risk overnight.
 
+### Longevity fix: sweep old Telegram uploads on an interval (2026-06-01, eighteenth slice) - DONE + DEPLOYED
+
+Defect-hunt for "built for longevity and sustainability". `cleanupOldUploads()`
+(media.ts:171, deletes regular files >24h old from workspace/uploads) was
+called EXACTLY ONCE at process start (index.ts:194), outside the main block.
+The voice/photo/document handlers (bot.ts:1616-1676) write Telegram downloads
+there on every inbound media message, so on a service designed to run for
+weeks the directory grew unbounded between restarts. The boot-only sweep only
+helped if the process happened to restart.
+
+Fix (`6a7c4a0`): folded `cleanupOldUploads()` into the existing main-process
+24h maintenance interval at index.ts:163 (alongside `runDecaySweep` +
+`cleanupOldMissionTasks`) and kept a boot-time call, so disk is bounded
+regardless of restart frequency. Also moved both calls INSIDE
+`if (AGENT_ID === 'main')`: only main runs the bot handlers that write uploads,
+matching the rationale already used for the decay/mission sweeps and removing a
+redundant cross-process unlink race. The function is defensive + idempotent
+(per-file stat+unlink in try/catch, only regular files >24h by mtime, logs only
+when deleted>0) and already covered by media.test.ts, so no new test needed.
+
+tsc exit 0, build green, full suite 965 passed / 4 skipped (unchanged).
+DEPLOYED via busy-guarded restart (no force) -> 200 (no turn in flight),
+health 200 attempt 1, clean boot (PID 326250: DB ready, consolidation enabled,
+scheduler started, ollama-proxy listening, dashboard + war room up, 0 errors).
+Session preserved (sessionAge 8d, model claude-opus-4-7, telegramConnected
+true). Origin/main at deployed HEAD (`6a7c4a0`, 0 ahead).
+
 ### Security: dependency audit (2026-06-01) - NEEDS EYES-ON
 
 Ran `npm audit` as a longevity check. Findings (prod tree): 9
@@ -1056,6 +1083,13 @@ seventeenth slice). Build exit 0; busy-guarded restart WITHOUT force -> 200,
 health 200 on poll attempt 1, clean boot (PID 319314, "ClaudeClaw online:
 @GCruiseJarvisBot", 0 errors). Origin/main at deployed HEAD (`80a814f`, 0
 ahead).
+
+DONE 2026-06-01 ~05:05. Deployed the uploads-sweep interval fix (`6a7c4a0`,
+eighteenth slice). Build exit 0, full suite 965/4-skipped; busy-guarded restart
+WITHOUT force -> 200 (no turn in flight), health 200 on poll attempt 1, clean
+boot (PID 326250: DB ready, consolidation enabled, scheduler started,
+ollama-proxy listening, dashboard + war room up, 0 errors; session preserved
+8d, telegramConnected true). Origin/main at deployed HEAD (`6a7c4a0`, 0 ahead).
 
 FOLLOW-UP (refactor, not urgent): the four generators duplicate security
 helpers, but a 2026-06-01 audit found the duplication is NOT uniform - do NOT
