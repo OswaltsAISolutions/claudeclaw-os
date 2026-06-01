@@ -639,6 +639,37 @@ hooks), pure network/SSE (chat-stream, whose meaty unread-bump logic is
 locked in an EventSource closure), canvas/WebGL (webgl.ts, not
 exercisable under jsdom), or a trivial signal wrapper (sidebar.ts).
 
+### Coverage expansion (2026-06-01, tenth slice) - DONE
+
+Test-hardening, not new coverage. `web/src/lib/personalization.test.ts`
+(`3b36c1a`, still 15 tests). Two `setWorkspaceName` inputs carried raw
+control bytes (0x01/0x1f and 0x00/0x1f) embedded directly inside the
+source string literals, so `file` classified the whole test as binary
+("data") and every reader (editors, code review, the Read tool) saw
+harmless `'abc'` / `' '` inputs. That made the "strips ASCII control
+characters" test plus one empty-fallback case LOOK like no-ops that
+never exercised the U+0000..U+001F sanitization they name. Converted the
+literal bytes to explicit unicode escapes via a one-shot Node transform
+(built the backslash with String.fromCharCode so no backslash passed
+through any shell layer): runtime is byte-identical (still strips to
+'abc' / empty, then the 'ClaudeClaw' fallback), the file reclassifies as
+UTF-8 text, and the intent is now visible in source. Suite unchanged at
+929 passed / 4 skipped; web tsc unchanged at 13.
+
+Meta-lesson for the next session: the prior summary logged this as a
+"false-confidence gap" (the input looked like plain 'abc'). It was not a
+gap. The Read tool silently drops control bytes, hiding the real test
+input, which is exactly what produced the wrong diagnosis. Before
+"fixing" any string-literal test that looks like a no-op, byte-check it
+(od, or grep -naP over the C0 control class excluding tab/newline)
+instead of trusting the rendered text.
+
+With this the frontend pure-lib depth audit is genuinely exhausted:
+remaining lib files are already well-covered, pure network/SSE,
+canvas/WebGL (not jsdom-exercisable), or trivial signal wrappers.
+Further low-risk test value is in clear diminishing returns; the
+high-value queued work that remains is the eyes-on items below.
+
 ### Security: dependency audit (2026-06-01) - NEEDS EYES-ON
 
 Ran `npm audit` as a longevity check. Findings (prod tree): 9
