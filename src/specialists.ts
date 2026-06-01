@@ -86,6 +86,14 @@ export interface SpecialistConfig {
   clawUseFull?: boolean;            // true → use full `claw` (bash + MCP); false (default) → `claw-analog` (sandboxed, no shell).
   clawMaxTurns?: number;            // Tool-loop cap (default 24).
   clawDisableFilesystemSandbox?: boolean; // true → CLAWD_SANDBOX_FILESYSTEM_MODE=off so host paths (/run/user/$UID/bus, /etc, journal) are visible. Required for sysadmin-shaped roles (sentinel).
+  /** True for specialists whose answers MUST be grounded in tool calls
+   *  (research, sysadmin, security, memory retrieval). When such a
+   *  specialist returns with zero tool calls, delegateClaw labels the
+   *  output as unverified. These are exactly the roles that fabricated
+   *  URLs, port lists, and byte counts in the bake-off. Leave unset for
+   *  prose, vision, or pure-reasoning roles where a tool-less answer is
+   *  legitimately fine. */
+  expectsToolUse?: boolean;
 }
 
 // All system prompts share a common "you are part of a hivemind" framing
@@ -234,6 +242,7 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
     vramHintGB: 14,
     clawPermission: 'read-only',
     clawUseFull: true,
+    expectsToolUse: true, // research: every fact must come from a fetched source
   },
   reaper: {
     callsign: 'reaper',
@@ -282,6 +291,7 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
     vramHintGB: 14,
     clawPermission: 'read-only',
     clawUseFull: true,
+    expectsToolUse: true, // memory ops must hit the DB, not be reasoned over
   },
   sentinel: {
     callsign: 'sentinel',
@@ -311,6 +321,7 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
     clawPermission: 'read-only',
     clawUseFull: true,
     clawDisableFilesystemSandbox: true,
+    expectsToolUse: true, // diagnostics must come from real systemctl/ss/df output
   },
   cipher: {
     callsign: 'cipher',
@@ -335,6 +346,7 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
     vramHintGB: 14,
     clawPermission: 'read-only',
     clawUseFull: true,
+    expectsToolUse: true, // figures must be computed from data, not estimated
   },
   // ── Cloud supervisors ────────────────────────────────────────────────
   // These two ride the user's Anthropic Max plan via OAuth (no API key,
@@ -706,8 +718,20 @@ export async function delegate(
   };
 }
 
+// Honesty labels prepended to specialist output we have reason to distrust.
+// Both are plain ASCII (no em/en dashes) because they are surfaced verbatim
+// to the user and to upstream Jarvis, who must never be handed a fabrication
+// as fact. Grounded in the 2026-05-25 bake-off: with zero tool calls, sleuth
+// fabricated URLs, sentinel invented port lists, and cipher made up a byte
+// count. Labeling (not hiding) keeps the answer available while flagging that
+// it is unverified.
+export const NO_TOOLS_FALLBACK_NOTICE =
+  '[unverified: claw failed, so this answer came from a no-tools fallback model and was NOT checked against files, commands, or the web]';
+export const UNGROUNDED_NOTICE =
+  '[unverified: produced without any tool calls, so factual claims (paths, URLs, figures) are NOT grounded and may be fabricated]';
+
 /**
- * Claw delegation — local agentic loop via the `claw-code` Rust harness
+ * Claw delegation. Local agentic loop via the `claw-code` Rust harness
  * bridged to Ollama. This is the default path for most specialists as of
  * the 2026-05-25 pivot. Free (no Anthropic quota burn), gives the model
  * a real tool loop (read/grep/glob/git/write, plus bash when
@@ -823,7 +847,11 @@ async function delegateClaw(
         opts.signal,
       );
       if (fallbackOut.trim()) {
-        logConversationTurn(chatId, 'assistant', fallbackOut, undefined, agentNs);
+        // This answer came from a no-tools fallback model after claw failed,
+        // so it was never checked against files, commands, or the web. Label
+        // it as unverified before it propagates to the user or to Jarvis.
+        const labeledFallback = `${NO_TOOLS_FALLBACK_NOTICE}\n\n${fallbackOut.trim()}`;
+        logConversationTurn(chatId, 'assistant', labeledFallback, undefined, agentNs);
         // Mirror the success path's hive_mind write so the dashboard activity
         // panel and the bake-off harness can both see what happened. Without
         // this, a claw failure that successfully fell back to direct Ollama
@@ -848,6 +876,7 @@ async function delegateClaw(
               stopReason: 'fallback-from-claw-error',
               fellBackFrom: spec.preferredModel,
               clawError: result.error ? result.error.slice(0, 200) : null,
+              unverified: true,
               taskPreview: task.slice(0, 120),
             }),
           );
@@ -857,7 +886,7 @@ async function delegateClaw(
         return {
           callsign: spec.callsign,
           modelUsed: fallbackModel,
-          output: fallbackOut.trim(),
+          output: labeledFallback,
           durationMs: Date.now() - startedAt,
           tokenEstimate: 0,
           fellBackFrom: spec.preferredModel,
@@ -871,14 +900,28 @@ async function delegateClaw(
     }
   }
 
-  if (output) {
-    logConversationTurn(chatId, 'assistant', output, undefined, agentNs);
+  // Anti-fabrication critic: a specialist flagged expectsToolUse MUST ground
+  // its answer in tool calls (research, sysadmin, security, memory retrieval).
+  // If it returned with zero tool calls, the prose is ungrounded and may be
+  // fabricated, so label it before it propagates. Prose/vision/reasoning roles
+  // leave expectsToolUse unset, so a tool-less answer there stays unlabeled.
+  const ungrounded = spec.expectsToolUse === true && result.toolCalls === 0 && !!output;
+  const finalOutput = ungrounded ? `${UNGROUNDED_NOTICE}\n\n${output}` : output;
+  if (ungrounded) {
+    logger.warn(
+      { callsign: spec.callsign, model: resolved.model, turns: result.turns },
+      '[claw] tool-required specialist produced zero tool calls; labeling output as ungrounded',
+    );
+  }
+
+  if (finalOutput) {
+    logConversationTurn(chatId, 'assistant', finalOutput, undefined, agentNs);
     try {
       logToHiveMind(
         agentNs,
         chatId,
         'specialist-delegate-claw',
-        output.slice(0, 240),
+        finalOutput.slice(0, 240),
         JSON.stringify({
           callsign: spec.callsign,
           tier: 'claw',
@@ -893,6 +936,7 @@ async function delegateClaw(
           // retryAttempts is 0/undefined on clean runs, 1 when a retry fired.
           retryAttempts: result.retryAttempts,
           strayToolSyntax: result.strayToolSyntax,
+          ungrounded,
           taskPreview: task.slice(0, 120),
         }),
       );
@@ -904,7 +948,7 @@ async function delegateClaw(
   // Emit a synthetic Reasoning card for tool-less responses so the
   // activity panel always shows something — same UX trick as in
   // delegateCloud, kept identical for consistency across tiers.
-  if (result.toolCalls === 0 && opts.onProgress && output) {
+  if (result.toolCalls === 0 && opts.onProgress && finalOutput) {
     const synthId = `response-${spec.callsign}-${Date.now()}`;
     const preview = task.length > 80 ? task.slice(0, 80) + '...' : task;
     opts.onProgress({
@@ -914,7 +958,7 @@ async function delegateClaw(
       toolName: 'Reasoning',
       input: task.length > 4000 ? task.slice(0, 4000) + '\n…[truncated]' : task,
     });
-    const cappedOut = output.length > 4000 ? output.slice(0, 4000) + '\n…[truncated]' : output;
+    const cappedOut = finalOutput.length > 4000 ? finalOutput.slice(0, 4000) + '\n…[truncated]' : finalOutput;
     opts.onProgress({
       type: 'tool_result',
       description: '',
@@ -926,7 +970,7 @@ async function delegateClaw(
   return {
     callsign: spec.callsign,
     modelUsed: resolved.model,
-    output: output || (result.error ? `[claw error] ${result.error}` : '[no output]'),
+    output: finalOutput || (result.error ? `[claw error] ${result.error}` : '[no output]'),
     durationMs,
     tokenEstimate: result.usage?.total_tokens || 0,
     fellBackFrom: resolved.fellBackFrom,
