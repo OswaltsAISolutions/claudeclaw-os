@@ -195,19 +195,25 @@ export function formatForTelegram(text: string): string {
     return `\x00CODE${codeBlocks.length - 1}\x00`;
   });
 
-  // 2. Escape HTML entities in the remaining text
-  result = result
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-
-  // 3. Inline code (after block extraction)
+  // 2. Extract inline code BEFORE the general escape, mirroring code blocks
+  //    above. Each protected region escapes its own content exactly once.
+  //    (Doing the general escape first and then escaping the inline content
+  //    again double-escaped it: `Map<string>` became Map&amp;lt;string&amp;gt;
+  //    and rendered the literal "&lt;" in Telegram.) The single-backtick regex
+  //    is safe here because the ``` fences were already replaced in step 1.
   const inlineCodes: string[] = [];
   result = result.replace(/`([^`]+)`/g, (_, code) => {
     const escaped = code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     inlineCodes.push(`<code>${escaped}</code>`);
     return `\x00INLINE${inlineCodes.length - 1}\x00`;
   });
+
+  // 3. Escape HTML entities in the remaining (non-code) text. & first, so the
+  //    &lt;/&gt; this produces are not themselves re-escaped.
+  result = result
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 
   // 4. Headings → bold (strip the # prefix, keep the text)
   result = result.replace(/^#{1,6}\s+(.+)$/gm, '<b>$1</b>');

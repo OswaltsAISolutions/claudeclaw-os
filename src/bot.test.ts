@@ -294,6 +294,28 @@ describe('formatForTelegram', () => {
     expect(formatForTelegram('`**x**`')).toBe('<code>**x**</code>');
   });
 
+  it('escapes <, >, & inside inline code exactly once (no double-escape)', () => {
+    // Regression: the general HTML-escape pass used to run BEFORE inline
+    // extraction, which then escaped the already-escaped content a second
+    // time, turning `Map<string, int>` into Map&amp;lt;...&amp;gt; (rendered
+    // literally as "&lt;" in Telegram). A developer's inline code is full of
+    // generics / comparisons / shell redirects, so this hit constantly. The
+    // content must be escaped exactly once: < -> &lt;, > -> &gt;, & -> &amp;.
+    expect(formatForTelegram('use `Map<string, int>` here')).toBe(
+      'use <code>Map&lt;string, int&gt;</code> here',
+    );
+    expect(formatForTelegram('run `a && b`')).toBe('run <code>a &amp;&amp; b</code>');
+  });
+
+  it('escapes special chars in inline code while still escaping bare text around it', () => {
+    // The bare `<` outside the code is escaped by the general pass; the `<`
+    // inside the code is escaped by the inline pass. Both end up escaped
+    // exactly once, from two different stages, with no interference.
+    expect(formatForTelegram('a < b and `c < d`')).toBe(
+      'a &lt; b and <code>c &lt; d</code>',
+    );
+  });
+
   it('converts a heading to bold, dropping the # prefix', () => {
     expect(formatForTelegram('## Title')).toBe('<b>Title</b>');
   });
