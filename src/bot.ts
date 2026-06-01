@@ -236,8 +236,14 @@ export function formatForTelegram(text: string): string {
   // 9. Strikethrough ~~text~~
   result = result.replace(/~~([^~\n]+)~~/g, '<s>$1</s>');
 
-  // 10. Links [text](url)
-  result = result.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2">$1</a>');
+  // 10. Links [text](url). Percent-encode any raw " in the URL so it cannot
+  //     close the href attribute early and make Telegram reject the whole
+  //     message as invalid HTML. Well-formed URLs already encode " as %22, so
+  //     this is a no-op for them.
+  result = result.replace(
+    /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g,
+    (_m, txt, url) => `<a href="${url.replace(/"/g, '%22')}">${txt}</a>`,
+  );
 
   // 11. Restore code blocks and inline code
   result = result.replace(/\x00CODE(\d+)\x00/g, (_, i) => codeBlocks[parseInt(i)]);

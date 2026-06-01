@@ -361,6 +361,15 @@ describe('formatForTelegram', () => {
     expect(out).toContain('[x](javascript:alert(1))');
   });
 
+  it('percent-encodes a raw double-quote in a link URL so the href stays valid HTML', () => {
+    // A raw " in the URL would otherwise close the href attribute early and
+    // make Telegram reject the whole message as malformed HTML.
+    const out = formatForTelegram('[x](https://e.com/a?q="z")');
+    expect(out).toBe('<a href="https://e.com/a?q=%22z%22">x</a>');
+    // Exactly the two attribute-delimiter quotes remain (open + close).
+    expect((out.match(/"/g) || []).length).toBe(2);
+  });
+
   it('collapses 3+ consecutive blank lines down to a single blank line', () => {
     expect(formatForTelegram('a\n\n\n\nb')).toBe('a\n\nb');
   });
