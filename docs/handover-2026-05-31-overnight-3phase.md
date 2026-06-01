@@ -603,6 +603,42 @@ lane: GET shapes and mutation rejection guards are both pinned, leaving
 only side-effecting happy paths (need a sandbox the in-memory DB can't
 provide) and the network/SSE routes excluded above.
 
+### Coverage expansion (2026-06-01, ninth slice) - DONE
+
+Pivoted from backend (exhausted) to deepening the highest-risk frontend
+pure modules. Not padding: every case was traced from source to a branch
+that was genuinely uncovered and where a regression would silently
+corrupt a schedule or reopen an XSS hole.
+
+- `web/src/lib/cron.test.ts` (`09fe3d0`, 31 -> 40 tests): the
+  schedule-picker describe/parse/build edge branches. describeCron now
+  pins the two-day "and" join vs the Oxford-comma list, a six-day list,
+  a multi-month restriction, dow `0-7` collapsing to every day, step
+  minutes enumerated inside one fixed hour, and the `*/0`
+  divide-by-zero guard. parseSchedule pins the full minute x hour cross
+  product (must not drop firing times); buildSchedule pins the
+  no-warning complement of the cross-product warning; the round-trip
+  identity set gains the multi-hour grid.
+- `web/src/lib/markdown.test.ts` (`9aad482`, 7 -> 13 tests): more
+  XSS-protection branches of the chat renderer (marked -> DOMPurify).
+  `data:` and `vbscript:` link schemes neutralized, `mailto:` kept
+  (positive allowlist case), `<iframe>` stripped, `style` attributes
+  stripped (CSS injection), GFM tables still render.
+- `web/src/lib/command-palette.test.ts` (`cf2d346`, 7 -> 13 tests):
+  `filterActions` was covered but `buildActions` (the palette's action
+  list) had none. Pin one Navigation action per route in ROUTES order
+  (parity vs ROUTES, not a hardcoded copy), the Actions/Theme groups
+  after Navigation, every nav action's run() navigating to its own
+  path, shortcut->hint uppercasing, the `/mission?new=1` and
+  `/agents?new=1` quick-create deep links, and a Theme action per theme.
+
+Suite 908 -> 929 passed (4 skipped, 68 files); web tsc unchanged at 13.
+Test-only, nothing deployed. Remaining frontend lib files are either
+already well-covered (format, theme, toasts, routes, api, the two
+hooks), pure network/SSE (chat-stream, whose meaty unread-bump logic is
+locked in an EventSource closure), canvas/WebGL (webgl.ts, not
+exercisable under jsdom), or a trivial signal wrapper (sidebar.ts).
+
 ## Guardrails in force
 
 Push + service-deploy now AUTHORIZED (see intro). Still NO PC restart /
