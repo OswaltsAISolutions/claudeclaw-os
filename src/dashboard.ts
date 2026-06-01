@@ -188,15 +188,15 @@ Reply with JSON: {"agent": "agent_id"}`;
 // Meeting id format: wr_<timestampBase36>_<6-hex-random>. Regex also allows
 // the same shape without the hex suffix in case an id is created manually
 // in tests. Validated on every route that takes meetingId.
-const WARROOM_TEXT_ID_RE = /^wr_[a-z0-9_]{4,64}$/i;
+export const WARROOM_TEXT_ID_RE = /^wr_[a-z0-9_]{4,64}$/i;
 // Browser crypto.randomUUID() produces lowercase v4 UUIDs. Accept either case.
-const CLIENT_MSG_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+export const CLIENT_MSG_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 // Constant-time token comparison (audit fix A4E-1, ported from fork).
 // Plain `===` leaks timing info that lets a remote attacker recover the token
 // one byte at a time. timingSafeEqual takes O(n) regardless of where the
 // mismatch occurs. Length pre-check prevents a panic on differing buffers.
-function safeTokenEqual(provided: string | null | undefined, expected: string | null | undefined): boolean {
+export function safeTokenEqual(provided: string | null | undefined, expected: string | null | undefined): boolean {
   if (!provided || !expected) return false;
   if (provided.length !== expected.length) return false;
   return crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
