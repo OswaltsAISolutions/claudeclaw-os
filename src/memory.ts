@@ -3,6 +3,7 @@ import {
   batchUpdateMemoryRelevance,
   decayMemories,
   getConsolidationsWithEmbeddings,
+  getDashboardPinnedMemories,
   getLastMemorySaveTime,
   getOtherAgentActivity,
   getRecentConsolidations,
@@ -10,11 +11,13 @@ import {
   getRecentWarRoomTranscriptForChat,
   getTurnCountSinceTimestamp,
   logConversationTurn,
+  pinMemory,
   pruneConversationLog,
   pruneSlackMessages,
   pruneWaMessages,
   pruneWarRoomMeetings,
-  searchConsolidations,
+  saveMemoryEmbedding,
+  saveStructuredMemory,
   searchConversationHistory,
   searchMemories,
 } from './db.js';
@@ -27,17 +30,119 @@ import { buildObsidianContext } from './obsidian.js';
 /**
  * Build a structured memory context string to prepend to the user's message.
  *
- * Three-layer retrieval:
- *   Layer 1: FTS5 keyword search on summary + raw_text + entities + topics (top 5)
- *   Layer 2: Recent high-importance memories (importance >= 0.5, top 5 by accessed_at)
- *   Layer 3: Relevant consolidation insights
+ * 2026-05-25 rewrite — unified global ranking + byte budget.
  *
- * Deduplicates across layers. Returns formatted context with structure.
+ * Old design: 5 independent layers each dumped their top-K with no global
+ * cap. A typical turn produced ~10 KB of preamble — long enough to bloat
+ * local-model context windows and leak into chat UIs when joins went
+ * wrong (see [[bug from 2026-05-24 chat-leak incident]]).
+ *
+ * New design:
+ *   1) CORE: pinned memories (explicitly marked permanent by the user).
+ *      Always rides, capped at 2 entries / ~250 bytes. Skipped when empty.
+ *   2) CTX:  unified pool of (semantic-search memories + recent-high-importance
+ *      memories + consolidation insights + recent team activity + recall
+ *      history). Each candidate gets a composite score
+ *      `relevance × 0.65 + importance × 0.25 + recency × 0.10`, where
+ *      relevance = cosine(query, embedding) for embedded items, or a
+ *      default mid-tier signal (0.55) for items without embeddings.
+ *      We pick top items in score order until we hit ~2.5 KB / 8 entries.
+ *
+ * Target: total memory block ≤ 3 KB (down from ~10 KB). Local 30b models
+ * have noticeably better instruction-following with shorter contexts; this
+ * is the single biggest lever for output quality after the local pivot.
  */
 export interface MemoryContextResult {
   contextText: string;
   surfacedMemoryIds: number[];
   surfacedMemorySummaries: Map<number, string>;
+}
+
+// Budget knobs. Tunable; defaults picked from empirical testing on
+// typical Jarvis prompts (~6 entries fits comfortably in 2.5 KB).
+const CTX_BYTE_BUDGET = 2500;
+const CTX_MAX_ITEMS = 8;
+const CORE_MAX_ITEMS = 2;
+const CORE_BYTE_BUDGET = 250;
+// Items without an embedding get this as their relevance signal — middle
+// of the road. Strong importance/recency can still float them up, but
+// they can't outrank a semantically-perfect match.
+const NO_EMBEDDING_RELEVANCE = 0.55;
+
+/** Source kind for a ranked candidate. The label survives into the
+ *  rendered output as a one-character prefix so the model can tell a
+ *  background fact from live team activity without verbose section
+ *  headers. */
+type CandidateKind = 'mem' | 'insight' | 'team' | 'history';
+
+interface RankCandidate {
+  kind: CandidateKind;
+  id: number | null;         // null for non-memory sources (insights, team, history)
+  summary: string;           // The one-line display text
+  embedding: number[] | null;
+  importance: number;        // 0..1
+  ageSeconds: number;
+  /** Optional prefix tag rendered before the summary (e.g. @scribe, 2d). */
+  tag?: string;
+  /** Override score; when set, skip composite computation (used by team
+   *  activity which gets a fixed recency-driven score). */
+  scoreOverride?: number;
+}
+
+interface RankedCandidate extends RankCandidate {
+  score: number;
+}
+
+/** Compute composite relevance score for a candidate. */
+function scoreCandidate(c: RankCandidate, queryEmbedding: number[] | undefined): number {
+  if (typeof c.scoreOverride === 'number') return c.scoreOverride;
+  const relevance = queryEmbedding && queryEmbedding.length > 0 && c.embedding && c.embedding.length > 0
+    ? Math.max(0, cosineSimilarity(queryEmbedding, c.embedding))
+    : NO_EMBEDDING_RELEVANCE;
+  const importance = Math.max(0, Math.min(1, c.importance));
+  // Exponential recency decay with a 1-week half-life. Items younger than
+  // a few hours sit near 1.0; week-old items sit near 0.5; month-old
+  // items near 0.1.
+  const recency = Math.exp(-c.ageSeconds / (7 * 24 * 3600));
+  return relevance * 0.65 + importance * 0.25 + recency * 0.10;
+}
+
+/** Parse the stored embedding column. Returns null for empty/missing. */
+function parseEmbedding(stored: string | null | undefined): number[] | null {
+  if (!stored) return null;
+  try {
+    const arr = JSON.parse(stored);
+    if (Array.isArray(arr) && arr.length > 0) return arr as number[];
+  } catch {
+    /* fall through */
+  }
+  return null;
+}
+
+/** Format a candidate as a single output line. */
+function renderCandidate(c: RankedCandidate): string {
+  const score = c.score.toFixed(2);
+  const tag = c.tag ? ` ${c.tag}` : '';
+  return `${score}${tag} ${c.summary}`;
+}
+
+/** Pick candidates in score order until byte/item budgets are hit. */
+function selectByBudget(
+  candidates: RankedCandidate[],
+  byteBudget: number,
+  maxItems: number,
+): RankedCandidate[] {
+  const picked: RankedCandidate[] = [];
+  let used = 0;
+  for (const c of candidates) {
+    if (picked.length >= maxItems) break;
+    const line = renderCandidate(c);
+    const lineCost = line.length + 1; // +1 for newline
+    if (used + lineCost > byteBudget) continue; // try smaller items further down the list
+    picked.push(c);
+    used += lineCost;
+  }
+  return picked;
 }
 
 export interface BuildMemoryContextOpts {
@@ -72,155 +177,146 @@ export async function buildMemoryContext(
     strictAgentId,
     warRoomBridge,
   } = opts;
-  const seen = new Set<number>();
+  const surfacedIds = new Set<number>();
   const summaryMap = new Map<number, string>();
-  const memLines: string[] = [];
+  const now = Math.floor(Date.now() / 1000);
 
-  // Embed the query for vector search (async, adds ~200ms but gives semantic results).
-  // 2026-05-23: removed the stale GOOGLE_API_KEY gate. embedText() runs on local
-  // bge-m3 (Ollama) now — no Google auth needed. Always try; non-fatal on failure.
+  // Embed the query once for vector scoring across all sources. Local
+  // bge-m3 (~200ms); failures are non-fatal — items without embeddings
+  // fall back to NO_EMBEDDING_RELEVANCE in scoreCandidate().
   let queryEmbedding: number[] | undefined;
   try {
     queryEmbedding = await embedText(userMessage);
   } catch {
-    // Embedding failure is non-fatal; falls back to keyword search
+    /* non-fatal */
   }
 
-  // Layer 1: semantic search (embedding) with FTS5/LIKE fallback
-  // NOTE: We do NOT touch memories here. The feedback loop (evaluateMemoryRelevance)
-  // is the only thing that should boost salience/accessed_at. Touching at retrieval
-  // creates a positive feedback loop where noise stays fresh forever.
-  const searched = searchMemories(chatId, userMessage, 5, queryEmbedding, strictAgentId);
+  // ── CORE: pinned memories ────────────────────────────────────────
+  // Pinned memories are user-marked "remember this permanently". They
+  // always ride at the top of the context, regardless of query relevance,
+  // because they're typically identity facts (who the user is, role,
+  // hard rules) that the agent needs every turn.
+  let corePicked: RankedCandidate[] = [];
+  if (!strictAgentId) {
+    const pinned = getDashboardPinnedMemories(chatId);
+    const coreCandidates: RankedCandidate[] = pinned.map((m) => ({
+      kind: 'mem' as const,
+      id: m.id,
+      summary: m.summary,
+      embedding: parseEmbedding(m.embedding),
+      importance: m.importance,
+      ageSeconds: now - m.accessed_at,
+      // Score override: importance × 1.0 keeps the top-importance pinned
+      // items first; we don't rerank by query relevance because pinned
+      // items are deliberately background-context.
+      scoreOverride: m.importance,
+      score: m.importance,
+    }));
+    coreCandidates.sort((a, b) => b.score - a.score);
+    corePicked = selectByBudget(coreCandidates, CORE_BYTE_BUDGET, CORE_MAX_ITEMS);
+    for (const c of corePicked) {
+      if (c.id !== null) {
+        surfacedIds.add(c.id);
+        summaryMap.set(c.id, c.summary);
+      }
+    }
+  }
+
+  // ── Build the candidate pool for the CTX block ───────────────────
+  const pool: RankCandidate[] = [];
+
+  // Source 1: semantic + FTS hybrid search over memories. Pull a larger
+  // pool (15) than we'll emit so the global ranker has options.
+  const searched = searchMemories(chatId, userMessage, 15, queryEmbedding, strictAgentId);
   for (const mem of searched) {
-    seen.add(mem.id);
-    summaryMap.set(mem.id, mem.summary);
-    const topics = safeParse(mem.topics);
-    const topicStr = topics.length > 0 ? ` (${topics.join(', ')})` : '';
-    memLines.push(`- [${mem.importance.toFixed(1)}] ${mem.summary}${topicStr}`);
-  }
-
-  // Layer 2: recent high-importance memories (deduplicated)
-  const recent = getRecentHighImportanceMemories(chatId, 5, strictAgentId);
-  for (const mem of recent) {
-    if (seen.has(mem.id)) continue;
-    seen.add(mem.id);
-    summaryMap.set(mem.id, mem.summary);
-    const topics = safeParse(mem.topics);
-    const topicStr = topics.length > 0 ? ` (${topics.join(', ')})` : '';
-    memLines.push(`- [${mem.importance.toFixed(1)}] ${mem.summary}${topicStr}`);
-  }
-
-  // Layer 3: consolidation insights (semantic search with LIKE fallback)
-  // The consolidations table has no agent_id column, so this layer is
-  // skipped when strictAgentId is set (war-room callers).
-  const insightLines: string[] = [];
-
-  if (includeConsolidations && !strictAgentId) {
-    if (queryEmbedding && queryEmbedding.length > 0) {
-      const candidates = getConsolidationsWithEmbeddings(chatId);
-      if (candidates.length > 0) {
-        const scored = candidates
-          .map((c) => ({ ...c, score: cosineSimilarity(queryEmbedding, c.embedding) }))
-          .filter((s) => s.score > 0.3)
-          .sort((a, b) => b.score - a.score)
-          .slice(0, 2);
-        for (const c of scored) {
-          insightLines.push(`- ${c.insight}`);
-        }
-      }
-    }
-
-    if (insightLines.length === 0) {
-      const consolidations = searchConsolidations(chatId, userMessage, 2);
-      if (consolidations.length === 0) {
-        const recentInsights = getRecentConsolidations(chatId, 2);
-        for (const c of recentInsights) {
-          insightLines.push(`- ${c.insight}`);
-        }
-      } else {
-        for (const c of consolidations) {
-          insightLines.push(`- ${c.insight}`);
-        }
-      }
-    }
-  }
-
-  // Layer 6 (computed early so we can decide whether to short-circuit):
-  // war-room transcript bridge.
-  let warRoomLines: string[] = [];
-  if (warRoomBridge) {
-    const cutoff = Math.floor(Date.now() / 1000) - 24 * 3600;
-    const rows = getRecentWarRoomTranscriptForChat(chatId, {
-      limit: warRoomBridge.limit ?? 10,
-      sinceTs: cutoff,
-      excludeMeetingId: warRoomBridge.excludeMeetingId,
+    if (surfacedIds.has(mem.id)) continue;
+    pool.push({
+      kind: 'mem',
+      id: mem.id,
+      summary: mem.summary,
+      embedding: parseEmbedding(mem.embedding),
+      importance: mem.importance,
+      ageSeconds: now - mem.accessed_at,
     });
-    if (rows.length > 0) {
-      warRoomLines = rows
-        .slice()
-        .reverse() // chronological
-        .map((r) => {
-          const speaker = r.speaker === 'user' ? 'User' : r.speaker;
-          const snippet = r.text.length > 200 ? r.text.slice(0, 200) + '…' : r.text;
-          return `- ${speaker}: ${snippet}`;
+  }
+
+  // Source 2: recent high-importance memories. Some of these may already
+  // be in the search results (dedup by id). Cap pool growth at 10.
+  const recentHigh = getRecentHighImportanceMemories(chatId, 10, strictAgentId);
+  for (const mem of recentHigh) {
+    if (surfacedIds.has(mem.id)) continue;
+    if (pool.some((p) => p.kind === 'mem' && p.id === mem.id)) continue;
+    pool.push({
+      kind: 'mem',
+      id: mem.id,
+      summary: mem.summary,
+      embedding: parseEmbedding(mem.embedding),
+      importance: mem.importance,
+      ageSeconds: now - mem.accessed_at,
+    });
+  }
+
+  // Source 3: consolidation insights. Embedding-aware when available.
+  if (includeConsolidations && !strictAgentId) {
+    const embedded = getConsolidationsWithEmbeddings(chatId);
+    if (embedded.length > 0) {
+      for (const c of embedded) {
+        pool.push({
+          kind: 'insight',
+          id: null,
+          summary: c.insight,
+          embedding: Array.isArray(c.embedding) ? c.embedding : null,
+          importance: 0.6,           // insights treated as "moderately important"
+          ageSeconds: 0,             // (no created_at on this shape) — treat as fresh
         });
+      }
+    } else {
+      // Fallback: a couple recent insights, no embedding signal.
+      for (const c of getRecentConsolidations(chatId, 3)) {
+        pool.push({
+          kind: 'insight',
+          id: null,
+          summary: c.insight,
+          embedding: null,
+          importance: 0.5,
+          ageSeconds: 0,
+        });
+      }
     }
   }
 
-  if (memLines.length === 0 && insightLines.length === 0 && warRoomLines.length === 0 && !agentObsidianConfig) {
-    return { contextText: '', surfacedMemoryIds: [], surfacedMemorySummaries: new Map() };
-  }
-
-  const parts: string[] = [];
-
-  if (memLines.length > 0 || insightLines.length > 0) {
-    const blocks: string[] = ['[Memory context]'];
-    if (memLines.length > 0) {
-      blocks.push('Relevant memories:');
-      blocks.push(...memLines);
-    }
-    if (insightLines.length > 0) {
-      blocks.push('');
-      blocks.push('Insights:');
-      blocks.push(...insightLines);
-    }
-    blocks.push('[End memory context]');
-    parts.push(blocks.join('\n'));
-  }
-
-  // Layer 4: Cross-agent activity awareness (skipped for strict per-agent
-  // war-room callers).
+  // Source 4: team activity (other agents' hivemind entries, last 24h).
+  // We pull a tighter window than the old 10 (now 6) and let global
+  // ranking decide which ones actually deserve to surface.
   if (includeTeamActivity) {
-    const teamActivity = getOtherAgentActivity(agentId, 24, 10);
-    if (teamActivity.length > 0) {
-      const activityLines = teamActivity.map((entry) => {
-        // Note: created_at is unix seconds, Date.now() is ms, so divide by 1000
-        const ago = Math.round((Date.now() / 1000 - entry.created_at) / 60);
-        const timeStr = ago < 60 ? `${ago}m ago` : `${Math.round(ago / 60)}h ago`;
-        return `- [${entry.agent_id}] ${timeStr}: ${entry.summary}`;
+    const teamRows = getOtherAgentActivity(agentId, 24, 6);
+    for (const entry of teamRows) {
+      const age = now - entry.created_at;
+      const ago = age < 3600
+        ? `${Math.max(1, Math.round(age / 60))}m`
+        : `${Math.round(age / 3600)}h`;
+      pool.push({
+        kind: 'team',
+        id: null,
+        summary: entry.summary,
+        embedding: null,
+        importance: 0.45,
+        ageSeconds: age,
+        tag: `@${entry.agent_id.replace(/^specialist:/, '')}/${ago}`,
       });
-      parts.push(`[Team activity — what other agents have done recently]\n${activityLines.join('\n')}\n[End team activity]`);
     }
   }
 
-  // Layer 5: Conversation history recall
-  // When the user is asking about past conversations, search the conversation_log
-  // for matching exchanges. This gives the agent access to the full context that
-  // memory extraction may have compressed into a single sentence.
+  // Source 5: conversation history (only when the prompt itself hints
+  // at a recall query — e.g. "what did we do yesterday"). We add these
+  // to the same pool so they compete with memories on relevance.
   if (includeRecallHistory) {
-    // 2026-05-23: expanded keyword set. Old set only matched memory-recall phrasings
-    // ("remember", "yesterday"); missed activity-summary phrasings like "shipped",
-    // "today's wins", "what we did", "last 24 hours", "tldr". These activity
-    // questions are exactly when Jarvis needs the conversation_log most — after a
-    // /newchat his session is empty and he has nothing to draw from without this.
     const recallKeywords = new RegExp(
       [
-        // Original memory-recall phrasings
         '\\bremember\\b', '\\brecall\\b', '\\byesterday\\b', '\\blast time\\b',
         '\\bwe talked\\b', '\\bwe discussed\\b', '\\bwhat do you know\\b',
         '\\bdo you know\\b', '\\bpreviously\\b', '\\bearlier\\b',
         '\\blast week\\b', '\\bfew days\\b',
-        // Activity-summary phrasings
         '\\bshipped\\b', '\\bshipping\\b',
         "\\btoday'?s?\\b.*\\b(wins?|activity|work|progress|recap|summary)\\b",
         '\\bwhat we (did|have|worked|built|shipped|discussed|talked|made)\\b',
@@ -238,31 +334,96 @@ export async function buildMemoryContext(
       'i',
     );
     if (recallKeywords.test(userMessage)) {
-      const historyTurns = searchConversationHistory(chatId, userMessage, agentId, 7, 10);
-      if (historyTurns.length > 0) {
-        const historyLines = historyTurns
-          .reverse() // chronological
-          .map((t) => {
-            const daysAgo = Math.round((Date.now() / 1000 - t.created_at) / 86400);
-            const timeStr = daysAgo === 0 ? 'today' : daysAgo === 1 ? 'yesterday' : `${daysAgo}d ago`;
-            const role = t.role === 'user' ? 'User' : 'You';
-            return `[${timeStr}] ${role}: ${t.content.slice(0, 300)}`;
-          });
-        parts.push(`[Conversation history recall]\n${historyLines.join('\n')}\n[End conversation history]`);
+      const historyTurns = searchConversationHistory(chatId, userMessage, agentId, 4, 10);
+      for (const t of historyTurns) {
+        const age = now - t.created_at;
+        const daysAgo = Math.round(age / 86400);
+        const ago = daysAgo === 0 ? 'today' : daysAgo === 1 ? '1d' : `${daysAgo}d`;
+        const role = t.role === 'user' ? 'User' : 'You';
+        const trimmed = t.content.length > 200 ? t.content.slice(0, 200) + '…' : t.content;
+        pool.push({
+          kind: 'history',
+          id: null,
+          summary: `${role}: ${trimmed}`,
+          embedding: null,
+          importance: 0.5,
+          ageSeconds: age,
+          tag: ago,
+        });
       }
     }
   }
 
-  // Layer 6: war-room transcript bridge (Telegram callers can opt-in to
-  // see what was said in recent text war rooms for this chat).
-  if (warRoomLines.length > 0) {
-    parts.push(`[War room earlier — most recent last]\n${warRoomLines.join('\n')}\n[End war room]`);
+  // ── Global ranking and budgeted selection ─────────────────────────
+  const scored: RankedCandidate[] = pool.map((c) => ({ ...c, score: scoreCandidate(c, queryEmbedding) }));
+  scored.sort((a, b) => b.score - a.score);
+  const ctxPicked = selectByBudget(scored, CTX_BYTE_BUDGET, CTX_MAX_ITEMS);
+  for (const c of ctxPicked) {
+    if (c.id !== null) {
+      surfacedIds.add(c.id);
+      summaryMap.set(c.id, c.summary);
+    }
   }
+
+  // ── War-room bridge (separate block; kept verbatim) ──────────────
+  // Treated separately because it's a chronological transcript, not a
+  // collection of facts to rank. Capped at 6 lines max.
+  let warRoomBlock = '';
+  if (warRoomBridge) {
+    const cutoff = now - 24 * 3600;
+    const rows = getRecentWarRoomTranscriptForChat(chatId, {
+      limit: Math.min(warRoomBridge.limit ?? 6, 6),
+      sinceTs: cutoff,
+      excludeMeetingId: warRoomBridge.excludeMeetingId,
+    });
+    if (rows.length > 0) {
+      const lines = rows.slice().reverse().map((r) => {
+        const speaker = r.speaker === 'user' ? 'User' : r.speaker;
+        const snippet = r.text.length > 160 ? r.text.slice(0, 160) + '…' : r.text;
+        return `${speaker}: ${snippet}`;
+      });
+      warRoomBlock = `[war room]\n${lines.join('\n')}\n[/war room]`;
+    }
+  }
+
+  // ── Assemble final block ─────────────────────────────────────────
+  const parts: string[] = [];
+  if (corePicked.length > 0) {
+    const lines = corePicked.map((c) => c.summary);
+    parts.push(`[core]\n${lines.join('\n')}\n[/core]`);
+  }
+  if (ctxPicked.length > 0) {
+    const lines = ctxPicked.map((c) => renderCandidate(c));
+    parts.push(`[ctx · ${ctxPicked.length}]\n${lines.join('\n')}\n[/ctx]`);
+  }
+  if (warRoomBlock) parts.push(warRoomBlock);
 
   const obsidianBlock = buildObsidianContext(agentObsidianConfig);
   if (obsidianBlock) parts.push(obsidianBlock);
 
-  return { contextText: parts.join('\n\n'), surfacedMemoryIds: [...seen], surfacedMemorySummaries: summaryMap };
+  // Trace the final size so we can monitor for regressions / bloat
+  // creep over time. Cheap (one log line per turn) and high-signal —
+  // an unexpected jump back into 8 KB territory means a new source got
+  // wired in without going through the budget gate.
+  const contextText = parts.join('\n\n');
+  logger.info(
+    {
+      chatId,
+      agentId,
+      coreItems: corePicked.length,
+      ctxItems: ctxPicked.length,
+      contextBytes: contextText.length,
+      poolSize: pool.length,
+      hadEmbedding: !!(queryEmbedding && queryEmbedding.length > 0),
+    },
+    '[memory] context built',
+  );
+
+  return {
+    contextText,
+    surfacedMemoryIds: [...surfacedIds],
+    surfacedMemorySummaries: summaryMap,
+  };
 }
 
 /**
@@ -292,6 +453,59 @@ export function logAssistantTurn(
   void ingestConversationTurn(chatId, userMessage, assistantResponse, agentId).catch((err) => {
     logger.error({ err }, 'Memory ingestion fire-and-forget failed');
   });
+}
+
+/**
+ * Create a new pinned memory from arbitrary user-supplied text.
+ *
+ * "Pinned" here is the existing memories.pinned flag — these entries are
+ * exempt from decay AND always ride at the top of buildMemoryContext()'s
+ * CORE block. Used by the `/pin <text>` Telegram command and the
+ * dashboard's POST /api/memory/pin endpoint so the user can promote
+ * facts to permanent without having to know existing memory IDs.
+ *
+ * Embedding generation is fire-and-forget so the caller doesn't pay the
+ * ~200ms bge-m3 round-trip. Without an embedding the entry still rides
+ * in CORE (CORE doesn't rank by relevance), just won't show up in the
+ * RANKED block until the next ingest pass re-embeds it.
+ */
+export async function createPinnedMemory(
+  chatId: string,
+  text: string,
+  agentId = 'main',
+): Promise<{ id: number; summary: string }> {
+  const trimmed = text.trim();
+  if (!trimmed) throw new Error('pinned memory text is empty');
+  // Use the first 140 chars as the displayable summary. The full text
+  // goes into raw_text so future re-summarization passes have the
+  // original to work with.
+  const summary = trimmed.length > 140 ? trimmed.slice(0, 140) + '…' : trimmed;
+  const id = saveStructuredMemory(
+    chatId,
+    trimmed,                // raw_text
+    summary,                // summary (display)
+    [],                     // entities
+    ['user-pinned'],        // topics
+    0.95,                   // importance (just below 1.0 so user can override later)
+    'user-pin',             // source
+    agentId,
+  );
+  pinMemory(id);
+
+  // Embed in background. Best-effort: if Ollama is down the memory still
+  // exists, it just won't show up in semantic search until something
+  // else re-embeds it.
+  embedText(trimmed).then((vec) => {
+    if (vec.length > 0) {
+      try {
+        saveMemoryEmbedding(id, vec);
+      } catch (err) {
+        logger.warn({ err: (err as Error).message, id }, '[memory] failed to save pinned embedding');
+      }
+    }
+  }).catch(() => { /* embedding miss is non-fatal */ });
+
+  return { id, summary };
 }
 
 /**

@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 vi.mock('./db.js', () => ({
   searchMemories: vi.fn(),
   getRecentHighImportanceMemories: vi.fn(),
+  getDashboardPinnedMemories: vi.fn(() => []),
   getOtherAgentActivity: vi.fn(() => []),
   getConsolidationsWithEmbeddings: vi.fn(() => []),
   touchMemory: vi.fn(),
@@ -46,6 +47,7 @@ import {
   logConversationTurn,
   searchConsolidations,
   getRecentConsolidations,
+  getConsolidationsWithEmbeddings,
 } from './db.js';
 
 import { ingestConversationTurn } from './memory-ingest.js';
@@ -57,6 +59,7 @@ const mockDecayMemories = vi.mocked(decayMemories);
 const mockLogConversationTurn = vi.mocked(logConversationTurn);
 const mockSearchConsolidations = vi.mocked(searchConsolidations);
 const mockGetRecentConsolidations = vi.mocked(getRecentConsolidations);
+const mockGetConsolidationsWithEmbeddings = vi.mocked(getConsolidationsWithEmbeddings);
 const mockIngest = vi.mocked(ingestConversationTurn);
 
 function makeMemory(overrides: Record<string, unknown> = {}) {
@@ -103,11 +106,9 @@ describe('buildMemoryContext', () => {
     mockGetRecentHighImportance.mockReturnValue([]);
 
     const { contextText } = await buildMemoryContext('chat1', 'pizza');
-    expect(contextText).toContain('[Memory context]');
+    expect(contextText).toContain('[ctx');
     expect(contextText).toContain('User enjoys pizza');
-    expect(contextText).toContain('food');
-    expect(contextText).toContain('[0.8]');
-    expect(contextText).toContain('[End memory context]');
+    expect(contextText).toContain('[/ctx]');
   });
 
   it('deduplicates between FTS and recent results', async () => {
@@ -160,18 +161,17 @@ describe('buildMemoryContext with consolidations', () => {
     mockGetRecentHighImportance.mockReturnValue([]);
   });
 
-  it('includes consolidation insights when searchConsolidations returns results', async () => {
-    mockSearchConsolidations.mockReturnValue([
-      { id: 1, chat_id: 'chat1', source_ids: '[1,2]', summary: 'Morning routine synthesis', insight: 'User has structured morning workflow', created_at: 100 },
+  it('surfaces consolidation insights from getConsolidationsWithEmbeddings', async () => {
+    mockGetConsolidationsWithEmbeddings.mockReturnValue([
+      { id: 1, summary: 'Morning routine synthesis', insight: 'User has structured morning workflow', embedding: [] },
     ]);
 
     const { contextText } = await buildMemoryContext('chat1', 'morning routine');
-    expect(contextText).toContain('Insights:');
     expect(contextText).toContain('User has structured morning workflow');
   });
 
-  it('falls back to recent consolidations when search returns empty', async () => {
-    mockSearchConsolidations.mockReturnValue([]);
+  it('falls back to recent consolidations when embeddings list is empty', async () => {
+    mockGetConsolidationsWithEmbeddings.mockReturnValue([]);
     mockGetRecentConsolidations.mockReturnValue([
       { id: 1, chat_id: 'chat1', source_ids: '[1]', summary: 'General insight', insight: 'User values productivity', created_at: 100 },
     ]);
@@ -192,15 +192,14 @@ describe('buildMemoryContext with consolidations', () => {
     mockSearchMemories.mockReturnValue([
       makeMemory({ summary: 'Prefers dark mode', importance: 0.8, topics: '["UI"]' }),
     ]);
-    mockSearchConsolidations.mockReturnValue([
-      { id: 1, chat_id: 'chat1', source_ids: '[1]', summary: 'UI summary', insight: 'User cares deeply about UI aesthetics', created_at: 100 },
+    mockGetConsolidationsWithEmbeddings.mockReturnValue([
+      { id: 1, summary: 'UI summary', insight: 'User cares deeply about UI aesthetics', embedding: [] },
     ]);
 
     const { contextText } = await buildMemoryContext('chat1', 'UI preferences');
     expect(contextText).toContain('Prefers dark mode');
     expect(contextText).toContain('User cares deeply about UI aesthetics');
-    expect(contextText).toContain('Relevant memories:');
-    expect(contextText).toContain('Insights:');
+    expect(contextText).toContain('[ctx');
   });
 });
 
@@ -211,15 +210,16 @@ describe('buildMemoryContext topic formatting', () => {
     mockGetRecentConsolidations.mockReturnValue([]);
   });
 
-  it('includes parsed topics in the formatted output', async () => {
+  it('surfaces the summary and no longer leaks topics into the output', async () => {
     mockSearchMemories.mockReturnValue([
       makeMemory({ summary: 'Likes hiking', topics: '["outdoor", "fitness"]', importance: 0.7 }),
     ]);
     mockGetRecentHighImportance.mockReturnValue([]);
 
     const { contextText } = await buildMemoryContext('chat1', 'hiking');
-    expect(contextText).toContain('outdoor');
-    expect(contextText).toContain('fitness');
+    expect(contextText).toContain('Likes hiking');
+    expect(contextText).not.toContain('outdoor');
+    expect(contextText).not.toContain('fitness');
   });
 
   it('handles empty topics gracefully', async () => {

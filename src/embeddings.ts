@@ -20,17 +20,57 @@ import { logger } from './logger.js';
 const EMBEDDING_MODEL = 'bge-m3:latest';
 
 /**
+ * bge-m3 on Ollama 0.24 sometimes returns NaN values for inputs containing
+ * specific patterns (observed: hyphenated identifiers immediately followed
+ * by file extensions, e.g. "claw-runner.ts"). The JSON encoder then bails
+ * with HTTP 500 "unsupported value: NaN". Strip the troublesome pattern
+ * by replacing non-alphanumeric runs with single spaces — semantic
+ * content is preserved, the tokenizer just sees a slightly different
+ * shape. Reserved for the retry path; we still try the original input
+ * first so semantic search benefits when bge-m3 cooperates.
+ */
+function sanitizeForEmbedding(text: string): string {
+  return text
+    .replace(/[^A-Za-z0-9\s]/g, ' ')   // strip punctuation, paths, code-y characters
+    .replace(/\s+/g, ' ')              // collapse whitespace
+    .trim();
+}
+
+/**
  * Generate an embedding vector for a text string. Returns a float array
  * (1024 dimensions for bge-m3). Returns an empty array on failure so
  * callers can fall back gracefully — never throws.
+ *
+ * Retry strategy: if the first call fails with the known NaN error from
+ * bge-m3, retry once with sanitized input. The vast majority of bge-m3
+ * failures observed in this codebase are triggered by code-shaped tokens
+ * (`claw-runner.ts`, `foo_bar.py`, etc.); stripping non-alphanum to spaces
+ * fixes them. If even the sanitized retry fails, return [] and let the
+ * caller's fallback (importance+recency-only ranking) handle the rest.
  */
 export async function embedText(text: string): Promise<number[]> {
   if (!text || !text.trim()) return [];
   try {
     return await ollamaEmbed(EMBEDDING_MODEL, text);
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // Retry only when the failure looks like the known NaN bug.
+    if (msg.includes('NaN') || msg.includes('unsupported value')) {
+      const sanitized = sanitizeForEmbedding(text);
+      if (sanitized && sanitized !== text) {
+        try {
+          return await ollamaEmbed(EMBEDDING_MODEL, sanitized);
+        } catch (err2) {
+          logger.warn(
+            { err: err2 instanceof Error ? err2.message : String(err2), model: EMBEDDING_MODEL, retried: true },
+            'Local embedding failed even after sanitization; returning empty vector',
+          );
+          return [];
+        }
+      }
+    }
     logger.warn(
-      { err: err instanceof Error ? err.message : String(err), model: EMBEDDING_MODEL },
+      { err: msg, model: EMBEDDING_MODEL },
       'Local embedding failed; returning empty vector',
     );
     return [];

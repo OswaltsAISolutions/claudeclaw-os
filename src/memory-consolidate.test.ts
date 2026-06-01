@@ -1,8 +1,19 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+// Consolidation generates JSON via the Anthropic SDK `query` (Haiku),
+// then parses it with parseJsonResponse. We mock the SDK boundary so the
+// test never spawns a real subprocess, and drive the parsed result through
+// the parseJsonResponse mock.
+vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
+  query: vi.fn(),
+}));
+
 vi.mock('./gemini.js', () => ({
-  generateContent: vi.fn(),
   parseJsonResponse: vi.fn(),
+}));
+
+vi.mock('./kill-switches.js', () => ({
+  requireEnabled: vi.fn(),
 }));
 
 vi.mock('./db.js', () => ({
@@ -20,16 +31,24 @@ vi.mock('./logger.js', () => ({
 }));
 
 import { runConsolidation } from './memory-consolidate.js';
-import { generateContent, parseJsonResponse } from './gemini.js';
+import { query } from '@anthropic-ai/claude-agent-sdk';
+import { parseJsonResponse } from './gemini.js';
 import {
   getUnconsolidatedMemories,
   saveConsolidationAtomic,
 } from './db.js';
 
 const mockGetUnconsolidated = vi.mocked(getUnconsolidatedMemories);
-const mockGenerateContent = vi.mocked(generateContent);
+const mockQuery = vi.mocked(query);
 const mockParseJson = vi.mocked(parseJsonResponse);
 const mockSaveAtomic = vi.mocked(saveConsolidationAtomic);
+
+/** Async-iterable stand-in for the SDK: yields one assistant text event. */
+function queryYielding(text: string) {
+  return (async function* () {
+    yield { type: 'assistant', message: { content: [{ type: 'text', text }] } };
+  })();
+}
 
 function makeMemory(id: number, summary: string) {
   return {
@@ -55,6 +74,9 @@ function makeMemory(id: number, summary: string) {
 describe('runConsolidation', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Default: the SDK yields a JSON blob. parseJsonResponse (mocked per
+    // test) decides what that blob deserializes to.
+    mockQuery.mockImplementation(() => queryYielding('{}') as never);
   });
 
   // ── Skip conditions ───────────────────────────────────────────────
@@ -62,14 +84,14 @@ describe('runConsolidation', () => {
   it('skips when fewer than 2 unconsolidated memories', async () => {
     mockGetUnconsolidated.mockReturnValue([makeMemory(1, 'only one')]);
     await runConsolidation('chat1');
-    expect(mockGenerateContent).not.toHaveBeenCalled();
+    expect(mockQuery).not.toHaveBeenCalled();
     expect(mockSaveAtomic).not.toHaveBeenCalled();
   });
 
   it('skips when zero unconsolidated memories', async () => {
     mockGetUnconsolidated.mockReturnValue([]);
     await runConsolidation('chat1');
-    expect(mockGenerateContent).not.toHaveBeenCalled();
+    expect(mockQuery).not.toHaveBeenCalled();
   });
 
   // ── Successful consolidation ──────────────────────────────────────
@@ -90,7 +112,6 @@ describe('runConsolidation', () => {
         { from_id: 20, to_id: 30, relationship: 'part of morning routine' },
       ],
     };
-    mockGenerateContent.mockResolvedValue(JSON.stringify(consolidationResult));
     mockParseJson.mockReturnValue(consolidationResult);
 
     await runConsolidation('chat1');
@@ -127,7 +148,6 @@ describe('runConsolidation', () => {
         { from_id: 10, to_id: 20, relationship: 'valid connection' },
       ],
     };
-    mockGenerateContent.mockResolvedValue(JSON.stringify(result));
     mockParseJson.mockReturnValue(result);
 
     await runConsolidation('chat1');
@@ -152,7 +172,6 @@ describe('runConsolidation', () => {
       insight: 'No clear pattern between these memories',
       connections: [],
     };
-    mockGenerateContent.mockResolvedValue(JSON.stringify(result));
     mockParseJson.mockReturnValue(result);
 
     await runConsolidation('chat1');
@@ -169,19 +188,18 @@ describe('runConsolidation', () => {
 
   // ── Error handling ────────────────────────────────────────────────
 
-  it('handles Gemini API failure gracefully', async () => {
+  it('handles LLM call failure gracefully', async () => {
     const memories = [makeMemory(10, 'mem1'), makeMemory(20, 'mem2')];
     mockGetUnconsolidated.mockReturnValue(memories);
-    mockGenerateContent.mockRejectedValue(new Error('API timeout'));
+    mockQuery.mockImplementation(() => { throw new Error('API timeout'); });
 
     await expect(runConsolidation('chat1')).resolves.not.toThrow();
     expect(mockSaveAtomic).not.toHaveBeenCalled();
   });
 
-  it('handles invalid Gemini response (null parse)', async () => {
+  it('handles invalid LLM response (null parse)', async () => {
     const memories = [makeMemory(10, 'mem1'), makeMemory(20, 'mem2')];
     mockGetUnconsolidated.mockReturnValue(memories);
-    mockGenerateContent.mockResolvedValue('garbage');
     mockParseJson.mockReturnValue(null);
 
     await runConsolidation('chat1');
@@ -193,7 +211,6 @@ describe('runConsolidation', () => {
     mockGetUnconsolidated.mockReturnValue(memories);
 
     const result = { summary: '', insight: 'insight', connections: [] };
-    mockGenerateContent.mockResolvedValue(JSON.stringify(result));
     mockParseJson.mockReturnValue(result);
 
     await runConsolidation('chat1');
@@ -205,7 +222,6 @@ describe('runConsolidation', () => {
     mockGetUnconsolidated.mockReturnValue(memories);
 
     const result = { summary: 'summary', insight: '', connections: [] };
-    mockGenerateContent.mockResolvedValue(JSON.stringify(result));
     mockParseJson.mockReturnValue(result);
 
     await runConsolidation('chat1');
@@ -218,26 +234,31 @@ describe('runConsolidation', () => {
     const memories = [makeMemory(10, 'mem1'), makeMemory(20, 'mem2')];
     mockGetUnconsolidated.mockReturnValue(memories);
 
-    let resolveFirst!: (val: string) => void;
-    const firstPromise = new Promise<string>((resolve) => { resolveFirst = resolve; });
-    mockGenerateContent.mockReturnValueOnce(firstPromise);
+    // Hold the first SDK call open so the second runConsolidation overlaps
+    // it. The second call must be rejected by the per-chat guard, so the
+    // SDK is invoked exactly once.
+    let releaseFirst!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    mockQuery.mockImplementationOnce(() => (async function* () {
+      await gate;
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: '{}' }] } };
+    })() as never);
 
     const result = {
       summary: 'summary',
       insight: 'insight',
       connections: [],
     };
+    mockParseJson.mockReturnValue(result);
 
     const run1 = runConsolidation('chat1');
-    mockGetUnconsolidated.mockReturnValue(memories);
     const run2 = runConsolidation('chat1');
 
-    resolveFirst(JSON.stringify(result));
-    mockParseJson.mockReturnValue(result);
+    releaseFirst();
 
     await run1;
     await run2;
 
-    expect(mockGenerateContent).toHaveBeenCalledTimes(1);
+    expect(mockQuery).toHaveBeenCalledTimes(1);
   });
 });
