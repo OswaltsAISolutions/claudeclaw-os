@@ -1,5 +1,5 @@
 import { useState } from 'preact/hooks';
-import { Pause, Play, Trash2, Clock, LayoutGrid, List, CheckSquare, Pencil } from 'lucide-preact';
+import { Pause, Play, Trash2, Clock, LayoutGrid, List, CheckSquare } from 'lucide-preact';
 import { PageHeader } from '@/components/PageHeader';
 import { Pill } from '@/components/Pill';
 import { PageState } from '@/components/PageState';

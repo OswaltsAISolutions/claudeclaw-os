@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useRef, useState } from 'preact/hooks';
 import {
   Crosshair, Send, Square, Zap, AlertTriangle, CheckCircle2,
   Brain, ChevronDown, ChevronUp,
@@ -7,7 +7,7 @@ import { PageHeader } from '@/components/PageHeader';
 import { PageState } from '@/components/PageState';
 import { Pill } from '@/components/Pill';
 import { useFetch } from '@/lib/useFetch';
-import { apiPost, dashboardToken } from '@/lib/api';
+import { dashboardToken } from '@/lib/api';
 import { pushToast } from '@/lib/toasts';
 import { formatRelativeTime } from '@/lib/format';
 

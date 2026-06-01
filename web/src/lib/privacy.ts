@@ -9,7 +9,7 @@
 // persisted — closing and reopening the page re-blurs everything, which
 // is the safer default if your screen wakes up showing this page.
 
-import { signal } from '@preact/signals';
+import { signal, type Signal } from '@preact/signals';
 
 export type PrivacySection = 'memories' | 'hive' | 'scheduled';
 
@@ -30,7 +30,7 @@ function loadInitial(section: PrivacySection): boolean {
   return false;
 }
 
-const _signals: Partial<Record<PrivacySection, ReturnType<typeof signal<boolean>>>> = {};
+const _signals: Partial<Record<PrivacySection, Signal<boolean>>> = {};
 
 export function privacyBlur(section: PrivacySection) {
   if (!_signals[section]) _signals[section] = signal<boolean>(loadInitial(section));

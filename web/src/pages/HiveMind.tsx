@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo } from 'preact/hooks';
+import { useState, useMemo } from 'preact/hooks';
 import { lazy, Suspense } from 'preact/compat';
 import { Brain as BrainIcon, Box, List as ListIcon } from 'lucide-preact';
 import { PageHeader, Tab } from '@/components/PageHeader';
