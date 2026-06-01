@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { splitMessage, extractFileMarkers, formatForTelegram, htmlToPlain, sendTelegramSafe } from './bot.js';
+import { splitMessage, extractFileMarkers, formatForTelegram, htmlToPlain, sendTelegramSafe, sendHtmlWithPlainFallback } from './bot.js';
 
 describe('splitMessage', () => {
   it('returns single-element array for short messages', () => {
@@ -451,5 +451,45 @@ describe('sendTelegramSafe', () => {
     // Chunk A was sent exactly once (not re-sent by the fallback => no duplicate).
     const aSends = reply.mock.calls.filter((c: unknown[]) => typeof c[0] === 'string' && c[0].includes(partA));
     expect(aSends).toHaveLength(1);
+  });
+});
+
+describe('sendHtmlWithPlainFallback (transport-agnostic core)', () => {
+  const PARSE_ERR = { description: "Bad Request: can't parse entities" };
+
+  it('drives an Api.sendMessage-shaped transport (dashboard relay path), not just ctx.reply', async () => {
+    // The relay path calls botApi.sendMessage(chatId, text, opts). Prove the
+    // shared core works through that 3-arg transport shape too: the `html`
+    // flag toggles parse_mode, content is delivered exactly once.
+    const sent: Array<{ text: string; html: boolean }> = [];
+    await sendHtmlWithPlainFallback('plain relay line', (chunk, html) => {
+      sent.push({ text: chunk, html });
+      return Promise.resolve(undefined);
+    });
+    expect(sent).toEqual([{ text: 'plain relay line', html: true }]);
+  });
+
+  it('resends only the failing chunk as plain via the transport, with no drop or duplicate', async () => {
+    const partA = 'A'.repeat(4000);
+    const big = `${partA}\nMARKER_B ${'B'.repeat(4000)}`;
+    const sent: Array<{ text: string; html: boolean }> = [];
+    await sendHtmlWithPlainFallback(big, (chunk, html) => {
+      sent.push({ text: chunk, html });
+      // Mimic Telegram rejecting the HTML of the B chunk only.
+      if (html && chunk.includes('B')) return Promise.reject(PARSE_ERR);
+      return Promise.resolve(undefined);
+    });
+    // A(html ok) + B(html rejected) + B(plain ok) = 3 transport calls.
+    expect(sent).toHaveLength(3);
+    // B content arrived via a plain (html=false) call ...
+    expect(sent.some((s) => s.text.includes('MARKER_B') && s.html === false)).toBe(true);
+    // ... and A was delivered exactly once (no duplicate from the fallback).
+    expect(sent.filter((s) => s.text.includes(partA))).toHaveLength(1);
+  });
+
+  it('propagates a non-parse transport error (e.g. 401 bad token) to the caller', async () => {
+    await expect(
+      sendHtmlWithPlainFallback('hi', () => Promise.reject({ description: 'Unauthorized', error_code: 401 })),
+    ).rejects.toBeDefined();
   });
 });

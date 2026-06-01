@@ -292,24 +292,26 @@ export function htmlToPlain(html: string): string {
 }
 
 /**
- * Send a message to Telegram with HTML formatting, falling back to plain text
- * if Telegram rejects the HTML. This prevents silent failures where the user
- * never sees a response because formatForTelegram produced invalid HTML.
+ * Core HTML-with-plain-fallback sender, transport-agnostic so every Telegram
+ * send site shares one correct implementation: the bot path (grammy
+ * `ctx.reply`) and the dashboard->Telegram relay path (`Api.sendMessage`).
+ * `send` delivers one already-chunked string, applying Telegram HTML parse
+ * mode when `html` is true.
  *
- * The fallback is PER-CHUNK: if one chunk's HTML fails to parse (typically a
- * long <pre> split across the 4096 boundary), only that chunk is resent as
- * plain text and the loop continues, so a single bad chunk can neither drop
- * the rest of a long reply nor duplicate the chunks already delivered.
+ * The fallback is PER-CHUNK: if one chunk's HTML is rejected by Telegram's
+ * parser (typically a <pre> block or entity split across the 4096 boundary),
+ * only that chunk is resent as plain text (htmlToPlain, re-split for length)
+ * and the loop continues. So a single bad chunk can neither drop the rest of
+ * a long reply nor duplicate chunks already delivered. Non-parse errors
+ * (network, rate limit, bad token) propagate to the caller.
  */
-export async function sendTelegramSafe(
-  ctx: Context,
-  _chatId: number,
+export async function sendHtmlWithPlainFallback(
   text: string,
+  send: (chunk: string, html: boolean) => Promise<unknown>,
 ): Promise<void> {
-  const parts = splitMessage(formatForTelegram(text));
-  for (const part of parts) {
+  for (const part of splitMessage(formatForTelegram(text))) {
     try {
-      await ctx.reply(part, { parse_mode: 'HTML' });
+      await send(part, true);
     } catch (htmlErr: any) {
       const desc = String(htmlErr?.description ?? '').toLowerCase();
       if (desc.includes('parse') || desc.includes('entity') || desc.includes('tag')) {
@@ -318,17 +320,31 @@ export async function sendTelegramSafe(
         logger.warn({ err: htmlErr }, 'Telegram HTML parse failed, sending chunk as plain text');
         for (const plainPart of splitMessage(htmlToPlain(part))) {
           try {
-            await ctx.reply(plainPart);
+            await send(plainPart, false);
           } catch (plainErr) {
             logger.error({ err: plainErr }, 'Telegram plain text send also failed');
           }
         }
         continue; // Keep going: later chunks may be valid HTML.
       }
-      // Non-formatting error (network, rate limit, etc.), re-throw
-      throw htmlErr;
+      throw htmlErr; // Non-formatting error (network, rate limit, etc.)
     }
   }
+}
+
+/**
+ * Send a message to Telegram with HTML formatting via grammy's Context,
+ * falling back to plain text per-chunk if Telegram rejects the HTML. Thin
+ * wrapper binding sendHtmlWithPlainFallback to ctx.reply.
+ */
+export async function sendTelegramSafe(
+  ctx: Context,
+  _chatId: number,
+  text: string,
+): Promise<void> {
+  await sendHtmlWithPlainFallback(text, (chunk, html) =>
+    ctx.reply(chunk, html ? { parse_mode: 'HTML' } : undefined),
+  );
 }
 
 // ── File marker types ─────────────────────────────────────────────────
@@ -1885,20 +1901,13 @@ async function processDashboardMessage(
     // above; the Telegram leg is best-effort.
     try {
       const telegramText = responseText || 'Done.';
-      for (const part of splitMessage(formatForTelegram(telegramText))) {
-        try {
-          await botApi.sendMessage(parseInt(chatIdStr), part, { parse_mode: 'HTML' });
-        } catch (htmlErr: any) {
-          // HTML parse failed, retry as plain text so user always sees the response
-          const desc = String(htmlErr?.description ?? '').toLowerCase();
-          if (desc.includes('parse') || desc.includes('entity') || desc.includes('tag')) {
-            logger.warn({ err: htmlErr }, 'Telegram HTML relay failed, retrying plain');
-            await botApi.sendMessage(parseInt(chatIdStr), telegramText.slice(0, 4096));
-            break; // Already sent full text as fallback
-          }
-          throw htmlErr; // Non-formatting error, let outer catch handle
-        }
-      }
+      const relayChatId = parseInt(chatIdStr);
+      // Same per-chunk HTML/plain fallback as the bot path: a single bad chunk
+      // can't drop or duplicate the rest of a long relayed reply. Non-parse
+      // errors (e.g. 401 bad token) propagate to the outer catch below.
+      await sendHtmlWithPlainFallback(telegramText, (chunk, html) =>
+        botApi.sendMessage(relayChatId, chunk, html ? { parse_mode: 'HTML' } : undefined),
+      );
     } catch (relayErr: any) {
       const code = relayErr?.error_code ?? relayErr?.status ?? null;
       const desc = String(relayErr?.description ?? relayErr?.message ?? '').toLowerCase();
