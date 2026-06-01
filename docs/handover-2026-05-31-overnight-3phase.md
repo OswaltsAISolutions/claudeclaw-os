@@ -693,6 +693,40 @@ retry/timeout/fabrication gate, the system's core reliability contract
 per the local-specialist pivot, so it earns coverage of its failure
 modes and not just its happy paths.
 
+### Coverage expansion (2026-06-01, twelfth slice) - DONE
+
+Ran `vitest run --coverage` to target remaining claw-runner gaps
+OBJECTIVELY instead of guessing module-by-module (which risks padding).
+`src/claw-runner.test.ts` (`4900355`, 13 -> 17 tests), 78% -> 93%
+statement coverage, 100% functions. Three genuine reliability paths that
+the prior tests never exercised:
+- FULL-CLAW result parsing. The earlier full-claw test only asserted argv;
+  the entire end-of-run JSON extraction (message->text, iterations->turns,
+  tool_uses/tool_results -> paired onProgress events, computed usage total)
+  was functionally untested. This is the path sentinel-shaped shell
+  specialists run on, so a claw schema-field rename could silently blank a
+  run's answer and its activity panel with every prior test still green.
+- runClawOnce ALWAYS resolves (never rejects/hangs) on both spawn-failure
+  mechanisms: a synchronous `spawn()` throw and an async child `error`
+  event (ENOENT/EACCES). Callers await-and-check `.error`; a regression to
+  reject/throw would surface as an unhandled rejection in the dispatcher.
+- a malformed (non-JSON) NDJSON line is logged and skipped without killing
+  the stream; a valid line after it still parses (claw can emit a stray
+  log line mid-stream and we must not lose the whole run).
+Skipped the residual uncovered lines (683/689/691/693): they are the
+cosmetic `detailFromInput` activity-panel label branches (glob/git/
+retrieve_context), and pinning each label string would be padding.
+Also gitignored the generated `coverage/` dir. Suite 931 -> 935 passed
+(4 skipped); `npm run build` green. Test-only + gitignore, nothing
+deployed.
+
+With claw-runner now at 93%/100-fn, the low-risk deploy-free backend
+reliability surface is exhausted: the remaining sub-80% backend files are
+integration glue (bot/dashboard/ollama/slack/scheduler/whatsapp, the
+*-cli entrypoints, setup/migrate/index) that require a live runtime or
+external SDKs to exercise and are not cheaply or honestly unit-testable.
+The next genuine value is the eyes-on items below, not more coverage.
+
 ### Security: dependency audit (2026-06-01) - NEEDS EYES-ON
 
 Ran `npm audit` as a longevity check. Findings (prod tree): 9
