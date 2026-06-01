@@ -938,6 +938,53 @@ scheduler started, ollama-proxy listening, dashboard + war room up, 0 errors).
 Session preserved (sessionAge 8d, model claude-opus-4-7, telegramConnected
 true). Origin/main at deployed HEAD (`6a7c4a0`, 0 ahead).
 
+### Reliability fix: guard main-process maintenance against crashing the bot (2026-06-01, nineteenth slice) - DONE + DEPLOYED
+
+Found while validating the eighteenth slice. The main-process maintenance ran
+UNGUARDED both at boot (index.ts:161-167) and inside the 24h setInterval
+(index.ts:168). `runDecaySweep` and `cleanupOldMissionTasks` issue raw
+`db.prepare().run()` with NO internal try/catch, and there is NO process-level
+`uncaughtException`/`unhandledRejection` handler anywhere in src/ (verified by
+grep). So a transient DB failure during the sweep (SQLITE_BUSY under write
+contention, disk error) throws inside the timer callback (or at boot) ->
+uncaughtException -> the whole bot crashes and Telegram delivery drops. systemd
+restarts it, but that interrupts the in-flight turn; on a service meant to run
+for weeks an avoidable maintenance-induced crash is a real reliability defect.
+
+Fix (`df34b9e`): extracted a shared `runMaintenance()` with per-call try/catch
+(decay/retention, mission-task cleanup, upload cleanup) that logs and continues,
+so a failing sweep is non-fatal AND one failure doesn't skip the others. Called
+at boot + on the 24h interval (DRYs the prior duplicate call sites). Mirrors the
+`.catch()` convention the consolidation timer immediately below already uses, so
+this just brings maintenance up to the codebase's own standard. Happy path
+unchanged.
+
+DELIBERATELY NOT DONE (architectural, needs Gabe): adding a global
+`uncaughtException`/`unhandledRejection` handler. Node leaves the process in an
+undefined state after an uncaughtException, so a swallow-and-continue global
+handler can mask corruption - that's a judgment call, not a safe overnight
+change. The project's convention is to guard at the call site (`.catch()` on
+fire-and-forget promises), which this fix follows. Flagging the ABSENCE of any
+global net as an observation for review, not a defect I auto-fixed.
+
+tsc exit 0, build green, full suite 965 passed / 4 skipped (unchanged).
+DEPLOYED via busy-guarded restart (no force) -> 200 (no turn in flight), health
+200 attempt 1, clean boot (PID 331851: DB ready, ollama-proxy listening,
+dashboard + war room up; ZERO "sweep failed"/"cleanup failed"/error lines, so
+boot-time runMaintenance ran clean). Session preserved (8d, claude-opus-4-7,
+telegramConnected true). Origin/main at deployed HEAD (`df34b9e`, 0 ahead).
+
+NOTE on the broader longevity audit (2026-06-01): checked the live DB for
+unbounded-growth risk. After 8d uptime store/claudeclaw.db is 1.3M; the
+append-only tables with no prune are tiny (token_usage 64, audit_log 128,
+consolidations 5, recovery_log 6, compaction_events 4) i.e. ~8-16 rows/day, a
+non-issue for years. The high-volume tables ARE bounded: runDecaySweep prunes
+conversation_log (cap 500), wa_*/slack (3-day), warroom_meetings+transcript
+(90-day), all wired to the 24h interval + boot. So DB retention is sound; the
+uploads gap (slice 18) was the genuine outlier (media files are KB-MB each,
+truly unbounded), NOT a symptom of a broader pattern. No DB pruning added (would
+cross the no-truncation guardrail for zero real benefit).
+
 ### Security: dependency audit (2026-06-01) - NEEDS EYES-ON
 
 Ran `npm audit` as a longevity check. Findings (prod tree): 9
@@ -1090,6 +1137,14 @@ WITHOUT force -> 200 (no turn in flight), health 200 on poll attempt 1, clean
 boot (PID 326250: DB ready, consolidation enabled, scheduler started,
 ollama-proxy listening, dashboard + war room up, 0 errors; session preserved
 8d, telegramConnected true). Origin/main at deployed HEAD (`6a7c4a0`, 0 ahead).
+
+DONE 2026-06-01 ~05:10. Deployed the maintenance-guard fix (`df34b9e`,
+nineteenth slice). tsc exit 0, build green, full suite 965/4-skipped;
+busy-guarded restart WITHOUT force -> 200 (no turn in flight), health 200 on
+poll attempt 1, clean boot (PID 331851: DB ready, ollama-proxy listening,
+dashboard + war room up; ZERO sweep/cleanup error lines, boot-time
+runMaintenance ran clean; session preserved 8d, telegramConnected true).
+Origin/main at deployed HEAD (`df34b9e`, 0 ahead).
 
 FOLLOW-UP (refactor, not urgent): the four generators duplicate security
 helpers, but a 2026-06-01 audit found the duplication is NOT uniform - do NOT
