@@ -188,19 +188,22 @@ Closed 14 of 37 at the root (commits `6c07180`, `f86c0bd`, `b1be253`):
 Not deployed: type-only / cleanup, runtime is byte-identical (privacy.ts
 emit unchanged, unused imports tree-shaken already, the .d.ts is not bundled).
 
-REMAINING 20 errors (17 of 37 now closed after the 2026-06-01 follow-up
-cleared BrainGraph3D's last 3; deferred set touches the visual centerpiece or
-needs a small design call, so they are left for a session where the user can
-weigh in rather than autonomously deleting creative WIP):
+REMAINING 13 errors (24 of 37 now closed; 37 - 13 = 24). Since the original
+inventory: the 2026-06-01 follow-up cleared BrainGraph3D's last errors, and
+Batch C (below) closed Settings.tsx's 6 (childless CardGroup + 5 dead layout
+primitives, commit `73e5977`) and SpecialistFloor.tsx's 1 (the missing Pill
+`warn` tone, commit `2c471a3`). A fresh `tsc -p web/tsconfig.json --noEmit` on
+2026-06-01 confirms exactly the two rows below remain. The deferred set touches
+the visual centerpiece or needs a small design call, so it is left for a
+session where the user can weigh in rather than autonomously deleting creative
+WIP:
 
 | File | Count | What | Why deferred |
 |---|---|---|---|
 | pages/JarvisHome.tsx | 12 | 10 unused shader consts (PLASMA_VERT, ORB_FRAG, CORE_*, SHELL_*, BACKDROP_*, playBootSweep, makeCurvedHologramPlane) + 2 three.js type mismatches (Float32Array@993, OrbUniforms index sig@1596) | orb visual centerpiece; deleting parked shaders / changing render types is a creative+design judgment |
-| pages/Settings.tsx | 6 | 5 unused helper components (Section/Card/Row/Divider/ReadOnlyRow) + CardGroup missing `children`@217 | unused set looks like a parked component kit; CardGroup needs a children decision |
-| components/SpecialistFloor.tsx | 1 | `tone="warn"`@157 not in Pill `Tone` union | needs a palette/design call (add a `warn` tone + color token, plus entries in both `Record<Tone>` maps) |
 | components/Sidebar.tsx | 1 | unused `open`@22 (from `sidebarOpen`) | `closeSidebar` is still used, so a mobile drawer may be half-wired; left intact rather than rip out possible WIP |
 
-To finish the gate later: clear these 20, then wire `typecheck:web` into the
+To finish the gate later: clear these 13, then wire `typecheck:web` into the
 `build` script (or a pre-push check) so frontend type errors can never ship
 unchecked again.
 
@@ -414,6 +417,37 @@ the component now uses `hidden md:flex` per a bottom-tab-bar comment - removing
 vs. re-wiring is an unresolved mobile-UX product call, not a blind overnight
 edit). Wiring `typecheck:web` into the build / pre-push gate stays blocked on
 these 13.
+
+### Coverage expansion (2026-06-01, fourth slice) - DONE
+
+Closed the last real gap in the inline-`<script>` security suite. The four
+served HTML generators each interpolate caller-controlled token / chatId /
+meetingId into a `<script>` block via `jsLiteral` (which escapes `< > &` so a
+`</script>` payload can't break out). Re-audited all four test files for that
+contract:
+- `dashboard-html` / `warroom-html` / `warroom-text-html`: each already had an
+  explicit `</script>` breakout test asserting the `</script>` form
+  appears and the raw closer does not - their jsLiteral contract is pinned.
+- `warroom-text-picker-html`: had NO breakout test. Its script-constant tests
+  only asserted `JSON.stringify`-equivalent output using metacharacter-free
+  inputs, so a regression downgrading the picker's `jsLiteral(token)` back to
+  bare `JSON.stringify` (which leaves `<` `>` `&` intact) would have passed
+  every test in the file while silently reopening the breakout.
+
+Fix (commit `2e8f88c`, test-only, suite 748 -> 750): added a local `jsLiteral`
+mirror + `</script>` breakout tests for both the TOKEN and CHAT_ID constants in
+`warroom-text-picker-html.test.ts`, matching the contract the sibling files
+already pin. Verified the picker source does emit jsLiteral-escaped constants
+(lines 300-301 from `jsLiteral(token)` / `jsLiteral(chatId)`), so the new
+assertions exercise the real escaping path. No source / runtime change, no
+deploy. Deliberately did NOT add redundant breakout tests to the other three
+(their existing breakout test already covers the shared jsLiteral function) -
+that would be test-count padding, not coverage.
+
+With this, the inline-`<script>` injection surface is fully and
+non-redundantly covered across all four generators. Also reconciled the stale
+"Web typecheck hole" REMAINING table above (it still listed Settings.tsx +
+SpecialistFloor.tsx as deferred though Batch C had closed them) to the true 13.
 
 ## Guardrails in force
 
