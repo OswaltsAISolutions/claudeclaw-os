@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/preact';
+import { render, screen, fireEvent, waitFor } from '@testing-library/preact';
 import type { MissionTask } from './missionTasks';
 
 // The component fetches over the network and renders the Specialist Floor on
@@ -28,6 +28,8 @@ vi.mock('wouter-preact', () => ({ useLocation: () => ['/mission', vi.fn()] }));
 vi.mock('@/components/SpecialistFloor', () => ({ SpecialistFloor: () => null }));
 
 import { MissionControl } from './MissionControl';
+import { apiPatch } from '@/lib/api';
+import { pushToast } from '@/lib/toasts';
 
 function task(over: Partial<MissionTask> = {}): MissionTask {
   return {
@@ -104,5 +106,35 @@ describe('MissionControl', () => {
 
     expect(await screen.findByText('Archived report')).toBeInTheDocument();
     expect(screen.getByText(/Load more \(1 of 90\)/)).toBeInTheDocument();
+  });
+
+  it('reports an honest error when a reassign loses the race (server returns ok:false)', async () => {
+    // The backend reassigns queued-only; if the task starts running mid-flight
+    // it returns { ok:false } at HTTP 200. The drawer must surface that as a
+    // failure, not a phantom success — the no-mock-data honesty contract.
+    h.data['/api/mission/tasks'] = {
+      tasks: [task({ id: 'q9', title: 'Index the vault', status: 'queued', assigned_agent: 'sleuth' })],
+    };
+    h.data['/api/agents'] = { agents: [{ id: 'cipher', name: 'Cipher', description: '', running: false }] };
+    h.data['history'] = { tasks: [], total: 0 };
+    h.data['detail'] = {
+      task: task({ id: 'q9', title: 'Index the vault', status: 'queued', assigned_agent: 'sleuth' }),
+    };
+    vi.mocked(apiPatch).mockResolvedValue({ ok: false } as never);
+
+    render(<MissionControl />);
+    fireEvent.click(screen.getByText('Index the vault'));
+    await screen.findByText(/Task . q9/);
+
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'cipher' } });
+    fireEvent.click(screen.getByText('Reassign'));
+
+    await waitFor(() =>
+      expect(vi.mocked(pushToast)).toHaveBeenCalledWith(
+        expect.objectContaining({ tone: 'error', description: 'Task is no longer queued.' }),
+      ),
+    );
+    // And it hit the real mutation surface with the picked agent, not a stub.
+    expect(vi.mocked(apiPatch)).toHaveBeenCalledWith('/api/mission/tasks/q9', { assigned_agent: 'cipher' });
   });
 });
