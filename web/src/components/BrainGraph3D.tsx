@@ -143,7 +143,7 @@ function smoothstep(edge0: number, edge1: number, x: number) {
 // soft lobe membership. The same lobe-weight function is later
 // re-used to assign dots to surface positions.
 
-function lobeWeights(x: number, y: number, z: number) {
+function lobeWeights(_x: number, y: number, z: number) {
   // Three.js camera defaults to looking in -z direction. With our
   // camera at +z, vertices facing the user have z > 0 — that's the
   // "front" of the brain (frontal lobe). Previous version inverted
@@ -199,7 +199,6 @@ function buildHemisphere(side: 'left' | 'right'): { mesh: THREE.Mesh; surface: T
     const frontT = smoothstep(0.7, 1.05, z);
     if (frontT > 0) {
       z *= 1 + frontT * 0.06;
-      const radial = Math.sqrt(x * x + y * y) + 0.0001;
       const radialBoost = 1 + frontT * 0.05;
       x *= radialBoost;
       y *= radialBoost;
@@ -1743,7 +1742,7 @@ function LobePie({
   return (
     <svg width="64" height="64" viewBox="0 0 64 64" class="shrink-0">
       <circle cx={cx} cy={cy} r={r} fill="var(--color-bg)" stroke="var(--color-border)" stroke-width="0.5" />
-      {slices.map(([agentId, count], i) => {
+      {slices.map(([agentId, count]) => {
         const startAngle = (acc / total) * 2 * Math.PI - Math.PI / 2;
         const endAngle = ((acc + count) / total) * 2 * Math.PI - Math.PI / 2;
         acc += count;

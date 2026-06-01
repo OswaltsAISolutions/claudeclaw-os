@@ -8,7 +8,13 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/preact';
 // refresh, the process-local cache (instant repaint, no flash on remount),
 // the "never show another endpoint's data" path-change clear, and polling.
 vi.mock('@/lib/api', () => {
-  class ApiError extends Error {}
+  // Mirror the real constructor (status, body, message) so call sites
+  // type-check against the imported class, not just at runtime.
+  class ApiError extends Error {
+    constructor(public status: number, public body: unknown, message: string) {
+      super(message);
+    }
+  }
   return { apiGet: vi.fn(), ApiError };
 });
 
@@ -49,7 +55,7 @@ describe('useFetch', () => {
   });
 
   it('surfaces an ApiError message and leaves data null', async () => {
-    vi.mocked(apiGet).mockRejectedValue(new ApiError('vault is sealed'));
+    vi.mocked(apiGet).mockRejectedValue(new ApiError(503, null, 'vault is sealed'));
     render(<Harness path="/api/err" />);
 
     await waitFor(() => expect(errorText()).toBe('vault is sealed'));
