@@ -17,6 +17,7 @@ const envConfig = readEnvFile([
   'DASHBOARD_TOKEN',
   'DASHBOARD_URL',
   'CLAUDECLAW_CONFIG',
+  'CLAUDECLAW_STORE_DIR',
   'DB_ENCRYPTION_KEY',
   'GOOGLE_API_KEY',
   'AGENT_TIMEOUT_MS',
@@ -102,7 +103,16 @@ const __dirname = path.dirname(__filename);
 // The SDK uses this as cwd, which causes Claude Code to load our CLAUDE.md
 // and all global skills from ~/.claude/skills/ via settingSources.
 export const PROJECT_ROOT = path.resolve(__dirname, '..');
-export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
+// SQLite store + PID files + logs + avatars all live here. Defaults to
+// <repo>/store; override with CLAUDECLAW_STORE_DIR (env or .env) to relocate
+// the whole store, e.g. tests point a child-process CLI at a throwaway temp
+// dir so the real scheduler/agent DB is never touched. (expandHome is a
+// hoisted function declaration, so it is callable here.)
+export const STORE_DIR = expandHome(
+  process.env.CLAUDECLAW_STORE_DIR ||
+    envConfig.CLAUDECLAW_STORE_DIR ||
+    path.resolve(PROJECT_ROOT, 'store'),
+);
 
 // ── External config directory ────────────────────────────────────────
 // Personal config files (CLAUDE.md, agent.yaml, agent CLAUDE.md) can live
