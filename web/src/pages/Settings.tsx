@@ -214,7 +214,9 @@ function SpecialistRoutingGroup() {
   }
   if (list.error || !list.data) {
     return (
-      <CardGroup title="SPECIALIST ROUTING" footer={list.error || 'Failed to load specialists'} />
+      <CardGroup title="SPECIALIST ROUTING" footer={list.error || 'Failed to load specialists'}>
+        <div class="px-4 py-3 text-[12px] text-[var(--color-text-muted)]">Could not load specialists.</div>
+      </CardGroup>
     );
   }
   return (
@@ -554,51 +556,6 @@ function KillSwitchRow({ switchKey, label, description, on, refusals, onChange }
         )}
       </div>
       <Toggle on={on} onChange={toggle} disabled={busy} ariaLabel={label} />
-    </div>
-  );
-}
-
-// ── Layout primitives ─────────────────────────────────────────────────
-
-function Section({ title, subtitle, children }: { title: string; subtitle?: string; children: any }) {
-  return (
-    <div>
-      <div class="mb-2.5">
-        <h2 class="text-[14px] font-semibold text-[var(--color-text)]">{title}</h2>
-        {subtitle && <p class="text-[12px] text-[var(--color-text-muted)] leading-snug mt-1">{subtitle}</p>}
-      </div>
-      {children}
-    </div>
-  );
-}
-
-function Card({ children }: { children: any }) {
-  return (
-    <div class="bg-[var(--color-card)] border border-[var(--color-border)] rounded-lg p-4 space-y-1">{children}</div>
-  );
-}
-
-function Row({ label, hint, children }: { label: string; hint?: string; children: any }) {
-  return (
-    <div class="flex items-center gap-4 py-1.5">
-      <div class="flex-1 min-w-0">
-        <div class="text-[13px] text-[var(--color-text)]">{label}</div>
-        {hint && <div class="text-[11px] text-[var(--color-text-faint)] mt-0.5">{hint}</div>}
-      </div>
-      {children}
-    </div>
-  );
-}
-
-function Divider() {
-  return <div class="border-t border-[var(--color-border)] my-1" />;
-}
-
-function ReadOnlyRow({ label, value }: { label: string; value: string }) {
-  return (
-    <div class="flex items-center justify-between py-1.5">
-      <span class="text-[13px] text-[var(--color-text-muted)]">{label}</span>
-      <span class="font-mono text-[12.5px] text-[var(--color-text)] tabular-nums">{value}</span>
     </div>
   );
 }
