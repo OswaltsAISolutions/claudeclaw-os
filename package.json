@@ -12,6 +12,7 @@
     "build:server": "tsc",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
+    "typecheck:web": "tsc -p web/tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
