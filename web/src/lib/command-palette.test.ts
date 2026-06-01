@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vitest';
-import { filterActions, type PaletteAction } from './command-palette';
+import { describe, it, expect, vi } from 'vitest';
+import { filterActions, buildActions, type PaletteAction } from './command-palette';
+import { ROUTES } from './routes';
 
 const noop = () => {};
 const actions: PaletteAction[] = [
@@ -49,5 +50,57 @@ describe('filterActions', () => {
     const before = [...actions];
     filterActions('mission', actions);
     expect(actions).toEqual(before);
+  });
+});
+
+// buildActions assembles the palette's action list from ROUTES + fixed
+// Actions/Theme entries. The parity + wiring here is what silently breaks
+// when a route is added/removed or a deep-link target is renamed, so we pin
+// the contract against ROUTES rather than a hardcoded copy.
+describe('buildActions', () => {
+  it('emits one Navigation action per route, in route order', () => {
+    const navIds = buildActions()
+      .filter((a) => a.group === 'Navigation')
+      .map((a) => a.id);
+    expect(navIds).toEqual(ROUTES.map((r) => 'nav:' + r.path));
+  });
+
+  it('appends the Actions then Theme groups after Navigation', () => {
+    const groups = buildActions().map((a) => a.group);
+    const navCount = ROUTES.length;
+    expect(groups.slice(0, navCount).every((g) => g === 'Navigation')).toBe(true);
+    expect(groups.slice(navCount)).toEqual(['Actions', 'Actions', 'Theme', 'Theme', 'Theme']);
+  });
+
+  it('wires every nav action to navigate to its own route path', () => {
+    const navigate = vi.fn();
+    for (const a of buildActions().filter((x) => x.group === 'Navigation')) {
+      navigate.mockClear();
+      a.run({ navigate });
+      expect(navigate).toHaveBeenCalledWith(a.id.slice('nav:'.length));
+    }
+  });
+
+  it('uppercases a route shortcut into the hint, leaving shortcutless routes hintless', () => {
+    const actions = buildActions();
+    expect(actions.find((a) => a.id === 'nav:/')!.hint).toBe('G J'); // shortcut 'g j'
+    expect(actions.find((a) => a.id === 'nav:/audit')!.hint).toBeUndefined(); // no shortcut
+  });
+
+  it('points the quick-create actions at the right deep links', () => {
+    const navigate = vi.fn();
+    const actions = buildActions();
+    actions.find((a) => a.id === 'action:new-task')!.run({ navigate });
+    expect(navigate).toHaveBeenCalledWith('/mission?new=1');
+    navigate.mockClear();
+    actions.find((a) => a.id === 'action:new-agent')!.run({ navigate });
+    expect(navigate).toHaveBeenCalledWith('/agents?new=1');
+  });
+
+  it('exposes a Theme action per theme', () => {
+    const themeIds = buildActions()
+      .filter((a) => a.group === 'Theme')
+      .map((a) => a.id);
+    expect(themeIds).toEqual(['theme:graphite', 'theme:midnight', 'theme:crimson']);
   });
 });
