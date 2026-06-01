@@ -3,6 +3,7 @@ import { Check, Pipette, RotateCcw } from 'lucide-preact';
 import { PageHeader } from '@/components/PageHeader';
 import { PageState } from '@/components/PageState';
 import { Toggle } from '@/components/Toggle';
+import { CardGroup, CardRow } from '@/components/CardGroup';
 import { useFetch } from '@/lib/useFetch';
 import { apiPost } from '@/lib/api';
 import { pushToast } from '@/lib/toasts';
@@ -11,6 +12,7 @@ import {
   customAccent, setCustomAccent,
   uiScale, setUiScale,
   showCosts, setShowCosts,
+  bootAudioEnabled, setBootAudio,
 } from '@/lib/theme';
 import {
   workspaceName,
@@ -56,7 +58,7 @@ const KILL_SWITCH_LABELS: Record<string, { label: string; description: string }>
   },
 };
 
-const THEME_ORDER: ThemeName[] = ['graphite', 'midnight', 'crimson'];
+const THEME_ORDER: ThemeName[] = ['ios-dark', 'graphite', 'midnight', 'crimson'];
 
 export function Settings() {
   const health = useFetch<Health>('/api/health', 30_000);
@@ -72,99 +74,242 @@ export function Settings() {
       {(health.loading || security.loading) && !health.data && <PageState loading />}
 
       {health.data && (
-        <div class="flex-1 overflow-y-auto p-6 space-y-5 max-w-3xl">
+        <div class="flex-1 overflow-y-auto px-5 md:px-6 py-4 space-y-7 max-w-2xl mx-auto w-full">
 
-          <Section
-            title="Workspace"
-            subtitle="Identity for this dashboard. Stored in the database so it shows up in any browser pointed at this server."
+          <CardGroup
+            title="WORKSPACE"
+            footer="Identity for this dashboard. Stored in the database so it shows up in any browser pointed at this server."
           >
-            <Card>
-              <Row label="Name" hint="Up to 32 characters. Empty resets to ClaudeClaw.">
-                <WorkspaceNameField />
-              </Row>
-              <Divider />
-              <Row label="Theme" hint="Switches CSS variables across the app.">
-                <ThemePicker />
-              </Row>
-              <Divider />
-              <Row label="Custom accent" hint="Override the theme's accent with any hex. Reset clears it.">
-                <AccentPicker />
-              </Row>
-            </Card>
-          </Section>
+            <CardRow
+              label="Name"
+              description="Up to 32 characters. Empty resets to ClaudeClaw."
+              value={<WorkspaceNameField />}
+            />
+            <CardRow
+              label="Theme"
+              description="Switches CSS variables across the app."
+              value={<ThemePicker />}
+            />
+            <CardRow
+              label="Custom accent"
+              description="Override the theme's accent with any hex. Reset clears it."
+              value={<AccentPicker />}
+            />
+          </CardGroup>
 
-          <Section
-            title="Display"
-            subtitle="Per-browser display preferences. Stored in localStorage, not per-workspace."
+          <CardGroup
+            title="DISPLAY"
+            footer="Per-browser display preferences. Stored in localStorage, not per-workspace."
           >
-            <Card>
-              <Row label="UI scale" hint="Zooms the whole app proportionally so layout stays correct.">
-                <ScalePicker />
-              </Row>
-              <Divider />
-              <Row label="Show costs" hint="Hide if you're on a Claude Code subscription — costs only matter on the API path.">
+            <CardRow
+              label="UI scale"
+              description="Zooms the whole app proportionally so layout stays correct."
+              value={<ScalePicker />}
+            />
+            <CardRow
+              label="Show costs"
+              description="Hide if you're on a Claude Code subscription — costs only matter on the API path."
+              value={
                 <Toggle
                   on={showCosts.value}
                   onChange={() => setShowCosts(!showCosts.value)}
                   ariaLabel="Show costs"
                 />
-              </Row>
-            </Card>
-          </Section>
+              }
+            />
+            <CardRow
+              label="Boot Music & Voice"
+              description="Plays AC/DC-style background music and ElevenLabs voice narration during the J.A.R.V.I.S. home boot sequence. Visuals always play."
+              value={
+                <Toggle
+                  on={bootAudioEnabled.value}
+                  onChange={() => setBootAudio(!bootAudioEnabled.value)}
+                  ariaLabel="Enable boot audio"
+                />
+              }
+            />
+          </CardGroup>
 
-          <Section
-            title="Keyboard"
-            subtitle="Pick which modifier opens the command palette and quick-jump search."
+          <CardGroup
+            title="KEYBOARD"
+            footer="Pick which modifier opens the command palette and quick-jump search."
           >
-            <Card>
-              <Row label="Search shortcut" hint="Auto matches your platform — pick a value to override.">
-                <HotkeyPicker />
-              </Row>
-            </Card>
-          </Section>
+            <CardRow
+              label="Search shortcut"
+              description="Auto matches your platform — pick a value to override."
+              value={<HotkeyPicker />}
+            />
+          </CardGroup>
 
-          <Section
-            title="Kill switches"
-            subtitle="Runtime feature gates. Toggling writes the flag to .env atomically; the runtime re-reads it within 1.5s so changes take effect without a restart."
+          <SpecialistRoutingGroup />
+
+          <CardGroup
+            title="KILL SWITCHES"
+            footer="Runtime feature gates. Toggling writes the flag to .env atomically; the runtime re-reads it within 1.5s so changes take effect without a restart."
           >
-            <div class="space-y-2">
-              {Object.entries(health.data.killSwitches).map(([key, on]) => {
-                const meta = KILL_SWITCH_LABELS[key] || { label: key, description: '' };
-                const refusals = health.data!.killSwitchRefusals[key] || 0;
-                return (
-                  <KillSwitchRow
-                    key={key}
-                    switchKey={key}
-                    label={meta.label}
-                    description={meta.description}
-                    on={on}
-                    refusals={refusals}
-                    onChange={() => health.refresh()}
-                  />
-                );
-              })}
-            </div>
-          </Section>
+            {Object.entries(health.data.killSwitches).map(([key, on]) => {
+              const meta = KILL_SWITCH_LABELS[key] || { label: key, description: '' };
+              const refusals = health.data!.killSwitchRefusals[key] || 0;
+              return (
+                <KillSwitchRow
+                  key={key}
+                  switchKey={key}
+                  label={meta.label}
+                  description={meta.description}
+                  on={on}
+                  refusals={refusals}
+                  onChange={() => health.refresh()}
+                />
+              );
+            })}
+          </CardGroup>
 
-          <Section title="Read-only" subtitle="Settings that need an .env edit + restart to change.">
-            <Card>
-              <ReadOnlyRow label="Default model" value={health.data.model || '—'} />
-              <Divider />
-              <ReadOnlyRow label="Context window" value={health.data.contextPct + '%'} />
-              <div class="text-[11px] text-[var(--color-text-faint)] pt-3 mt-1 border-t border-[var(--color-border)] leading-snug">
-                To toggle a kill switch, edit <code class="font-mono text-[var(--color-text-muted)]">.env</code> and set the relevant flag to <code class="font-mono text-[var(--color-text-muted)]">true</code> or <code class="font-mono text-[var(--color-text-muted)]">false</code>. The change takes effect within 1.5 seconds without a process restart.
-              </div>
-            </Card>
-          </Section>
+          <CardGroup
+            title="READ-ONLY"
+            footer="To toggle a kill switch, edit .env and set the relevant flag to true or false. The change takes effect within 1.5 seconds without a process restart."
+          >
+            <CardRow label="Default model" value={health.data.model || '—'} />
+            <CardRow label="Context window" value={health.data.contextPct + '%'} />
+          </CardGroup>
 
-          <Section title="Acknowledgements">
-            <Card>
-              <ReadOnlyRow label="3D brain model" value="Detailed Human Brain Model, NIH 3D 3DPX-021161, CC-BY" />
-            </Card>
-          </Section>
+          <CardGroup title="ACKNOWLEDGEMENTS">
+            <CardRow
+              label="3D brain model"
+              description="Detailed Human Brain Model, NIH 3D 3DPX-021161, CC-BY"
+            />
+          </CardGroup>
 
         </div>
       )}
+    </div>
+  );
+}
+
+// ── Specialist routing override ──────────────────────────────────────
+// Per-callsign tier selector. Lets the user override the static tier
+// from src/specialists.ts at runtime without a rebuild. Stored in the
+// dashboard_settings KV under `specialist.<callsign>.tier`. Cleared by
+// re-clicking the active button (back to default) or by picking the
+// default tier explicitly.
+
+interface SpecialistRow {
+  callsign: string;
+  tier: 'claw' | 'cloud' | 'local';
+  defaultTier: 'claw' | 'cloud' | 'local';
+  tierOverride: 'claw' | 'cloud' | 'local' | null;
+  preferredModel: string;
+  cloudModel: string | null;
+  modelInUse: string | null;
+  available: boolean;
+}
+
+function SpecialistRoutingGroup() {
+  const list = useFetch<{ specialists: SpecialistRow[] }>('/api/specialists', 30_000);
+  if (list.loading && !list.data) {
+    return (
+      <CardGroup title="SPECIALIST ROUTING" footer="Loading…">
+        <div class="px-4 py-3 text-[12px] text-[var(--color-text-muted)]">Fetching specialists…</div>
+      </CardGroup>
+    );
+  }
+  if (list.error || !list.data) {
+    return (
+      <CardGroup title="SPECIALIST ROUTING" footer={list.error || 'Failed to load specialists'} />
+    );
+  }
+  return (
+    <CardGroup
+      title="SPECIALIST ROUTING"
+      footer="Override where each specialist runs. Claw = local agentic loop via claw-code + Ollama (free). Local = direct Ollama call, no tool loop (vision and uncensored). Cloud = paid Anthropic SDK (only if the specialist has a cloudModel set). Click the active button to revert to default."
+    >
+      {list.data.specialists.map((s) => (
+        <SpecialistRoutingRow key={s.callsign} spec={s} onChanged={list.refresh} />
+      ))}
+    </CardGroup>
+  );
+}
+
+function SpecialistRoutingRow({ spec, onChanged }: { spec: SpecialistRow; onChanged: () => void }) {
+  const [busy, setBusy] = useState(false);
+  async function setTier(target: 'claw' | 'cloud' | 'local') {
+    setBusy(true);
+    try {
+      // Clicking the currently-active tier clears any override and reverts
+      // to the spec's default (matters when default and override happen to
+      // resolve to the same tier).
+      const isActive = spec.tier === target;
+      const payload = isActive && spec.tierOverride
+        ? { tier: null }                              // clear override
+        : isActive && !spec.tierOverride
+          ? { tier: spec.defaultTier }                // no-op confirmation; harmless
+          : { tier: target };                         // new override
+      const res = await apiPost<{ ok?: boolean; error?: string }>(
+        `/api/specialists/${spec.callsign}/tier`,
+        payload,
+      );
+      if (res.ok) {
+        pushToast({
+          tone: 'success',
+          title: payload.tier === null
+            ? `${spec.callsign} reverted to default (${spec.defaultTier})`
+            : `${spec.callsign} routed to ${payload.tier}`,
+        });
+        onChanged();
+      } else {
+        pushToast({ tone: 'error', title: 'Override failed', description: res.error || 'unknown error', durationMs: 6000 });
+      }
+    } catch (err: any) {
+      pushToast({ tone: 'error', title: 'Override failed', description: err?.message || String(err), durationMs: 6000 });
+    } finally {
+      setBusy(false);
+    }
+  }
+  const tiers: Array<{ key: 'claw' | 'local' | 'cloud'; label: string; available: boolean; hint: string }> = [
+    { key: 'claw',  label: 'CLAW',  available: true,                  hint: 'Local claw-code agentic loop + Ollama' },
+    { key: 'local', label: 'LOCAL', available: true,                  hint: 'Direct Ollama call, no tool loop' },
+    { key: 'cloud', label: 'CLOUD', available: !!spec.cloudModel,     hint: spec.cloudModel ? `Paid Anthropic SDK (${spec.cloudModel})` : 'No cloudModel configured' },
+  ];
+  return (
+    <div class="flex items-start gap-3 px-4 py-3.5">
+      <div class="flex-1 min-w-0">
+        <div class="flex items-center gap-2 mb-0.5">
+          <span class="text-[14px] font-medium text-[var(--color-text)] capitalize">{spec.callsign}</span>
+          {spec.tierOverride && (
+            <span class="text-[9.5px] font-mono uppercase tracking-[0.14em] px-1.5 py-0.5 rounded bg-[var(--color-accent)]/15 border border-[var(--color-accent)]/40 text-[var(--color-accent)]">
+              override active
+            </span>
+          )}
+        </div>
+        <div class="text-[11.5px] text-[var(--color-text-faint)] leading-snug">
+          default: <span class="font-mono uppercase">{spec.defaultTier}</span>
+          {' · '}
+          model: <span class="font-mono">{spec.modelInUse || spec.preferredModel}</span>
+        </div>
+      </div>
+      <div class="flex items-center gap-1 shrink-0">
+        {tiers.map((t) => {
+          const active = spec.tier === t.key;
+          const disabled = busy || !t.available;
+          return (
+            <button
+              key={t.key}
+              type="button"
+              onClick={() => !disabled && setTier(t.key)}
+              disabled={disabled}
+              title={t.hint}
+              class={[
+                'inline-flex items-center px-2.5 py-1 rounded-md text-[10.5px] font-mono uppercase tracking-[0.12em] border transition-colors',
+                active
+                  ? 'bg-[var(--color-accent-soft)] border-[var(--color-accent)] text-[var(--color-accent)]'
+                  : 'bg-[var(--color-card)] border-[var(--color-border)] text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:border-[var(--color-border-strong)]',
+                disabled ? 'opacity-40 cursor-not-allowed' : '',
+              ].join(' ')}
+            >
+              {t.label}
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -395,13 +540,13 @@ function KillSwitchRow({ switchKey, label, description, on, refusals, onChange }
     } finally { setBusy(false); }
   }
   return (
-    <div class="flex items-start gap-3 bg-[var(--color-card)] border border-[var(--color-border)] rounded-lg px-4 py-3.5">
+    <div class="flex items-start gap-3 px-4 py-3.5">
       <div class="flex-1 min-w-0">
         <div class="flex items-center gap-2 mb-0.5">
-          <span class="text-[13.5px] font-medium text-[var(--color-text)]">{label}</span>
+          <span class="text-[15px] font-medium text-[var(--color-text)]">{label}</span>
           <code class="text-[10.5px] text-[var(--color-text-faint)] font-mono">{switchKey}</code>
         </div>
-        <div class="text-[12px] text-[var(--color-text-muted)] leading-snug">{description}</div>
+        <div class="text-[12px] text-[var(--color-text-faint)] leading-snug">{description}</div>
         {refusals > 0 && (
           <div class="text-[11px] text-[var(--color-status-failed)] mt-1 tabular-nums">
             {refusals} refusals since startup

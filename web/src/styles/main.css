@@ -1,11 +1,42 @@
 @import "tailwindcss";
 
 /* ── Theme tokens ────────────────────────────────────────────────────
-   Three dark themes: graphite (default), midnight (blue), crimson.
-   Status colors stay constant across all themes for universal recognition.
-   Switch by setting data-theme on <html>. */
+   Four dark themes: ios-dark (default — iPhone aesthetic), graphite,
+   midnight (blue), crimson. Status colors stay constant across all
+   themes for universal recognition. Switch by setting data-theme on <html>. */
 
 :root,
+[data-theme="ios-dark"] {
+  /* JARVIS-HUD palette. True Iron Man HUD: neon cyan primary with
+     orange highlights for data/alerts. Surfaces stay glass-translucent
+     so the underlying gradient bleeds through every panel. Whites are
+     slightly cyan-tinted for that holographic feel. */
+  --color-bg: #000000;
+  --color-sidebar: rgba(8, 14, 22, 0.55);
+  --color-card: rgba(10, 18, 28, 0.58);
+  --color-elevated: rgba(20, 36, 52, 0.62);
+  --color-border: rgba(0, 240, 255, 0.14);
+  --color-border-strong: rgba(0, 240, 255, 0.32);
+  --color-text: #e6faff;
+  --color-text-muted: #8ab8c4;
+  --color-text-faint: #5a8090;
+  --color-accent: #00f0ff;
+  --color-accent-hover: #4dfaff;
+  --color-accent-soft: rgba(0, 240, 255, 0.16);
+  /* Orange alert/data accent — used for telemetry highlights, warnings,
+     status numbers (HP/CPU style readouts in the HUD). Matches the
+     gold-orange Jayse Hansen used in Iron Man HUDs. */
+  --color-accent-alt: #ff9500;
+  --color-accent-alt-hover: #ffb340;
+  --color-accent-alt-soft: rgba(255, 149, 0, 0.18);
+  /* Cinematic gradient backdrop — cyan top-left, orange top-right,
+     deep teal bottom. Visible through every glass surface. */
+  --bg-gradient: radial-gradient(120% 80% at 0% 0%, rgba(0, 240, 255, 0.18), transparent 55%),
+                 radial-gradient(90% 70% at 100% 5%, rgba(255, 149, 0, 0.10), transparent 55%),
+                 radial-gradient(110% 90% at 50% 120%, rgba(0, 180, 220, 0.12), transparent 60%),
+                 #000308;
+}
+
 [data-theme="graphite"] {
   --color-bg: #0e0e10;
   --color-sidebar: #141416;
@@ -19,6 +50,7 @@
   --color-accent: #8b8af0;
   --color-accent-hover: #a4a3f5;
   --color-accent-soft: rgba(139, 138, 240, 0.12);
+  --bg-gradient: var(--color-bg);
 }
 
 [data-theme="midnight"] {
@@ -34,6 +66,7 @@
   --color-accent: #5eb6ff;
   --color-accent-hover: #82c8ff;
   --color-accent-soft: rgba(94, 182, 255, 0.12);
+  --bg-gradient: var(--color-bg);
 }
 
 [data-theme="crimson"] {
@@ -49,6 +82,7 @@
   --color-accent: #ff5e6e;
   --color-accent-hover: #ff8090;
   --color-accent-soft: rgba(255, 94, 110, 0.12);
+  --bg-gradient: var(--color-bg);
 }
 
 /* Status colors are theme-agnostic. */
@@ -76,6 +110,9 @@
   --color-accent: var(--color-accent);
   --color-accent-hover: var(--color-accent-hover);
   --color-accent-soft: var(--color-accent-soft);
+  --color-accent-alt: var(--color-accent-alt);
+  --color-accent-alt-hover: var(--color-accent-alt-hover);
+  --color-accent-alt-soft: var(--color-accent-alt-soft);
   --color-status-queued: var(--color-status-queued);
   --color-status-running: var(--color-status-running);
   --color-status-done: var(--color-status-done);
@@ -84,31 +121,494 @@
   --color-priority-medium: var(--color-priority-medium);
   --color-priority-low: var(--color-priority-low);
 
-  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  /* SF Pro on Apple, then system-ui for cross-platform parity. Inter as
+     fallback when neither is available. The system stack gives iOS
+     devices the real SF; everywhere else still looks clean. */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Inter", system-ui, ui-sans-serif, sans-serif;
+  --font-mono: "SF Mono", "JetBrains Mono", ui-monospace, monospace;
 
-  --radius-sm: 4px;
-  --radius-md: 6px;
-  --radius-lg: 8px;
-  --radius-xl: 10px;
+  /* iOS-tier rounding. Was 4/6/8/10 — too tight to feel iPhone-y.
+     Now: sm for pill-tags, md for inputs, lg for cards, xl for panels,
+     2xl for hero modals, full for capsule buttons. */
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 22px;
+  --radius-2xl: 28px;
+  --radius-full: 999px;
+
+  /* Soft, long iOS-style shadows. Layered: tight contact + diffuse glow. */
+  --shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.16), 0 6px 16px rgba(0, 0, 0, 0.22);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.18), 0 8px 24px rgba(0, 0, 0, 0.28);
+  --shadow-glass: 0 1px 2px rgba(0, 0, 0, 0.20), 0 12px 40px rgba(0, 0, 0, 0.42);
 }
 
 /* ── Base resets ─────────────────────────────────────────────────────── */
 
 html, body {
   height: 100%;
-  background-color: var(--color-bg);
   color: var(--color-text);
   font-family: var(--font-sans);
-  font-size: 13px;
-  line-height: 1.5;
+  font-size: 15px;
+  line-height: 1.55;
+  letter-spacing: -0.008em;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
 body {
   margin: 0;
   user-select: none;
+  /* Theme-driven background. For ios-dark this is a subtle multi-stop
+     radial gradient (blue/purple/green wash); for other themes it's
+     just the flat --color-bg. Fixed so glass surfaces always have the
+     gradient peeking through, even when content scrolls. */
+  background: var(--bg-gradient, var(--color-bg));
+  background-attachment: fixed;
+  background-color: var(--color-bg);
+}
+
+/* iOS glass surface. Heavy blur + saturation so the indigo/purple
+   gradient genuinely diffuses through. Apply to elevated panels,
+   sidebar, modals, page headers. Falls back to opaque card on
+   browsers without backdrop-filter. */
+.glass {
+  backdrop-filter: blur(40px) saturate(180%);
+  -webkit-backdrop-filter: blur(40px) saturate(180%);
+  background: var(--color-card);
+  border: 1px solid var(--color-border);
+}
+@supports not (backdrop-filter: blur(1px)) {
+  .glass { background: var(--color-elevated); }
+}
+
+/* iOS-style scale-on-press for clickable surfaces. Wrap with .press-target
+   to get a subtle pop without writing inline styles each time. Spring curve
+   matches iOS UIKit's default interaction spring. */
+.press-target {
+  transition: transform 180ms cubic-bezier(0.25, 1.5, 0.5, 1);
+  will-change: transform;
+}
+.press-target:active { transform: scale(0.96); }
+
+/* Softer press for larger surfaces (cards, panels) — less aggressive
+   scale so big elements don't look glitchy when tapped. */
+.press-target-soft {
+  transition: transform 200ms cubic-bezier(0.25, 1.2, 0.5, 1);
+}
+.press-target-soft:active { transform: scale(0.985); }
+
+/* ── iOS modal entrance ───────────────────────────────────────────────
+   Sheets pop in with a soft scale + fade. Spring curve matches iOS UIKit
+   sheet presentation. */
+@keyframes modal-fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes modal-pop {
+  from { opacity: 0; transform: scale(0.94) translateY(8px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+.animate-modal-fade { animation: modal-fade 240ms cubic-bezier(0.22, 1, 0.36, 1); }
+.animate-modal-pop  { animation: modal-pop  280ms cubic-bezier(0.34, 1.32, 0.64, 1) backwards; }
+
+/* ── JARVIS Home ──────────────────────────────────────────────────────
+   Concentric HUD rings on the orb dashboard rotate continuously. Boot
+   sequence log lines fade in one by one. */
+@keyframes jarvis-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+@keyframes boot-line-in {
+  from { opacity: 0; transform: translateX(-6px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+.boot-line { animation: boot-line-in 220ms ease-out both; }
+
+/* ── Cinematic boot animations ────────────────────────────────────────
+   Used by the JarvisHome BootSequence component. Each phase has its
+   own keyframe so the sequence stays declarative and the timing logic
+   in BootSequence is just `setPhase(N)` over setTimeouts. */
+
+/* Phase 1: center dot impact — appears, throbs once, fades into ring */
+@keyframes boot-dot {
+  0%   { opacity: 0; transform: scale(0.3); }
+  20%  { opacity: 1; transform: scale(1.4); }
+  100% { opacity: 0; transform: scale(0.8); }
+}
+
+/* Phase 2: ring waves expanding outward from center */
+@keyframes boot-ring-expand {
+  0%   { opacity: 0.95; transform: scale(0.1); border-width: 2.5px; }
+  60%  { opacity: 0.7; border-width: 1.5px; }
+  100% { opacity: 0; transform: scale(12); border-width: 0.5px; }
+}
+
+/* Phase 3: SVG arc draws in via stroke-dashoffset → 0 */
+@keyframes boot-arc-draw {
+  from { stroke-dashoffset: var(--arc-len, 3000); opacity: 0; }
+  20%  { opacity: 1; }
+  to   { stroke-dashoffset: 0; opacity: 1; }
+}
+
+/* Generic fade-in for status lines, brackets, etc. */
+@keyframes boot-fade-in {
+  from { opacity: 0; transform: translateY(2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Phase 4: letter-by-letter reveal with a subtle drop */
+@keyframes boot-letter-in {
+  0%   { opacity: 0; transform: translateY(12px) scale(0.92); filter: blur(4px); }
+  60%  { opacity: 1; filter: blur(0); }
+  100% { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+}
+
+/* Phase 5: white flash radial pulse */
+@keyframes boot-flash {
+  0%   { opacity: 0; }
+  20%  { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+/* JARVIS energy halo — slow cyan breathing behind the orb canvas.
+   Combined with the orb's amplitude-driven shader and the rotating HUD
+   rings, this is what gives the dashboard its "alive" feel. */
+@keyframes jarvis-halo-breath {
+  0%, 100% { opacity: 0.55; transform: scale(0.96); }
+  50%      { opacity: 1.00; transform: scale(1.06); }
+}
+.jarvis-halo {
+  animation: jarvis-halo-breath 6.5s ease-in-out infinite;
+  transform-origin: center;
+}
+
+/* ── JARVIS HUD layer ─────────────────────────────────────────────────
+   Multi-panel HUD elements that surround the central 3D orb. The whole
+   layer mounts AFTER boot completes and stagger-fades in via GSAP. */
+
+/* Perspective grid floor — subtle scanlines receding to a vanishing
+   point at the horizon. Two linear gradients crossed at right angles,
+   skewed via transform: perspective(). Animates on Y to feel alive. */
+@keyframes jarvis-grid-pan {
+  0%   { background-position: 0 0; }
+  100% { background-position: 0 50px; }
+}
+.jarvis-grid-floor {
+  position: absolute;
+  inset: 60% 0 0 0;
+  perspective: 600px;
+  perspective-origin: 50% 0%;
+  pointer-events: none;
+  overflow: hidden;
+  opacity: 0.45;
+  mask-image: linear-gradient(to bottom, transparent 0%, black 25%, black 90%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 25%, black 90%, transparent 100%);
+}
+.jarvis-grid-floor::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform-origin: 50% 0%;
+  transform: rotateX(72deg) translateY(-12%);
+  background-image:
+    linear-gradient(to right, rgba(0, 240, 255, 0.22) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(0, 240, 255, 0.22) 1px, transparent 1px);
+  background-size: 50px 50px;
+  animation: jarvis-grid-pan 4s linear infinite;
+}
+
+/* Vertical scanning line that drifts across the screen — subtle,
+   continuous, gives the whole HUD a "live monitor" character. */
+@keyframes jarvis-scan-vert {
+  0%   { transform: translateX(-20vw); opacity: 0; }
+  10%  { opacity: 0.35; }
+  90%  { opacity: 0.35; }
+  100% { transform: translateX(120vw); opacity: 0; }
+}
+.jarvis-scanline {
+  position: absolute;
+  top: 0; bottom: 0; width: 220px;
+  pointer-events: none;
+  background: linear-gradient(to right,
+    transparent 0%,
+    rgba(0, 240, 255, 0.04) 35%,
+    rgba(0, 240, 255, 0.18) 50%,
+    rgba(0, 240, 255, 0.04) 65%,
+    transparent 100%);
+  animation: jarvis-scan-vert 8s linear infinite;
+  animation-delay: 2s;
+}
+
+/* Corner HUD panels — glass surface with bracket-frame corners,
+   uppercase tracked header, monospace data rows. Modeled after the
+   Jayse Hansen Iron Man HUD aesthetic: cyan structure + orange data
+   highlights + ambient grid micro-tex. */
+.jarvis-panel {
+  position: relative;
+  padding: 12px 14px;
+  background: rgba(0, 16, 28, 0.42);
+  backdrop-filter: blur(20px) saturate(160%);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  border: 1px solid rgba(0, 240, 255, 0.22);
+  border-radius: 4px;
+  box-shadow:
+    0 0 0 1px rgba(0, 240, 255, 0.04) inset,
+    0 8px 32px rgba(0, 0, 0, 0.45);
+  font-family: var(--font-mono);
+  color: #80d8e8;
+  letter-spacing: 0.02em;
+}
+.jarvis-panel::before,
+.jarvis-panel::after,
+.jarvis-panel > .br-tl,
+.jarvis-panel > .br-tr,
+.jarvis-panel > .br-bl,
+.jarvis-panel > .br-br {
+  content: '';
+  position: absolute;
+  width: 14px; height: 14px;
+  pointer-events: none;
+}
+.jarvis-panel::before {
+  /* top-left bracket */
+  top: -1px; left: -1px;
+  border-top: 1.5px solid #00f0ff;
+  border-left: 1.5px solid #00f0ff;
+}
+.jarvis-panel::after {
+  /* bottom-right bracket */
+  bottom: -1px; right: -1px;
+  border-bottom: 1.5px solid #00f0ff;
+  border-right: 1.5px solid #00f0ff;
+}
+.jarvis-panel > .br-tr {
+  top: -1px; right: -1px;
+  border-top: 1.5px solid #00f0ff;
+  border-right: 1.5px solid #00f0ff;
+}
+.jarvis-panel > .br-bl {
+  bottom: -1px; left: -1px;
+  border-bottom: 1.5px solid #00f0ff;
+  border-left: 1.5px solid #00f0ff;
+}
+
+.jarvis-panel-title {
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: #00f0ff;
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(0, 240, 255, 0.18);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.jarvis-panel-title::before {
+  content: '';
+  display: inline-block;
+  width: 5px; height: 5px;
+  border-radius: 50%;
+  background: #00f0ff;
+  box-shadow: 0 0 6px #00f0ff;
+}
+.jarvis-panel-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  font-size: 11px;
+  line-height: 1.5;
+  padding: 1.5px 0;
+}
+.jarvis-panel-row .k { color: #80d8e8; }
+.jarvis-panel-row .v { color: #ff9500; font-weight: 600; }
+.jarvis-panel-row .v.cyan { color: #00f0ff; }
+.jarvis-panel-row .v.dim  { color: #5a8090; }
+
+/* Mini gauge bar — used inside panels for CPU/MEM-style readouts. */
+.jarvis-gauge {
+  position: relative;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(0, 240, 255, 0.10);
+  overflow: hidden;
+  margin: 2px 0 4px;
+}
+.jarvis-gauge > span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(to right, #00f0ff, #4dfaff);
+  box-shadow: 0 0 8px rgba(0, 240, 255, 0.65);
+  transition: width 600ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.jarvis-gauge.orange > span {
+  background: linear-gradient(to right, #ff9500, #ffb340);
+  box-shadow: 0 0 8px rgba(255, 149, 0, 0.55);
+}
+
+/* JARVIS nameplate — sits below the orb, big letter-spaced cyan text
+   with a soft glow and an underline tick mark on each side. */
+@keyframes jarvis-nameplate-pulse {
+  0%, 100% { text-shadow: 0 0 12px rgba(0, 240, 255, 0.85), 0 0 32px rgba(0, 240, 255, 0.45); }
+  50%      { text-shadow: 0 0 18px rgba(0, 240, 255, 1.0),  0 0 48px rgba(0, 240, 255, 0.65); }
+}
+.jarvis-nameplate {
+  font-family: var(--font-mono);
+  font-size: clamp(14px, 1.5vmin, 18px);
+  letter-spacing: 0.55em;
+  font-weight: 700;
+  padding-left: 0.55em;
+  color: #e6faff;
+  animation: jarvis-nameplate-pulse 3.2s ease-in-out infinite;
+}
+.jarvis-nameplate-sub {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.3em;
+  color: #00f0ff;
+  opacity: 0.7;
+  margin-top: 6px;
+  text-shadow: 0 0 4px rgba(0, 240, 255, 0.7);
+}
+
+/* JARVIS page caption — iOS-style descriptor at the very top of the
+   dashboard. Proportional SF Pro stack (not mono), 500 weight, wide
+   tracking. Sits between the top SYSTEM / TELEMETRY corner panels. */
+.jarvis-page-caption {
+  position: absolute;
+  top: 22px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 8;
+  pointer-events: none;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', system-ui, sans-serif;
+  font-size: clamp(13px, 1.55vmin, 17px);
+  letter-spacing: 0.48em;
+  padding-left: 0.48em;
+  font-weight: 500;
+  color: #00f0ff;
+  opacity: 0.88;
+  text-shadow:
+    0 0 10px rgba(0, 240, 255, 0.85),
+    0 0 28px rgba(0, 240, 255, 0.35);
+  white-space: nowrap;
+}
+
+/* JARVIS page title — iOS-style headline at the very bottom of the
+   dashboard. Slightly larger than the top caption, with more open
+   tracking so the seven dotted letters spread across the band.
+   Lighter weight + softer glow than the previous bold-mono treatment
+   for a refined Apple-grade feel. */
+.jarvis-page-title {
+  position: absolute;
+  bottom: 22px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 8;
+  pointer-events: none;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', system-ui, sans-serif;
+  font-size: clamp(15px, 1.85vmin, 20px);
+  letter-spacing: 0.72em;
+  padding-left: 0.72em;
+  font-weight: 500;
+  color: #00f0ff;
+  text-shadow:
+    0 0 10px rgba(0, 240, 255, 0.95),
+    0 0 28px rgba(0, 240, 255, 0.45),
+    0 0 64px rgba(0, 240, 255, 0.22);
+  animation: jarvis-page-title-pulse 3.6s ease-in-out infinite;
+  white-space: nowrap;
+}
+
+@keyframes jarvis-page-title-pulse {
+  0%, 100% { opacity: 0.94; }
+  50%      { opacity: 1.00; }
+}
+
+/* ── iOS form controls ────────────────────────────────────────────────
+   Inputs get a comfortable height, generous radius, soft inset shadow
+   for depth. Focus ring uses the accent color at low opacity. */
+input[type="text"],
+input[type="search"],
+input[type="number"],
+input[type="email"],
+input[type="password"],
+textarea,
+select {
+  background: var(--color-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 8px 12px;
+  font-family: inherit;
+  color: var(--color-text);
+  transition: border-color 150ms, box-shadow 150ms, background 150ms;
+  outline: none;
+}
+input[type="text"]:focus,
+input[type="search"]:focus,
+input[type="number"]:focus,
+input[type="email"]:focus,
+input[type="password"]:focus,
+textarea:focus,
+select:focus {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px var(--color-accent-soft);
+}
+input::placeholder, textarea::placeholder {
+  color: var(--color-text-faint);
+}
+
+/* ── iOS chat bubbles ─────────────────────────────────────────────────
+   iMessage uses ~18px corner radius with the corner adjacent to the
+   speaker tip slightly tighter (~6px). Apply via .ios-bubble + sender
+   modifier classes. */
+.ios-bubble {
+  border-radius: 20px;
+  padding: 9px 14px;
+  font-size: 13.5px;
+  line-height: 1.4;
+  letter-spacing: -0.005em;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
+  max-width: 78%;
+  word-wrap: break-word;
+}
+.ios-bubble-user {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--color-accent) 100%, transparent) 0%, color-mix(in srgb, var(--color-accent) 88%, transparent) 100%);
+  color: #ffffff;
+  border-bottom-right-radius: 6px;
+}
+.ios-bubble-assistant {
+  background: var(--color-elevated);
+  border: 1px solid var(--color-border);
+  color: var(--color-text);
+  border-bottom-left-radius: 6px;
+}
+
+/* ── iMessage-style typing indicator ─────────────────────────────────
+   Three pulsing dots that bounce in staggered sequence. The dot color
+   tracks the muted text color so it sits well inside the assistant
+   bubble surface. The label text alongside the dots tells the user
+   what the agent is doing in plain language (Thinking, Searching the
+   web, Running command, etc.). */
+@keyframes typing-bounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.35; }
+  30%           { transform: translateY(-3px); opacity: 0.95; }
+}
+.typing-dot {
+  display: inline-block;
+  animation: typing-bounce 1.2s ease-in-out infinite;
+  will-change: transform, opacity;
+}
+@keyframes typing-bubble-in {
+  from { opacity: 0; transform: translateY(4px) scale(0.97); }
+  to   { opacity: 1; transform: translateY(0)   scale(1);    }
+}
+.typing-bubble-in {
+  animation: typing-bubble-in 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
 *, *::before, *::after {
@@ -130,11 +630,11 @@ input, textarea, select {
 /* ── Reusable helpers ────────────────────────────────────────────────── */
 
 .section-label {
-  font-size: 10px;
+  font-size: 10.5px;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.12em;
   color: var(--color-text-faint);
-  font-weight: 500;
+  font-weight: 600;
 }
 
 /* Chat bubble markdown rendering */
@@ -145,17 +645,17 @@ input, textarea, select {
 .chat-md code {
   font-family: var(--font-mono);
   font-size: 0.92em;
-  background: var(--color-elevated);
-  border: 1px solid var(--color-border);
-  border-radius: 3px;
-  padding: 0 4px;
-}
-.chat-md pre {
-  background: var(--color-bg);
+  background: color-mix(in srgb, var(--color-bg) 60%, transparent);
   border: 1px solid var(--color-border);
   border-radius: 6px;
-  padding: 8px 10px;
-  margin: 0.4em 0;
+  padding: 1px 6px;
+}
+.chat-md pre {
+  background: color-mix(in srgb, var(--color-bg) 80%, transparent);
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin: 0.5em 0;
   overflow-x: auto;
 }
 .chat-md pre code {
@@ -203,6 +703,21 @@ input, textarea, select {
   to   { opacity: 1; transform: translateY(0); }
 }
 .animate-toast-in { animation: toast-in 160ms ease-out; }
+
+/* ── iOS bottom sheet slide-up ───────────────────────────────────────
+   Used by MoreSheet and any future bottom sheet. Spring curve for
+   that bouncy iOS feel. */
+@keyframes sheet-slide-up {
+  from { transform: translateY(100%); }
+  to   { transform: translateY(0); }
+}
+
+/* ── Bottom tab bar glass surface ────────────────────────────────────
+   Extra-heavy blur to ensure readability over scrolling content. */
+nav.glass {
+  backdrop-filter: blur(50px) saturate(200%);
+  -webkit-backdrop-filter: blur(50px) saturate(200%);
+}
 
 /* Privacy blur — used on Memories + Hive Mind summaries when the user
    wants the page screenshot-safe. Click-to-reveal per row, hover lightens
@@ -363,4 +878,45 @@ input, textarea, select {
   animation: brainTooltipEnter 160ms cubic-bezier(0.2, 0.7, 0.25, 1) both;
   transform-origin: top left;
   will-change: transform, opacity;
+}
+
+/* ── iOS page layout helpers ─────────────────────────────────────────
+   Standard page container with iPhone-appropriate padding. On mobile,
+   tighter side padding (16px) matching iOS. Desktop gets more room. */
+.ios-page {
+  padding: 0 16px 24px;
+  max-width: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  height: 100%;
+  -webkit-overflow-scrolling: touch;
+}
+@media (min-width: 768px) {
+  .ios-page { padding: 0 32px 32px; }
+}
+
+/* iOS-style section spacing between card groups */
+.ios-page > * + * { margin-top: 28px; }
+
+/* iOS list row with inset separator — the separator doesn't extend to
+   the left edge but starts after the icon/indent, just like iPhone. */
+.ios-row-separator {
+  border-bottom: 0.5px solid var(--color-border);
+  margin-left: 52px;
+}
+
+/* iOS status bar spacer — on mobile, adds safe-area top padding so
+   content doesn't clash with the phone's status bar. */
+.ios-status-spacer {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+/* ── Page enter animation ────────────────────────────────────────────
+   Subtle fade + slide for page transitions. Apply to page root divs. */
+@keyframes page-enter {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-page-enter {
+  animation: page-enter 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }

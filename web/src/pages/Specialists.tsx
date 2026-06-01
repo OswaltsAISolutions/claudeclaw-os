@@ -13,7 +13,7 @@ import { formatRelativeTime } from '@/lib/format';
 
 interface Specialist {
   callsign: string;
-  tier: 'local' | 'cloud';
+  tier: 'local' | 'claw' | 'cloud';
   role: string;
   preferredModel: string;
   fallbackModels: string[];
@@ -36,6 +36,18 @@ interface DelegateResult {
   fellBackFrom?: string | null;
 }
 
+interface HistoryTurn {
+  role: 'user' | 'assistant' | string;
+  content: string;
+  timestamp?: number;
+  created_at?: number;
+}
+
+interface HistoryResponse {
+  callsign: string;
+  turns: HistoryTurn[];
+}
+
 export function Specialists() {
   const roster = useFetch<{ specialists: Specialist[] }>('/api/specialists', 15_000);
 
@@ -49,16 +61,16 @@ export function Specialists() {
     <div class="h-full flex flex-col">
       <PageHeader title="Specialists" />
 
-      <div class="flex-1 overflow-y-auto px-5 pb-8 space-y-6">
+      <div class="flex-1 overflow-y-auto px-5 md:px-6 pb-8 space-y-5 max-w-4xl mx-auto w-full">
         {/* Top status banner. */}
-        <div class="bg-[var(--color-elevated)] border border-[var(--color-border)] rounded p-3 flex items-center gap-3">
+        <div class="bg-[var(--color-card)] border border-[var(--color-border)] rounded-2xl px-4 py-3 flex items-center gap-3">
           <Crosshair size={16} class="text-[var(--color-accent)]" />
           <div class="flex-1 min-w-0">
             <div class="text-[12.5px] font-medium text-[var(--color-text)]">
               {available} of {specs.length} specialists online
             </div>
             <div class="text-[10.5px] text-[var(--color-text-faint)]">
-              Jarvis routes tasks to these callsigns. All share the same hivemind memory.
+              J.A.R.V.I.S. routes tasks to these callsigns. All share the same hivemind memory.
             </div>
           </div>
           <Pill tone="done">hivemind</Pill>
@@ -82,6 +94,14 @@ function SpecialistCard({ spec, onChanged }: { spec: Specialist; onChanged: () =
   const [lastResult, setLastResult] = useState<DelegateResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  // Recent task history for this specialist — pulled from
+  // /api/specialists/:callsign/history (conversation_log entries tagged
+  // with agent_id = "specialist:<callsign>"). Poll every 10s when the
+  // card is expanded so a routed task from chat appears within seconds.
+  const history = useFetch<HistoryResponse>(
+    `/api/specialists/${spec.callsign}/history`,
+    expanded ? 10_000 : 60_000,
+  );
 
   async function runTask() {
     const trimmed = task.trim();
@@ -108,6 +128,9 @@ function SpecialistCard({ spec, onChanged }: { spec: Specialist; onChanged: () =
       const data: DelegateResult = await res.json();
       setLastResult(data);
       onChanged();
+      // Refresh the history feed so the just-dispatched task shows up
+      // immediately rather than waiting for the next poll.
+      history.refresh();
       pushToast({
         tone: 'success',
         title: `${spec.callsign} done`,
@@ -144,8 +167,17 @@ function SpecialistCard({ spec, onChanged }: { spec: Specialist; onChanged: () =
       : <Pill tone="done">online</Pill>
     : <Pill tone="failed">offline</Pill>;
 
+  // Tier badge — shows where this specialist runs. Local is the
+  // post-2026-05-25 default. Cloud means it would hit the paid
+  // Anthropic route (only when a user override flips it).
+  const tierBadge = spec.tier === 'cloud'
+    ? <span class="text-[9.5px] font-mono uppercase tracking-[0.14em] px-1.5 py-0.5 rounded bg-[var(--color-status-warning)]/15 border border-[var(--color-status-warning)]/40 text-[var(--color-status-warning)]">PAID</span>
+    : spec.tier === 'claw'
+      ? <span class="text-[9.5px] font-mono uppercase tracking-[0.14em] px-1.5 py-0.5 rounded bg-[var(--color-accent)]/15 border border-[var(--color-accent)]/40 text-[var(--color-accent)]">LOCAL · CLAW</span>
+      : <span class="text-[9.5px] font-mono uppercase tracking-[0.14em] px-1.5 py-0.5 rounded bg-[var(--color-elevated)] border border-[var(--color-border)] text-[var(--color-text-muted)]">LOCAL</span>;
+
   return (
-    <div class="bg-[var(--color-elevated)] border border-[var(--color-border)] rounded p-3 space-y-2.5">
+    <div class="bg-[var(--color-card)] border border-[var(--color-border)] rounded-2xl p-4 space-y-2.5">
       {/* Header */}
       <div class="flex items-start gap-2">
         <div class="shrink-0 w-8 h-8 rounded bg-[var(--color-card)] border border-[var(--color-border)] flex items-center justify-center">
@@ -154,6 +186,7 @@ function SpecialistCard({ spec, onChanged }: { spec: Specialist; onChanged: () =
         <div class="flex-1 min-w-0">
           <div class="flex items-center gap-2 flex-wrap">
             <span class="text-[13px] font-semibold text-[var(--color-text)] capitalize">{spec.callsign}</span>
+            {tierBadge}
             {statusBadge}
             <span class="text-[10.5px] text-[var(--color-text-faint)] tabular-nums">
               ~{spec.vramHintGB}GB VRAM
@@ -187,17 +220,78 @@ function SpecialistCard({ spec, onChanged }: { spec: Specialist; onChanged: () =
         ))}
       </div>
 
+      {/* Usage stats (last 24h) — backed by /api/specialists/stats */}
+      <SpecialistStatsStrip callsign={spec.callsign} />
+
+
       {/* Expanded details */}
       {expanded && (
-        <div class="text-[10.5px] text-[var(--color-text-faint)] bg-[var(--color-card)] rounded p-2 space-y-1 border border-[var(--color-border)]">
-          <div>temperature: <span class="font-mono">{spec.temperature}</span></div>
-          <div>context: <span class="font-mono">{spec.contextTokens.toLocaleString()} tokens</span></div>
-          <div>fallback chain:</div>
-          <ul class="ml-3 space-y-0.5">
-            {spec.fallbackModels.map((m) => (
-              <li key={m} class="font-mono text-[10px] truncate">↳ {m}</li>
-            ))}
-          </ul>
+        <div class="space-y-2.5">
+          <div class="text-[10.5px] text-[var(--color-text-faint)] bg-[var(--color-card)] rounded p-2 space-y-1 border border-[var(--color-border)]">
+            <div>temperature: <span class="font-mono">{spec.temperature}</span></div>
+            <div>context: <span class="font-mono">{spec.contextTokens.toLocaleString()} tokens</span></div>
+            <div>fallback chain:</div>
+            <ul class="ml-3 space-y-0.5">
+              {spec.fallbackModels.map((m) => (
+                <li key={m} class="font-mono text-[10px] truncate">↳ {m}</li>
+              ))}
+            </ul>
+          </div>
+
+          {/* Recent activity feed — last N tasks delegated to this
+              specialist (whether via the dispatch box above, or routed
+              from chat / Telegram / Mission Control through agent.ts's
+              intelligentRoute). Polls every 10s while card is expanded. */}
+          <div>
+            <div class="flex items-center justify-between mb-1.5">
+              <div class="text-[10px] uppercase tracking-[0.12em] font-semibold text-[var(--color-text-faint)]">
+                Recent activity
+              </div>
+              {history.data?.turns && (
+                <div class="text-[10px] text-[var(--color-text-faint)] tabular-nums">
+                  {history.data.turns.length} turn{history.data.turns.length === 1 ? '' : 's'}
+                </div>
+              )}
+            </div>
+            {history.loading && !history.data && (
+              <div class="text-[10.5px] text-[var(--color-text-faint)] italic px-1">loading…</div>
+            )}
+            {history.data && history.data.turns.length === 0 && (
+              <div class="text-[10.5px] text-[var(--color-text-faint)] italic px-1">no recent tasks</div>
+            )}
+            {history.data && history.data.turns.length > 0 && (
+              <div class="space-y-1.5">
+                {history.data.turns.slice(0, 6).map((turn, i) => {
+                  const ts = turn.timestamp ?? turn.created_at;
+                  const isUser = turn.role === 'user';
+                  return (
+                    <div
+                      key={i}
+                      class={[
+                        'text-[11px] bg-[var(--color-card)] rounded p-2 border border-[var(--color-border)]',
+                        isUser ? 'border-l-2 border-l-[var(--color-accent)]' : '',
+                      ].join(' ')}
+                    >
+                      <div class="text-[var(--color-text-faint)] text-[10px] mb-1 flex items-center gap-1.5">
+                        <span class={isUser ? 'text-[var(--color-accent)] font-semibold' : 'capitalize'}>
+                          {isUser ? 'TASK' : turn.role}
+                        </span>
+                        {ts && (
+                          <>
+                            <span>·</span>
+                            <span>{formatRelativeTime(ts)}</span>
+                          </>
+                        )}
+                      </div>
+                      <div class="text-[var(--color-text)] line-clamp-2 leading-snug">
+                        {turn.content?.slice(0, 240) || '—'}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
       )}
 
@@ -294,3 +388,88 @@ function CallsignGlyph({ callsign }: { callsign: string }) {
 // Re-export the Brain icon so tree-shakers don't complain about an unused
 // import when this file is the only consumer outside LocalModels.
 export { Brain };
+
+// ── Per-card usage stats strip ────────────────────────────────────────
+// Pulls /api/specialists/stats once per card mount and re-fetches when
+// the parent roster refreshes. Shows: invocations (last 24h), total
+// runtime, last invocation timestamp. Click to expand and see the
+// recent task previews. Empty state (no invocations) shows a faint
+// "no recent activity" line so a brand-new specialist doesn't look
+// broken.
+
+interface SpecialistStatsResp {
+  hours: number;
+  stats: Array<{
+    callsign: string;
+    invocations: number;
+    totalDurationMs: number;
+    avgDurationMs: number;
+    totalToolCalls: number;
+    lastInvokedAt: number | null;
+    lastModel: string | null;
+    recentTasks: Array<{ when: number; preview: string; durationMs: number; tier: string }>;
+  }>;
+}
+
+function SpecialistStatsStrip({ callsign }: { callsign: string }) {
+  const [open, setOpen] = useState(false);
+  // Refresh every 30s so the activity stays live without hammering the API.
+  const fetched = useFetch<SpecialistStatsResp>('/api/specialists/stats?hours=24', 30_000);
+  const stats = fetched.data?.stats?.find((s) => s.callsign === callsign);
+  if (!stats) return null;
+
+  if (stats.invocations === 0) {
+    return (
+      <div class="text-[10px] text-[var(--color-text-faint)] italic">
+        no recent activity (24h)
+      </div>
+    );
+  }
+
+  const totalSec = Math.round(stats.totalDurationMs / 1000);
+  const avgSec = Math.round(stats.avgDurationMs / 1000);
+  const lastAgo = stats.lastInvokedAt ? relativeAgo(stats.lastInvokedAt) : '—';
+
+  return (
+    <div class="space-y-1.5">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        class="w-full flex items-center justify-between gap-2 text-[10.5px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
+      >
+        <span class="flex items-center gap-2 tabular-nums">
+          <span class="text-[var(--color-accent)] font-semibold">{stats.invocations}</span>
+          <span>{stats.invocations === 1 ? 'run' : 'runs'} · {totalSec}s total · avg {avgSec}s · last {lastAgo}</span>
+        </span>
+        <ChevronDown size={10} class={['shrink-0 transition-transform', open ? '' : '-rotate-90'].join(' ')} />
+      </button>
+      {open && (
+        <div class="space-y-1 text-[10px] text-[var(--color-text-faint)] pl-2 border-l border-[var(--color-border)]">
+          {stats.recentTasks.map((t, i) => (
+            <div key={i} class="truncate">
+              <span class="font-mono tabular-nums text-[var(--color-text-muted)]">
+                {relativeAgo(t.when)}
+              </span>
+              <span class="text-[var(--color-text-faint)] mx-1">·</span>
+              <span class="font-mono uppercase text-[9px] text-[var(--color-accent)]/70">
+                {t.tier}
+              </span>
+              <span class="text-[var(--color-text-faint)] mx-1">·</span>
+              <span class="tabular-nums">{Math.round(t.durationMs / 1000)}s</span>
+              <span class="text-[var(--color-text-faint)] mx-1">·</span>
+              {t.preview.length > 80 ? t.preview.slice(0, 80) + '…' : t.preview}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function relativeAgo(unixSec: number): string {
+  const diff = Math.floor(Date.now() / 1000) - unixSec;
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.round(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.round(diff / 3600)}h ago`;
+  return `${Math.round(diff / 86400)}d ago`;
+}

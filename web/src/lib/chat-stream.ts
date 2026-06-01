@@ -60,6 +60,8 @@ export function startChatStream() {
     es.addEventListener('assistant_photo', dispatch('assistant_photo'));
     es.addEventListener('processing', dispatch('processing'));
     es.addEventListener('progress', dispatch('progress'));
+    es.addEventListener('tool_use', dispatch('tool_use'));
+    es.addEventListener('tool_result', dispatch('tool_result'));
     es.addEventListener('error', dispatch('error') as any);
   }
 

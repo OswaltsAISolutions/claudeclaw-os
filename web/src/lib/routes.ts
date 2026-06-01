@@ -5,6 +5,7 @@ import {
   Cpu,
   Crosshair,
   Settings,
+  Sparkles,
 } from 'lucide-preact';
 import type { ComponentChildren } from 'preact';
 
@@ -22,6 +23,7 @@ export interface RouteDef {
 // Voices used to be a top-level item; it now lives under War Room as the
 // "Voice config" sub-tab and is reachable via /warroom?mode=voices.
 export const ROUTES: RouteDef[] = [
+  { path: '/',           label: 'J.A.R.V.I.S.',    section: 'workspace',    icon: Sparkles,      shortcut: 'g j' },
   { path: '/mission',    label: 'Mission Control', section: 'workspace',    icon: LayoutGrid,    shortcut: 'g m' },
   { path: '/scheduled',  label: 'Scheduled',       section: 'workspace',    icon: ListTodo,      shortcut: 'g s' },
   { path: '/agents',     label: 'Agents',          section: 'workspace',    icon: Users,         shortcut: 'g a' },
@@ -46,7 +48,7 @@ export const SECTION_LABEL: Record<RouteSection, string> = {
   configure:    'Configure',
 };
 
-export const DEFAULT_ROUTE = '/mission';
+export const DEFAULT_ROUTE = '/';
 
 // Lightly typed children helper for placeholder pages.
 export type PageProps = { children?: ComponentChildren };

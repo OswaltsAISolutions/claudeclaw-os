@@ -606,7 +606,7 @@ function ChatSection({ models }: { models: LocalModel[] }) {
         </h3>
         <div class="flex items-center gap-1.5 text-[10.5px] text-[var(--color-text-faint)]">
           <Brain size={11} class="text-[var(--color-accent)]" />
-          Shares hivemind memory with Jarvis
+          Shares hivemind memory with J.A.R.V.I.S.
         </div>
       </div>
 

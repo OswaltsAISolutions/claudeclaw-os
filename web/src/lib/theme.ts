@@ -1,20 +1,21 @@
 import { signal, effect } from '@preact/signals';
 
-export type ThemeName = 'graphite' | 'midnight' | 'crimson';
+export type ThemeName = 'graphite' | 'midnight' | 'crimson' | 'ios-dark';
 
 const STORAGE_KEY = 'claudeclaw.theme';
 const ACCENT_KEY = 'claudeclaw.theme.customAccent';
 const SCALE_KEY = 'claudeclaw.uiScale';
 const SHOW_COSTS_KEY = 'claudeclaw.showCosts';
+const BOOT_AUDIO_KEY = 'claudeclaw.bootAudio';
 
 function loadInitial(): ThemeName {
   try {
     const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved === 'graphite' || saved === 'midnight' || saved === 'crimson') {
+    if (saved === 'graphite' || saved === 'midnight' || saved === 'crimson' || saved === 'ios-dark') {
       return saved;
     }
   } catch {}
-  return 'graphite';
+  return 'ios-dark';
 }
 
 function loadCustomAccent(): string | null {
@@ -44,6 +45,18 @@ function loadShowCosts(): boolean {
   return false;
 }
 
+function loadBootAudio(): boolean {
+  try {
+    const v = localStorage.getItem(BOOT_AUDIO_KEY);
+    if (v === 'on') return true;
+    if (v === 'off') return false;
+  } catch {}
+  // Default ON — boot music + voice narration are part of the JARVIS
+  // experience. Users can disable in Settings → Display if they want a
+  // silent boot (e.g. when other audio is playing on the machine).
+  return true;
+}
+
 export const theme = signal<ThemeName>(loadInitial());
 
 /** Custom accent override (hex). When set, it overrides the active
@@ -64,7 +77,13 @@ export const uiScale = signal<number>(loadScale());
  *  + 30-day chart, and the Chat session bar's "Cost today" cell. */
 export const showCosts = signal<boolean>(loadShowCosts());
 
+/** Whether the JARVIS Home boot sequence plays background music and
+ *  ElevenLabs voice narration. Default ON. Visuals always play; flipping
+ *  this off only mutes the audio layers. */
+export const bootAudioEnabled = signal<boolean>(loadBootAudio());
+
 export const themeMeta: Record<ThemeName, { label: string; swatch: string }> = {
+  'ios-dark': { label: 'J.A.R.V.I.S. HUD', swatch: '#00f0ff' },
   graphite: { label: 'Graphite', swatch: '#8b8af0' },
   midnight: { label: 'Midnight', swatch: '#5eb6ff' },
   crimson: { label: 'Crimson', swatch: '#ff5e6e' },
@@ -110,6 +129,10 @@ effect(() => {
   try { localStorage.setItem(SHOW_COSTS_KEY, showCosts.value ? 'on' : 'off'); } catch {}
 });
 
+effect(() => {
+  try { localStorage.setItem(BOOT_AUDIO_KEY, bootAudioEnabled.value ? 'on' : 'off'); } catch {}
+});
+
 export function setTheme(next: ThemeName) {
   theme.value = next;
 }
@@ -125,6 +148,10 @@ export function setUiScale(next: number) {
 
 export function setShowCosts(next: boolean) {
   showCosts.value = next;
+}
+
+export function setBootAudio(next: boolean) {
+  bootAudioEnabled.value = next;
 }
 
 // Lighten/darken a hex color by `pct` percent (-100..100). Used to

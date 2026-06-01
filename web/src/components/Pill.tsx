@@ -22,7 +22,7 @@ const TONE_STYLE: Record<Tone, string> = {
 
 export function Pill({ tone = 'neutral', children }: Props) {
   return (
-    <span class={'inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium ' + TONE_STYLE[tone]}>
+    <span class={'inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10.5px] font-semibold uppercase tracking-wider ' + TONE_STYLE[tone]}>
       {children}
     </span>
   );
@@ -41,10 +41,16 @@ export function StatusDot({ tone }: { tone: Tone }) {
     neutral: 'var(--color-text-faint)',
     accent: 'var(--color-accent)',
   };
+  const color = colorMap[tone];
+  // iOS-style status dot: slightly larger, with a soft outer glow halo
+  // (drop-shadow) so it reads as "live indicator" rather than punctuation.
   return (
     <span
-      class="inline-block w-1.5 h-1.5 rounded-full shrink-0"
-      style={{ backgroundColor: colorMap[tone] }}
+      class="inline-block w-2 h-2 rounded-full shrink-0"
+      style={{
+        backgroundColor: color,
+        boxShadow: `0 0 0 2px color-mix(in srgb, ${color} 22%, transparent)`,
+      }}
     />
   );
 }
