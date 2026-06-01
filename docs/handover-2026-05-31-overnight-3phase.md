@@ -881,6 +881,36 @@ force) -> 200, health 200 on poll attempt 1, clean boot (PID 315110,
 @GCruiseJarvisBot online, 0 errors/0 leaked tokens). Origin/main at deployed
 HEAD (`907937c`, 0 ahead).
 
+### Real bug fix: raw quote in link URL broke Telegram HTML (2026-06-01, seventeenth slice) - DONE + DEPLOYED
+
+Root-cause companion to slices 15/16. `formatForTelegram` escapes `& < >` in
+step 3 but NEVER escaped `"`, and step 10 dropped the captured markdown-link
+URL straight into the `href` attribute. A link whose URL held a raw `"`
+(`[x](https://e/a?q="z")`) emitted `<a href="...q="z"">` - the `"` closes the
+attribute early, so Telegram rejects the ENTIRE message as invalid HTML. The
+new per-chunk fallback (slices 15/16) would degrade it to plain text, but this
+fixes the source: percent-encode `"` -> `%22` in the URL (a no-op for
+well-formed URLs, which already encode it), so valid HTML is produced in the
+first place and the fallback isn't even exercised.
+
+Fix (`80a814f`): step-10 link replace switched from a `'$2'` string template
+to a function replace that does `url.replace(/"/g, '%22')`. Behavior for
+quote-free URLs is byte-identical (existing `[ok](https://example.com)` test
+unchanged; `javascript:` guard untouched - the regex still requires
+`https?://`). +1 regression test asserting exactly the two attribute-delimiter
+quotes remain. Full suite 964 -> 965 / 4 skipped, tsc + build green. DEPLOYED
+via busy-guarded restart (no force) -> 200, health 200 attempt 1, clean boot
+(PID 319314, @GCruiseJarvisBot online, 0 errors). Origin/main at deployed HEAD
+(`80a814f`, 0 ahead).
+
+NOTE for future: the three Telegram send sites in bot.ts are now audited and
+correct (slices 15-17). Remaining KNOWN cosmetic-only edges in
+formatForTelegram, deliberately NOT fixed (fallback-covered, not correctness
+bugs): a link URL containing `)` truncates at the first paren (wrong URL, valid
+HTML); nested same-type emphasis like `*a _b_ c*` can produce `<i>..<i>..</i>..</i>`
+(Telegram is lenient; if it ever rejects, the fallback catches it). Not worth
+the regex risk overnight.
+
 ### Security: dependency audit (2026-06-01) - NEEDS EYES-ON
 
 Ran `npm audit` as a longevity check. Findings (prod tree): 9
@@ -1020,6 +1050,12 @@ served `dist/bot.js` dropped `telegramText.slice(0, 4096)` and gained
 WITHOUT force -> 200, `GET /api/health` 200 on poll attempt 1, clean boot
 (PID 315110, "ClaudeClaw online: @GCruiseJarvisBot", DB ready, 0 errors/0
 leaked tokens). Origin/main at deployed HEAD (`907937c`, 0 ahead).
+
+DONE 2026-06-01 ~04:58. Deployed the link-URL quote fix (`80a814f`,
+seventeenth slice). Build exit 0; busy-guarded restart WITHOUT force -> 200,
+health 200 on poll attempt 1, clean boot (PID 319314, "ClaudeClaw online:
+@GCruiseJarvisBot", 0 errors). Origin/main at deployed HEAD (`80a814f`, 0
+ahead).
 
 FOLLOW-UP (refactor, not urgent): the four generators duplicate security
 helpers, but a 2026-06-01 audit found the duplication is NOT uniform - do NOT
