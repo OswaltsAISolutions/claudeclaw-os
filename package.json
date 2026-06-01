@@ -71,6 +71,11 @@
     "vitest": "^2.0.0",
     "wouter-preact": "^3.9.0"
   },
+  "overrides": {
+    "monaco-editor": {
+      "dompurify": "^3.4.1"
+    }
+  },
   "engines": {
     "node": ">=20"
   },
