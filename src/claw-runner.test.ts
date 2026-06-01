@@ -255,4 +255,35 @@ describe('runClaw retry policy', () => {
     expect(res.text).toBe('after timeout');
     expect(res.retryAttempts).toBe(1);
   });
+
+  it('retries at most once: a second stray-XML failure surfaces honestly, never a third spawn', async () => {
+    // Both attempts emit unparseable stray XML. The retry must be bounded to
+    // exactly one (a wedged model must not loop and burn GPU), and the final
+    // result must still carry strayToolSyntax:true so specialists.ts logs the
+    // PERSISTENT failure to hive_mind instead of masking it. The happy-path
+    // stray test pins the cleared-on-success flag; this pins its complement.
+    children.push(makeFakeChild((c) => {
+      c.stdout.emit('data', '<function=read_file>{"path":"/x"}</function>\n');
+    }));
+    children.push(makeFakeChild((c) => {
+      c.stdout.emit('data', '<function=read_file>{"path":"/y"}</function>\n');
+    }));
+    const res = await runClaw({ model: 'qwen3-coder:30b', task: 'go', workspace: '/tmp/ws' });
+    expect(mockSpawn).toHaveBeenCalledTimes(2);
+    expect(res.retryAttempts).toBe(1);
+    expect(res.strayToolSyntax).toBe(true);
+    expect(res.text).toBe('');
+  });
+
+  it('retries at most once: a second wall-clock timeout keeps timedOut set, never a third spawn', async () => {
+    // Neither attempt exits on its own; the wall-clock timer kills both. The
+    // retry stays bounded to one and timedOut survives on the final result so
+    // the caller can see the run genuinely failed twice rather than silently.
+    children.push(makeFakeChild(() => { /* never exits — timer kills it */ }));
+    children.push(makeFakeChild(() => { /* never exits — timer kills it */ }));
+    const res = await runClaw({ model: 'm', task: 'go', workspace: '/tmp/ws', timeoutMs: 20 });
+    expect(mockSpawn).toHaveBeenCalledTimes(2);
+    expect(res.retryAttempts).toBe(1);
+    expect(res.timedOut).toBe(true);
+  });
 });
