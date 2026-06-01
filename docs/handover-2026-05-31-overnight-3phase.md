@@ -1080,6 +1080,69 @@ error/fatal/warn/exception lines from the new PID). Session preserved (8d,
 claude-opus-4-7, telegramConnected true, kill switches intact). Origin/main at
 deployed HEAD (`359c42d`, 0 ahead).
 
+### Reliability fix: retry transient outbound Telegram sends (2026-06-01, twenty-second slice) - DONE + DEPLOYED
+
+Different defect class from slices 18-21 (those were daemon-timer crashes; this
+is silent message LOSS). Outbound Telegram sends had NO transient-failure
+handling. `sendHtmlWithPlainFallback` (bot.ts:300) retries only HTML-PARSE
+failures per chunk; its own comment says "Non-parse errors (network, rate limit,
+bad token) propagate to the caller." That caller chain ends at `bot.catch`
+(bot.ts:1737), which ONLY logs. So on a 429 (flood control - reachable because
+Jarvis streams chunked + progress messages to its single chat, hitting the
+~1 msg/s per-chat limit) or a transient network blip (the SAME grammy HttpError
+class slices 15-17 + oauth-health already proved happens here), a finished Opus
+turn is silently dropped: the expensive work succeeds, the cheap final delivery
+is lost, the operator hears nothing. North-star failure.
+
+Fix: a grammy API transformer (new src/telegram-retry.ts) installed once on the
+SHARED `bot.api.config` right after `new Bot(token)` (bot.ts:977). Because
+ctx.reply, the dashboard relay (startDashboard(bot.api), index.ts:217), and the
+war-room notifications all use that one Api instance, a single install covers
+every send path. Chose an IN-HOUSE transformer over the @grammyjs/auto-retry
+plugin deliberately: zero new dependency surface (respects the dependency
+guardrail the audit item below is flagged under), and full control of scope.
+
+Transformer contract care (it wraps EVERY api call, so correctness is critical -
+verified against grammy's own type defs before writing):
+- Inside a transformer `prev()` RETURNS an ApiResponse; api errors come back as
+  `{ ok:false, error_code, parameters?.retry_after }`, they are NOT thrown.
+  Only network failures throw. The transformer handles both.
+- On success the response is returned VERBATIM.
+- On a PERMANENT api error (4xx) the ok:false response is returned UNCHANGED, so
+  grammy's Api layer still throws the normal GrammyError. We never throw from
+  the transformer on an api error (grammy would mis-wrap it as an HttpError).
+- Retries ONLY transient cases: network errors, 429 (honoring retry_after,
+  seconds->ms, never below backoff, capped at 30s), and 5xx. Bounded at 3
+  retries. A deliberate AbortSignal is never retried (clean shutdown).
+- SCOPED to user-visible delivery methods (sendMessage/Photo/Document/Voice).
+  Deliberately EXCLUDES getUpdates (grammy owns polling retry + the shutdown
+  abort - wrapping it risks the lifecycle) and sendChatAction (ephemeral typing
+  indicator). Non-listed methods pass straight through, zero behavior change.
+
+The retry DECISION is a pure function `decideTelegramRetry(failure, retriesSoFar,
+opts)` so it is fully unit-testable without grammy or a live network. +14 tests
+(src/telegram-retry.test.ts): the pure matrix (network backoff, 429 retry_after
+clamp, 5xx vs 4xx, budget-beats-transience) and the transformer contract
+(verbatim passthrough, non-send untouched, 429-then-success, permanent-4xx
+returned unchanged, network-throw-then-success, budget exhaustion rethrows,
+pre-aborted signal stops immediately).
+
+ACCEPTED TRADEOFF (documented in code): a network blip AFTER the request reached
+Telegram but before the response returned can duplicate one message (classic
+at-least-once). For a single-operator COO bot an occasional dupe is strictly
+better than a silently lost reply.
+
+tsc exit 0, build green, full suite 982 passed / 4 skipped (was 968; +14).
+DEPLOYED via busy-guarded restart (no force) -> 200 (no turn in flight), health
+200 attempt 1, clean boot (PID 347568: DB ready, Orchestrator initialized,
+consolidation enabled, War Room WS proxy active, "Scheduler started (checking
+every 60s)", ollama-proxy listening, dashboard 3141 + war room 7860 up,
+"ClaudeClaw online: @GCruiseJarvisBot" - the getMe/setMyCommands calls behind
+that line went through the now-active transformer's passthrough, live proof it
+doesn't disturb non-send calls; ZERO error/warn/retry lines). Session preserved
+(8d, claude-opus-4-7, telegramConnected true, kill switches intact). Origin/main
+at deployed HEAD (`75ec82c`, 0 ahead).
+
 ### Security: dependency audit (2026-06-01) - NEEDS EYES-ON
 
 Ran `npm audit` as a longevity check. Findings (prod tree): 9
@@ -1263,6 +1326,19 @@ every 60s)", ollama-proxy listening, dashboard 3141 + war room 7860 up,
 grep for error/fatal/warn/unhandled/uncaught/exception across the new PID
 returned NOTHING). Session preserved 8d, claude-opus-4-7, telegramConnected true,
 kill switches intact. Origin/main at deployed HEAD (`359c42d`, 0 ahead).
+
+DONE 2026-06-01 ~05:36. Deployed the transient outbound-send retry transformer
+(`75ec82c`, twenty-second slice: in-house grammy API transformer on the shared
+bot.api.config; retries network/429/5xx on sendMessage/Photo/Document/Voice,
+returns permanent 4xx unchanged, never retries an abort). tsc exit 0, build
+green, full suite 982/4-skipped (+14 telegram-retry tests). Busy-guarded restart
+WITHOUT force -> 200 (no turn in flight), health 200 on poll attempt 1, clean
+boot (PID 347568: DB ready, Orchestrator initialized, "Scheduler started
+(checking every 60s)", ollama-proxy listening, dashboard 3141 + war room 7860
+up, "ClaudeClaw online: @GCruiseJarvisBot"; ZERO error/warn/retry lines - and
+the getMe/setMyCommands calls behind the online line confirm the transformer's
+passthrough works live). Session preserved 8d, telegramConnected true, kill
+switches intact. Origin/main at deployed HEAD (`75ec82c`, 0 ahead).
 
 FOLLOW-UP (refactor, not urgent): the four generators duplicate security
 helpers, but a 2026-06-01 audit found the duplication is NOT uniform - do NOT
