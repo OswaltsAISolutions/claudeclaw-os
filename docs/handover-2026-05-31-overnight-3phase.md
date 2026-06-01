@@ -187,28 +187,45 @@ Closed 14 of 37 at the root (commits `6c07180`, `f86c0bd`, `b1be253`):
 Not deployed: type-only / cleanup, runtime is byte-identical (privacy.ts
 emit unchanged, unused imports tree-shaken already, the .d.ts is not bundled).
 
-REMAINING 23 errors (deferred - these touch the visual centerpiece or need a
-small design call, so they are left for a session where the user can weigh in
-rather than autonomously deleting creative WIP):
+REMAINING 20 errors (17 of 37 now closed after the 2026-06-01 follow-up
+cleared BrainGraph3D's last 3; deferred set touches the visual centerpiece or
+needs a small design call, so they are left for a session where the user can
+weigh in rather than autonomously deleting creative WIP):
 
 | File | Count | What | Why deferred |
 |---|---|---|---|
 | pages/JarvisHome.tsx | 12 | 10 unused shader consts (PLASMA_VERT, ORB_FRAG, CORE_*, SHELL_*, BACKDROP_*, playBootSweep, makeCurvedHologramPlane) + 2 three.js type mismatches (Float32Array@993, OrbUniforms index sig@1596) | orb visual centerpiece; deleting parked shaders / changing render types is a creative+design judgment |
 | pages/Settings.tsx | 6 | 5 unused helper components (Section/Card/Row/Divider/ReadOnlyRow) + CardGroup missing `children`@217 | unused set looks like a parked component kit; CardGroup needs a children decision |
-| components/BrainGraph3D.tsx | 3 | unused locals x@146, radial@202, i@1746 | visual file; low-risk but batch with the visual review |
-| components/SpecialistFloor.tsx | 1 | `tone="warn"`@157 not in Pill `Tone` union | needs a palette/design call (add a `warn` tone + color token) |
+| components/SpecialistFloor.tsx | 1 | `tone="warn"`@157 not in Pill `Tone` union | needs a palette/design call (add a `warn` tone + color token, plus entries in both `Record<Tone>` maps) |
 | components/Sidebar.tsx | 1 | unused `open`@22 (from `sidebarOpen`) | `closeSidebar` is still used, so a mobile drawer may be half-wired; left intact rather than rip out possible WIP |
 
-To finish the gate later: clear these 23, then wire `typecheck:web` into the
+To finish the gate later: clear these 20, then wire `typecheck:web` into the
 `build` script (or a pre-push check) so frontend type errors can never ship
 unchecked again.
 
-### Flaky-test note
+### Reliability follow-ups (2026-06-01) - DONE
 
-`src/agent.test.ts` retry/timeout cases (real ~2-10s waits, e.g. "gives up
-after max retries") occasionally flake under load - saw one spurious
-`1 failed | 509 passed` that went green on immediate re-run. Worth making
-those deterministic (fake timers) so green stays a trustworthy signal.
+Continued the autonomous run with three pure-additive / no-runtime-change
+slices (suite now 518 / 36, build green throughout):
+
+- `web/src/lib/useFetch.test.tsx` (commit `7eba81d`): 8 tests via a tiny
+  Harness component (no renderHook dep) locking the SWR hook every page
+  leans on - cold-start loading flash, ApiError-vs-String error branch,
+  null-path no-op, manual refresh, process-local cache hydration on remount,
+  stale-clear on path change, and polling. Unique paths per test dodge the
+  module-level `_cache` bleed.
+- `src/agent.test.ts` fake timers (commit `a551564`): the retry tests slept
+  through the real backoff (2s, then 8s + jitter), so the file took ~16s and
+  was the source of the occasional full-suite flake (now RESOLVED). Switched
+  to `vi.useFakeTimers()` + `vi.runAllTimersAsync()`. Safe because runAgent
+  always clears its 4s typing `setInterval` in its `finally` before settling,
+  so the pump only drains the retry-loop sleeps and never spins on a live
+  interval. File dropped 16s -> 13ms; whole suite 17s -> ~3.5s.
+- 4 more web tsc errors closed (commit `44aac9e`): matched the useFetch mock's
+  `ApiError` to the real `(status, body, message)` ctor so the call site
+  type-checks, and removed three dead locals in BrainGraph3D (unused
+  `lobeWeights` x param -> `_x`, unused `radial`, unused map index `i`).
+  BrainGraph3D is now tsc-clean.
 
 ## Guardrails in force
 
