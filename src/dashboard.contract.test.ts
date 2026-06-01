@@ -17,6 +17,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import { _initTestDatabase } from './db.js';
 import { buildDashboardApp } from './dashboard.js';
 import { setProcessing } from './state.js';
+import { ALL_CALLSIGNS } from './specialists.js';
 import type { Hono } from 'hono';
 
 const TOKEN = 'test-contract-token';
@@ -642,5 +643,157 @@ describe('POST /api/agents/main/restart busy guard', () => {
 
     const res = await app.request('/api/agents/main/restart?force=1&token=' + TOKEN, { method: 'POST' });
     expect(res.status).toBe(409);
+  });
+});
+
+// ── Additional SPA-depended GET endpoints ────────────────────────────────
+// These endpoint families weren't pinned above. Same rationale as the rest of
+// this suite: the web rewrite consumes their documented shape, so backend
+// drift (a renamed field, changed nullability, a wrong status code) should
+// fail here rather than silently break the frontend. All are DB/config-only
+// reads (no systemd, Ollama, or network), so they resolve deterministically
+// against the in-memory test DB. Endpoints that shell out (/:id/details ->
+// systemctl) or resolve models (/api/specialists -> Ollama) are deliberately
+// excluded so this suite stays hermetic.
+
+describe('GET /api/mission/tasks/:id', () => {
+  it('returns 404 {error} for an unknown id', async () => {
+    const res = await get('/api/mission/tasks/deadbeef');
+    expect(res.status).toBe(404);
+    expect(await jsonOf(res)).toMatchObject({ error: expect.any(String) });
+  });
+
+  it('returns { task } for a task that exists', async () => {
+    const created = await app.request('/api/mission/tasks' + Q, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: 'lookup', prompt: 'do nothing' }),
+    });
+    const { task } = await jsonOf(created);
+    const res = await get('/api/mission/tasks/' + task.id);
+    expect(res.status).toBe(200);
+    const body = await jsonOf(res);
+    expect(body.task).toMatchObject({ id: task.id, title: 'lookup', status: 'queued' });
+  });
+});
+
+describe('GET /api/memories/pinned', () => {
+  it('returns { memories: [] }', async () => {
+    const res = await get('/api/memories/pinned?chatId=test');
+    expect(res.status).toBe(200);
+    expect(await jsonOf(res)).toMatchObject({ memories: expect.any(Array) });
+  });
+});
+
+describe('GET /api/agents/:id/tasks (scheduled)', () => {
+  it('returns { tasks: [] }', async () => {
+    const res = await get('/api/agents/main/tasks');
+    expect(res.status).toBe(200);
+    expect(await jsonOf(res)).toMatchObject({ tasks: expect.any(Array) });
+  });
+});
+
+describe('GET /api/agents/:id/tokens', () => {
+  it('returns todayCost / todayTurns / allTimeCost as numbers', async () => {
+    const res = await get('/api/agents/main/tokens');
+    expect(res.status).toBe(200);
+    expect(await jsonOf(res)).toMatchObject({
+      todayCost: expect.any(Number),
+      todayTurns: expect.any(Number),
+      allTimeCost: expect.any(Number),
+    });
+  });
+});
+
+describe('GET /api/agents/:id/status', () => {
+  it('returns { running: boolean }', async () => {
+    const res = await get('/api/agents/main/status');
+    expect(res.status).toBe(200);
+    expect(await jsonOf(res)).toMatchObject({ running: expect.any(Boolean) });
+  });
+});
+
+describe('GET /api/agents/suggestions', () => {
+  it('returns { suggestions: [] }', async () => {
+    const res = await get('/api/agents/suggestions');
+    expect(res.status).toBe(200);
+    expect(await jsonOf(res)).toMatchObject({ suggestions: expect.any(Array) });
+  });
+});
+
+describe('GET /api/agents/templates', () => {
+  it('returns { templates: [...] }', async () => {
+    const res = await get('/api/agents/templates');
+    expect(res.status).toBe(200);
+    expect(await jsonOf(res)).toMatchObject({ templates: expect.any(Array) });
+  });
+});
+
+describe('GET /api/agents/validate-id', () => {
+  it('flags a format-valid, non-existent id as { ok: true } with { displayName, username } suggestions', async () => {
+    const res = await get('/api/agents/validate-id?id=contractprobe');
+    expect(res.status).toBe(200);
+    const body = await jsonOf(res);
+    expect(body.ok).toBe(true);
+    expect(body.suggestions).toMatchObject({
+      displayName: expect.any(String),
+      username: expect.any(String),
+    });
+  });
+
+  it('flags "main" as reserved { ok: false, error }', async () => {
+    const res = await get('/api/agents/validate-id?id=main');
+    const body = await jsonOf(res);
+    expect(body.ok).toBe(false);
+    expect(body.error).toEqual(expect.any(String));
+  });
+});
+
+describe('GET /api/specialists/stats', () => {
+  it('returns { hours, stats: [] } and clamps hours to [1, 168]', async () => {
+    const res = await get('/api/specialists/stats?hours=9999');
+    expect(res.status).toBe(200);
+    const body = await jsonOf(res);
+    expect(body.hours).toBe(168);
+    expect(body.stats).toBeInstanceOf(Array);
+  });
+});
+
+describe('GET /api/specialists/:callsign/history', () => {
+  it('returns 400 {error} for an unknown callsign', async () => {
+    const res = await get('/api/specialists/not_a_callsign/history');
+    expect(res.status).toBe(400);
+    expect(await jsonOf(res)).toMatchObject({ error: expect.any(String) });
+  });
+
+  it('returns { callsign, turns: [] } for a real callsign', async () => {
+    const cs = ALL_CALLSIGNS[0];
+    const res = await get('/api/specialists/' + cs + '/history');
+    expect(res.status).toBe(200);
+    expect(await jsonOf(res)).toMatchObject({ callsign: cs, turns: expect.any(Array) });
+  });
+});
+
+describe('GET /api/warroom/meetings', () => {
+  it('returns { meetings: [] }', async () => {
+    const res = await get('/api/warroom/meetings');
+    expect(res.status).toBe(200);
+    expect(await jsonOf(res)).toMatchObject({ meetings: expect.any(Array) });
+  });
+});
+
+describe('GET /api/warroom/meeting/:id/transcript', () => {
+  it('returns a { transcript } key even for an unknown meeting', async () => {
+    const res = await get('/api/warroom/meeting/wr_missing/transcript');
+    expect(res.status).toBe(200);
+    expect('transcript' in (await jsonOf(res))).toBe(true);
+  });
+});
+
+describe('GET /api/warroom/text/list', () => {
+  it('returns { ok: true, meetings: [] }', async () => {
+    const res = await get('/api/warroom/text/list');
+    expect(res.status).toBe(200);
+    expect(await jsonOf(res)).toMatchObject({ ok: true, meetings: expect.any(Array) });
   });
 });
