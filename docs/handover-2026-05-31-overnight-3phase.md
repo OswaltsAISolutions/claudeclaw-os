@@ -639,6 +639,41 @@ hooks), pure network/SSE (chat-stream, whose meaty unread-bump logic is
 locked in an EventSource closure), canvas/WebGL (webgl.ts, not
 exercisable under jsdom), or a trivial signal wrapper (sidebar.ts).
 
+### Security: dependency audit (2026-06-01) - NEEDS EYES-ON
+
+Ran `npm audit` as a longevity check. Findings (prod tree): 9
+vulnerabilities (1 critical, 2 high, 6 moderate); 18 incl. dev. Did NOT
+auto-fix: a dependency mutation + redeploy is guardrail-flagged
+hard-to-reverse, and the churn touches runtime libs the test suite does
+not exercise (voice/realtime/Gemini/WhatsApp), so it must be verified
+eyes-on, not blind overnight.
+
+Blast radius (all transitive, none attacker-facing):
+- `protobufjs@7.5.4` (CRITICAL, RCE + DoS) <- `@google/genai`. The RCE
+  needs attacker-controlled protobuf input; here protobuf only decodes
+  Google API responses, so practical exposure is low.
+- `ws@8.19.0` (moderate, uninit memory) <- `@google/genai` and
+  `whatsapp-web.js`>`puppeteer`.
+- `ip-address@10.1.0` <- deep transitive of `whatsapp-web.js`>puppeteer.
+- DOMPurify advisories (ADD_ATTR/ADD_TAGS predicate bypasses) do NOT
+  apply: `markdown.ts` uses ALLOWED_TAGS/ALLOWED_ATTR allowlists, not the
+  ADD_* predicate forms. Our direct dompurify is 3.4.1; the 3.2.7 copy is
+  monaco's isolated bundle. Fix is gated behind a breaking monaco bump
+  and can wait.
+
+Remediation (verified via `npm audit fix --dry-run`):
+- Non-breaking `npm audit fix` resolves the critical protobufjs (=>7.6.2),
+  ws (=>8.21.0), ip-address (=>10.2.0) and an axios NO_PROXY CVE
+  (=>1.16.1), but also bumps hono 4.12.12=>4.12.23 (covered by contract
+  tests), `uuid` 10=>11 (MAJOR), and @daily-co/@pipecat-ai/@google/genai
+  (NOT covered by tests).
+- PREFERRED surgical path: add a package.json `overrides` block forcing
+  only `protobufjs@^7.6.2`, `ws@^8.21.0`, `ip-address@^10.2.0`,
+  `axios@^1.16.1` so the SDK versions and uuid/daily/pipecat stay put;
+  then `npm i`, `npm run build`, full `npx vitest run`, smoke-test
+  Gemini + Voices/WarRoom + WhatsApp, and redeploy via the busy-guarded
+  restart. Queued via spawn_task.
+
 ## Guardrails in force
 
 Push + service-deploy now AUTHORIZED (see intro). Still NO PC restart /
