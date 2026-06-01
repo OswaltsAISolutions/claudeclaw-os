@@ -469,10 +469,26 @@ orphan - meeting `wr_tf7gr3_f40873`, started 2026-05-17 (~14 days prior),
 persists post-restart as expected (the /new flow lazily auto-ends stale text
 meetings per chat). No action taken.
 
-FOLLOW-UP (refactor, not urgent): all four generators now carry byte-identical
-local copies of `escapeHtml` (predating this work) AND `jsLiteral` (added this
-slice). Consolidating both into one shared `src/html-escape.ts` would give a
-single audited security helper. Deferred deliberately - it is a cross-cutting
-refactor touching all four served generators (plus their tests) and is better
-done as a focused, reviewable change than bundled into an overnight slice; the
-duplication is inert and fully test-pinned, so there is no rush.
+FOLLOW-UP (refactor, not urgent): the four generators duplicate security
+helpers, but a 2026-06-01 audit found the duplication is NOT uniform - do NOT
+blind-merge:
+- `jsLiteral` (added this slice): byte-identical across ALL FOUR generators,
+  all server-side. Cleanly extractable to a shared `src/html-escape.ts` that
+  all four import.
+- `escapeHtml`: HETEROGENEOUS.
+  - Server-side 5-char (`& < > " '`): picker, warroom-text-html, warroom-html
+    (behavior-identical; warroom-html's is a one-liner, the other two multi-
+    line). These three are the real escapeHtml consolidation target.
+  - dashboard-html.ts has NO server-side escapeHtml - its only `escapeHtml`
+    (~line 1025) is defined INSIDE the inline `<script>` (client-side, emitted
+    as browser text) and escapes only 3 chars (`& < >`). Adequate for its text-
+    content call sites but it CANNOT be replaced by a server-side import; if
+    normalized, edit the script text directly (ideally up to 5-char).
+  - warroom-html.ts also emits a client-side `escapeHtmlClient` (5-char, null-
+    guarded) into its script - same "it's browser text, can't import" caveat.
+Safe plan: extract `jsLiteral` (all 4) + the server-side `escapeHtml` (picker /
+warroom-text-html / warroom-html) into `src/html-escape.ts`; leave the two
+client-side escapers as in-page text. Fully test-pinned (each generator has its
+own .test.ts with a local jsLiteral mirror), so a regression is caught by
+vitest before any deploy. Still better as a focused, reviewable PR than an
+overnight slice - no rush, the duplication is runtime-inert.
