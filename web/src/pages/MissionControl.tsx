@@ -11,25 +11,10 @@ import { apiPost, apiPatch, apiDelete } from '@/lib/api';
 import { formatRelativeTime } from '@/lib/format';
 import { pushToast } from '@/lib/toasts';
 import { workspaceName } from '@/lib/personalization';
-
-interface MissionTask {
-  id: string;
-  title: string;
-  prompt: string;
-  assigned_agent: string | null;
-  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
-  priority: number;
-  created_by: string;
-  created_at: number;
-  started_at: number | null;
-  completed_at: number | null;
-  result: string | null;
-  error: string | null;
-}
+import { TERMINAL, partitionTasks, statusTone, hasMoreHistory, type MissionTask } from './missionTasks';
 
 interface Agent { id: string; name: string; description: string; running: boolean; }
 
-const TERMINAL: MissionTask['status'][] = ['completed', 'failed', 'cancelled'];
 const HISTORY_PAGE = 30;
 
 type TabKey = 'queue' | 'active' | 'completed' | 'floor';
@@ -68,14 +53,10 @@ export function MissionControl() {
   //          anything already terminal.
   // active = currently running (status='running').
   // Completed/terminal tasks come from the history archive, not this poll.
-  const { queue, active } = useMemo(() => {
-    const all = tasks.data?.tasks ?? [];
-    const queue = all.filter(
-      (t) => !TERMINAL.includes(t.status) && (t.status === 'queued' || !t.assigned_agent),
-    );
-    const active = all.filter((t) => t.status === 'running');
-    return { queue, active };
-  }, [tasks.data]);
+  const { queue, active } = useMemo(
+    () => partitionTasks(tasks.data?.tasks ?? []),
+    [tasks.data],
+  );
 
   async function autoAssignAll() {
     setBulkAssigning(true);
@@ -180,7 +161,7 @@ export function MissionControl() {
                     onChange={refreshAll}
                   />
                 ))}
-                {isCompleted && shown.length < historyTotal && (
+                {isCompleted && hasMoreHistory(shown.length, historyTotal) && (
                   <div class="pt-2 flex justify-center">
                     <button
                       type="button"
@@ -372,7 +353,7 @@ function TaskDetailsModal({
     >
       <div class="space-y-3">
         <div class="flex items-center gap-2 flex-wrap">
-          <Pill tone={t.status as any}>{t.status}</Pill>
+          <Pill tone={statusTone(t.status)}>{t.status}</Pill>
           {t.assigned_agent && (
             <span class="text-[11.5px] text-[var(--color-text-muted)] font-mono uppercase tracking-[0.08em]">@{t.assigned_agent}</span>
           )}
@@ -602,7 +583,7 @@ function TaskRow({
                 @{agent.id}
               </span>
             )}
-            <Pill tone={task.status as any}>{task.status}</Pill>
+            <Pill tone={statusTone(task.status)}>{task.status}</Pill>
             <span class="text-[var(--color-text-faint)] tabular-nums">
               {formatRelativeTime(task.completed_at || task.started_at || task.created_at)}
             </span>

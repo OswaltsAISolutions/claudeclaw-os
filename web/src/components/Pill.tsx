@@ -1,6 +1,6 @@
 import type { ComponentChildren } from 'preact';
 
-type Tone = 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | 'high' | 'medium' | 'low' | 'neutral' | 'accent';
+export type Tone = 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | 'high' | 'medium' | 'low' | 'neutral' | 'accent';
 
 interface Props {
   tone?: Tone;
