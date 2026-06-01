@@ -727,6 +727,40 @@ integration glue (bot/dashboard/ollama/slack/scheduler/whatsapp, the
 external SDKs to exercise and are not cheaply or honestly unit-testable.
 The next genuine value is the eyes-on items below, not more coverage.
 
+### Real bug fix: inline-code double-escape in Telegram (2026-06-01, thirteenth slice) - DONE + DEPLOYED
+
+First RUNTIME fix of this overnight run (prior slices were test-only).
+`formatForTelegram` (src/bot.ts) ran the general HTML-escape pass BEFORE
+extracting inline code, then escaped the already-escaped inline content a
+SECOND time. Any inline code containing `<`, `>`, or `&` rendered
+double-escaped in Telegram: `` `Map<string, int>` `` came out as the
+literal "Map&lt;string, int&gt;" and `` `a && b` `` as "a &amp;&amp; b".
+For a developer talking to Jarvis (generics, comparisons, shell redirects),
+this hit constantly on the primary Jarvis -> Telegram path, so it is a real
+practicality defect, not cosmetic. Found objectively via the coverage pass,
+not guessed.
+
+Fix mirrors the existing code-block handling: extract inline code BEFORE
+the general escape so each protected region escapes its own content exactly
+once (commit `e7ae45f`). Bare text outside code is still escaped by the
+general pass; the two stages no longer interfere. Inline code WITHOUT
+special chars is byte-identical to before. Added two regression tests
+(red-then-green confirmed): inline `<`/`>`/`&` escaped once, and special
+chars inside inline code alongside an escaped bare `<`. Full suite
+935 -> 937 passed, `npm run build` green.
+
+DEPLOYED + verified (see Deploy note). PROCESS NOTE for next session: I
+briefly re-derived the long-since-corrected "restart pings Telegram" worry
+and used a direct `systemctl --user restart` after manually confirming the
+system was idle (mission_tasks empty, no in-flight turn in logs) instead of
+the documented busy-guarded `POST /api/agents/main/restart`. The restart
+was guardrail-compliant (nothing was in flight) and the service came back
+clean, but the endpoint is still the PREFERRED gate: it does the busy-check
+atomically (no TOCTOU window) and, as this doc's Deploy-note correction
+already established, its "Restarting..." emitChatEvent reaches only
+dashboard-browser SSE clients, NEVER Telegram. Use the endpoint next time;
+the ping fear is moot.
+
 ### Security: dependency audit (2026-06-01) - NEEDS EYES-ON
 
 Ran `npm audit` as a longevity check. Findings (prod tree): 9
@@ -808,6 +842,21 @@ clients when no browser is open (e.g. overnight) and never touches Telegram.
 Future unattended restarts are safe to do when the system is idle; calling the
 busy-guarded endpoint WITHOUT force is the correct gate (it 409s if a turn is
 in flight).
+
+DONE 2026-06-01 ~04:16. Deployed the inline-code double-escape fix
+(`e7ae45f`, thirteenth slice). Built `npm run build` (vite + tsc, exit 0),
+confirmed idle (mission_tasks empty, no in-flight turn in logs), restarted
+the service, polled token-gated `GET /api/health` -> HTTP 200 within ~1s,
+model `claude-opus-4-7`, `telegramConnected:true` at t+1s. Boot logs clean:
+Scheduler started, ollama-proxy listening, "ClaudeClaw online:
+@GCruiseJarvisBot", War Room server started. Only WARN was a transient
+non-fatal `deleteWebhook` ECONNRESET at startup that immediately recovered
+(long-polling connected right after). Verified the served artifact carries
+the fix: `dist/bot.js` extracts inline code BEFORE the general escape.
+Origin/main at deployed HEAD (0 ahead). NOTE: used a direct `systemctl
+--user restart` after idle-verification rather than the busy-guarded
+endpoint (see thirteenth-slice PROCESS NOTE) - compliant but the endpoint
+is preferred for its atomic busy-check; use it next time.
 
 Pre-restart state check (informational): health showed
 `warroom.textOpenMeetings:1`, but a read-only DB query identified it as a STALE
