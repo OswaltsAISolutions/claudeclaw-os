@@ -133,8 +133,9 @@ Deliberately NOT done (these two stale items contradict current design):
 
 UI note: changes are verified by tsc + the full test suite + matching the
 independently-read backend contracts. They were NOT browser-verified: the
-dashboard needs a live backend, an auth token, and seeded mission data,
-and the running service is the old build (deploy is gated, see below).
+dashboard needs a live backend, an auth token, and seeded mission data. (At
+the time of writing the running service was the old build; it has since been
+rebuilt and deployed - see Deploy note.)
 
 ## Post-Phase-2 - continued autonomous run (2026-06-01)
 
@@ -386,6 +387,34 @@ Assessed-and-skipped this slice (poor extraction-to-value ratio - the
 meaningful behavior IS the I/O): `daily-client.ts`, `slack.ts`, `whatsapp.ts`
 (thin network / SDK wrappers with only trivial inline pure bits).
 
+Batch C (2 commits, web typecheck cleanup, 747 -> 748 tests) - deployed with
+Batch B's hardening in the 02:16 restart (see Deploy note):
+- `web/src/components/Pill.tsx` + `Pill.test.tsx` (commit `2c471a3`): added the
+  missing `warn` tone. SpecialistFloor renders `<Pill tone="warn">` for a
+  specialist that fell back from another model, but `warn` was absent from the
+  `Tone` union, `TONE_STYLE`, and `StatusDot`'s colorMap - both a tsc error
+  (TS2322) AND a runtime bug (`TONE_STYLE['warn']` was undefined, so the
+  fallback pill rendered with no palette class). Mapped to the amber
+  `--color-priority-medium` token; pinned with a test.
+- `web/src/pages/Settings.tsx` (commit `73e5977`): cleared the remaining safe
+  Settings tsc errors. (1) SpecialistRoutingGroup's error branch rendered a
+  childless `<CardGroup/>` (TS2322 + an empty bordered box at runtime) - gave it
+  a body row mirroring the sibling loading state, matching the established
+  "every CardGroup has children" convention (it is the only childless call in
+  the codebase) rather than weakening the shared component's required-children
+  contract. (2) Removed five unused, unexported layout primitives (Section /
+  Card / Row / Divider / ReadOnlyRow), compiler-confirmed dead (TS6133),
+  superseded by the CardGroup / CardRow iOS components the page now uses.
+
+Web tsc errors: 19 -> 13. The remaining 13 stay DEFERRED: 12 in JarvisHome.tsx
+(WIP Three.js orb - 10 unused shader consts/fns + 2 Float32Array / OrbUniforms
+type mismatches; unverifiable overnight + visual-taste guardrail) and 1 in
+Sidebar.tsx (`open` / `sidebarOpen` are vestiges of a mobile slide-in drawer;
+the component now uses `hidden md:flex` per a bottom-tab-bar comment - removing
+vs. re-wiring is an unresolved mobile-UX product call, not a blind overnight
+edit). Wiring `typecheck:web` into the build / pre-push gate stays blocked on
+these 13.
+
 ## Guardrails in force
 
 Push + service-deploy now AUTHORIZED (see intro). Still NO PC restart /
@@ -406,33 +435,39 @@ of Phases 0-2 are now live. Origin/main at the deployed HEAD (0 ahead).
 Next deploys this session follow the same gate: build + full vitest green,
 commit, push, restart, verify health 200 + clean logs.
 
-PENDING (2026-06-01 third slice): an HTML-generator inline-`<script>`
-hardening across THREE served-code commits is pushed but NOT yet live -
-warroom-text-picker (`71ac15a`), dashboard-html (`5515c8f`), and the voice +
-text War Room pages (`85afded`). All FOUR HTML generators now route their
-`<script>` JS constants (TOKEN / CHAT_ID / MEETING_ID) through a `jsLiteral()`
-that escapes `<` `>` `&`, and dashboard-html additionally builds its War Room
-onclick from runtime constants via encodeURIComponent. Deliberately deferred:
-functional impact on real traffic is nil (output only changes when a token /
-chatId / meetingId contains `<` `>` `&`, which operator tokens, numeric
-Telegram chatIds, and WARROOM_TEXT_ID_RE-validated meetingIds never do), so an
-unattended restart was judged not worth its specific cost: the main-restart
-handler (dashboard.ts ~2718) emits a Telegram message to ALLOWED_CHAT_ID
-worded "Restarting the service now. Any in-flight task did not finish." -
-which would ping the sleeping operator at ~01:50 with an inaccurate
-"you lost work" message for a change that alters nothing on real traffic. The
-other two third-slice source edits (`ollama-prefix-proxy`, `dashboard`) are
-export-only and byte-identical at runtime, so they need no deploy at all.
+DONE 2026-06-01 ~02:16. The third-slice HTML-generator hardening (commits
+`71ac15a`, `5515c8f`, `85afded`) PLUS the two web-typecheck fixes in Batch C
+(`2c471a3`, `73e5977`) are now LIVE. Ran `npm run build` (vite + tsc, exit 0,
+new SPA bundle `index-BoXSMnhU.js`), then restarted via the busy-guarded
+`POST /api/agents/main/restart` WITHOUT `?force=true` - it returned 200 (not
+409), proving no agent turn was in flight. Service recovered in ~1s: systemd
+`active`, `NRestarts=0` (clean restart, not a crash loop); `GET /api/health`
+200 with model `claude-opus-4-7` + `telegramConnected:true`; the same session
+preserved (turns/age unchanged); logs clean. Confirmed the new code is actually
+served: `GET /` references the new bundle hash `index-BoXSMnhU.js` (frontend
+live) and `GET /warroom?mode=voice` returns 200 / 75970 bytes with the inline
+`const TOKEN =` constant present (backend generator live). Origin/main at the
+deployed HEAD (`73e5977`, 0 ahead).
 
-`dist/` IS already rebuilt (2026-06-01 ~01:56) and verified to contain the
-hardening (jsLiteral present in all four dist/*-html.js, plus
-encodeURIComponent(TOKEN) in dist/dashboard-html.js), so the change is armed:
-ANY restart (the next active-window deploy, or any natural/systemd restart)
-picks it up cleanly with no further build step. Only the restart itself is
-deferred. Action for the next active window: restart via the busy-guarded
-`POST /api/agents/main/restart` (or bundle with the next served-code change)
-and verify health 200. Origin/main is otherwise at the deployed HEAD plus
-these pushed-but-runtime-inert commits.
+CORRECTION to the prior deferral reasoning: the feared "2am operator ping" was
+a MISREAD and does NOT occur. The restart handler (dashboard.ts ~2718) calls
+`emitChatEvent({ type:'assistant_message', source:'dashboard', ... })`, which
+only `.emit`s on the in-process `chatEvents` EventEmitter. Its ONLY production
+subscriber is the `/api/chat/stream` SSE endpoint (dashboard.ts:3874), which
+forwards events to connected DASHBOARD BROWSERS only. There is no
+chatEvents->Telegram bridge (the bot PRODUCES these events to mirror chats into
+the dashboard; it does not consume them). So the restart message reaches zero
+clients when no browser is open (e.g. overnight) and never touches Telegram.
+Future unattended restarts are safe to do when the system is idle; calling the
+busy-guarded endpoint WITHOUT force is the correct gate (it 409s if a turn is
+in flight).
+
+Pre-restart state check (informational): health showed
+`warroom.textOpenMeetings:1`, but a read-only DB query identified it as a STALE
+orphan - meeting `wr_tf7gr3_f40873`, started 2026-05-17 (~14 days prior),
+`entry_count:0`, last transcript entry the same timestamp. Not live work; it
+persists post-restart as expected (the /new flow lazily auto-ends stale text
+meetings per chat). No action taken.
 
 FOLLOW-UP (refactor, not urgent): all four generators now carry byte-identical
 local copies of `escapeHtml` (predating this work) AND `jsLiteral` (added this
