@@ -298,13 +298,72 @@ extraction, which is behavior-identical and the feature is opt-in/off.
   `routerFallback` determinism, and prompt builders neutralizing `"""`
   delimiters in untrusted user text / roster descriptions / replies.
 
-Remaining untested-but-candidate modules (for a future slice; each needs
-either heavier mocking or a judgment call): `agent-config.ts`, `config.ts`
-(pure helpers, but reads files at module load), `env-write.ts` (file writes),
-`slack.ts` / `whatsapp.ts` / `daily-client.ts` (network clients), the
-`*-html.ts` template strings (low value), and `orchestrator.ts` (large,
-side-effecting). The web typecheck gate (20 deferred errors above) is still
-the other open longevity item.
+Remaining untested-but-candidate modules: see the third slice below, which
+cleared `agent-config` / `config` / `env-write` / `orchestrator` and the
+`ollama-prefix-proxy` + `dashboard` primitives, and assessed-and-skipped the
+thin network clients (`slack` / `whatsapp` / `daily-client`). Still open: the
+big `*-html.ts` template strings (low value), `meet-cli.ts` / `index.ts` (CLI /
+boot entry, side-effecting), and the web typecheck gate (20 deferred errors
+above) as the other longevity item.
+
+### Coverage expansion (2026-06-01, third slice) - DONE
+
+Two more coverage batches. Every change is test-only or an
+export-only/behaviour-preserving source tweak; full `tsc` + vitest green
+throughout; all pushed. Suite grew 633 -> 730 passed (4 skipped, 54 files).
+
+Batch A (6 commits, 633 -> 687) - previously-uncovered pure helpers:
+- `src/env-write.test.ts` (10): atomicEnvWrite + setEnvKey vs a /tmp dir -
+  0o600 perms, full overwrite, no .tmp leftover, in-place first-occurrence key
+  replace preserving order/comments, prefix-collision safety, round-trip.
+- `src/agent-config.test.ts` (9): AGENT_ID_RE path-traversal guard (accepts
+  valid incl. uppercase; rejects '', '..', '../etc/passwd', slashes, abs,
+  dots/spaces); agentExists pre-fs reject; resolveAgentDir fallback shape.
+- `src/orchestrator.test.ts` (14): parseDelegation for `/delegate <id> <prompt>`
+  and `@id: <prompt>` (case-insensitivity, lazy colon capture, hyphen ids,
+  empty-registry guard against bare `@id` false positives, incomplete -> null).
+- `src/agent-create.test.ts` (10): validateAgentId VALID_ID_RE (lowercase,
+  leading-letter, max 30, reserved 'main'); suggestBotNames; pickAgentColor
+  palette + modulo wrap. (Flagged validateAgentId's dead leading-underscore
+  check via spawn_task for the user to prune.)
+- `src/config.test.ts` (7): expandHome (~ / ~/sub / bare ~ / ~/ keeps trailing
+  slash / leaves abs+rel+~foo untouched); setAgentOverrides +
+  updateAgentSystemPrompt pushing into the live ESM bindings.
+- `src/ollama.ts` + `.test.ts` (4): extracted the pure `buildOllamaUrlFromHost`
+  (full-URL verbatim, strip one trailing slash, host:port gets http scheme,
+  bare host gets fallback port) out of resolveOllamaBaseUrl and rewired it (one
+  source of truth). Behavior-identical.
+
+Batch B (3 commits, 687 -> 730) - security/reliability primitives:
+- `src/warroom-text-picker-html.ts` + `.test.ts` (commit `71ac15a`, 7 tests):
+  hardened the inline-`<script>` embedding. getWarRoomPickerHtml put token /
+  chatId into a `<script>` block via JSON.stringify alone, which leaves
+  `<` `>` `&` intact so a value containing `</script>` could break out. Added a
+  `jsLiteral()` helper escaping those three as < / > / & (decoded
+  value identical at parse time, source inert) and rewired jsToken / jsChatId.
+  Tests pin both sinks: the escapeHtml Back-link href and the jsLiteral script
+  constants. THIS is the one served-code change of the segment - see Deploy
+  note (functional impact is nil for real tokens; only triggers on HTML-metachar
+  input that operator tokens never contain).
+- `src/ollama-prefix-proxy.ts` + `.test.ts` (commit `ac0cf84`, 28 tests):
+  exported and pinned the five pure helpers that make local Qwen3 specialists
+  usable - stripRoutingPrefix (drops openai/xai/grok/qwen/kimi prefixes,
+  preserves unknown like huihui_ai/), isQwen3Family, stripThinkingTags (closed +
+  unclosed `<think>` blocks), and the cross-fragment streaming state machine
+  stripFromContent + processSseLine (drops `<think>` content split across SSE
+  chunks for both OpenAI-compat delta and Ollama-native message shapes).
+  Export-only, behavior-identical.
+- `src/dashboard.ts` + `.test.ts` (commit `bfd74fd`, 8 tests): exported and
+  pinned the auth/input guards - safeTokenEqual (constant-time compare, audit
+  A4E-1, incl. the null/empty + length-mismatch short-circuits that keep
+  timingSafeEqual from throwing) and the WARROOM_TEXT_ID_RE / CLIENT_MSG_ID_RE
+  validators (accept the documented shapes; reject wrong prefix/version/variant,
+  traversal attempts, illegal chars). Export-only; contract tests still cover
+  auth over HTTP, these pin the primitives.
+
+Assessed-and-skipped this slice (poor extraction-to-value ratio - the
+meaningful behavior IS the I/O): `daily-client.ts`, `slack.ts`, `whatsapp.ts`
+(thin network / SDK wrappers with only trivial inline pure bits).
 
 ## Guardrails in force
 
@@ -325,3 +384,17 @@ Token-gated `GET /api/health` returns HTTP 200 with model
 of Phases 0-2 are now live. Origin/main at the deployed HEAD (0 ahead).
 Next deploys this session follow the same gate: build + full vitest green,
 commit, push, restart, verify health 200 + clean logs.
+
+PENDING (2026-06-01 third slice): the warroom-text-picker `jsLiteral`
+hardening (commit `71ac15a`) is the only served-code change since the last
+restart and is NOT yet live. Deliberately deferred: its functional impact on
+real traffic is nil (it only changes output when a token / chatId contains
+`<` `>` `&`, which operator tokens never do), so an unattended overnight
+restart of the live Jarvis service was judged not worth the small downtime /
+in-flight-interruption risk for a never-triggered code path. The other two
+third-slice source edits (`ollama-prefix-proxy`, `dashboard`) are export-only
+and byte-identical at runtime, so they need no deploy at all. Action for the
+next active window: `npm run build` then restart via the busy-guarded
+`POST /api/agents/main/restart` (or bundle with the next served-code change)
+and verify health 200. Origin/main is otherwise at the deployed HEAD plus
+these three pushed-but-runtime-inert commits.
