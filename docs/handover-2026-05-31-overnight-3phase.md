@@ -523,6 +523,17 @@ blind-merge:
 Safe plan: extract `jsLiteral` (all 4) + the server-side `escapeHtml` (picker /
 warroom-text-html / warroom-html) into `src/html-escape.ts`; leave the two
 client-side escapers as in-page text. Fully test-pinned (each generator has its
-own .test.ts with a local jsLiteral mirror), so a regression is caught by
-vitest before any deploy. Still better as a focused, reviewable PR than an
-overnight slice - no rush, the duplication is runtime-inert.
+own .test.ts with a local jsLiteral mirror, and as of the fourth slice all four
+also pin the `</script>` breakout contract), so a regression is caught by vitest
+before any deploy. Still better as a focused, reviewable PR than an overnight
+slice - no rush, the duplication is runtime-inert.
+
+VERIFIED 2026-06-01 (read all escapeHtml bodies, de-risking the future PR): the
+three server-side browser copies ARE behavior-identical - same five chars in the
+same `&`-first order, same entities (`&amp; &lt; &gt; &quot; &#39;`); only the
+formatting differs (warroom-html one-liner vs the other two multi-line). So they
+merge with zero output change. CAVEAT discovered while censusing: `bot.ts` (~line
+157) ALSO defines a server-side `escapeHtml`, but it is 3-char (`& < >`) on
+purpose - it feeds Telegram's HTML parse mode, a different sink where `& < >` is
+the complete/correct set. Do NOT fold bot.ts's escaper into the browser
+`html-escape.ts`; they are different contexts that happen to share a name.
