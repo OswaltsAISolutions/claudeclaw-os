@@ -1112,7 +1112,7 @@ function BootSequence({ onComplete, onFinalFlash, orbRef }: {
  * values = more distortion. 220 reads as "patchy transmission" without
  * crushing intelligibility. Public-domain DSP, no library needed.
  */
-function makeGlitchCurve(amount: number): Float32Array {
+function makeGlitchCurve(amount: number): Float32Array<ArrayBuffer> {
   const samples = 44100;
   const curve = new Float32Array(samples);
   const deg = Math.PI / 180;
@@ -1286,6 +1286,10 @@ function playBootSweep() {
 // ──────────────────────────────────────────────────────────────────────
 
 interface OrbUniforms {
+  // Index signature so the object satisfies THREE.ShaderMaterial's
+  // `{ [uniform: string]: IUniform }` parameter. The named fields below keep
+  // their strict value types for typo-safe per-frame updates in tick().
+  [uniform: string]: THREE.IUniform;
   uTime: { value: number };
   uIdle: { value: number };
   uAmp: { value: number };
@@ -2707,3 +2711,26 @@ void main() {
   gl_FragColor = vec4(col * uFade, clamp(alpha, 0.0, 1.0));
 }
 `;
+
+// ── Retained orb-redesign WIP (intentionally unwired) ────────────────────
+// The layered-orb shaders above (plasma / inner-core / shell / backdrop) and
+// the curved-hologram + boot-sweep helpers are authored and tuned but not yet
+// wired into OrbController, which still runs the shipped DENSE_SHELL design.
+// They are kept on purpose (see the playBootSweep note near exitBootMode:
+// "still defined below in case we ever want to bring it back"). This single
+// reference marks them as read so the strict `noUnusedLocals` web typecheck can
+// gate the build without dropping the in-progress work. It is side-effect free
+// (just reads const bindings), so the bundler tree-shakes it and the unused
+// shaders out of production: no runtime, bundle, or visual change.
+void [
+  PLASMA_VERT,
+  ORB_FRAG,
+  CORE_VERT,
+  CORE_FRAG,
+  SHELL_VERT,
+  SHELL_FRAG,
+  BACKDROP_VERT,
+  BACKDROP_FRAG,
+  makeCurvedHologramPlane,
+  playBootSweep,
+];

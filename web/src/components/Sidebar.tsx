@@ -5,7 +5,7 @@ import { WorkspaceSwitcher } from './WorkspaceSwitcher';
 import { commandPaletteOpen } from '@/lib/command-palette';
 import { chatUnread } from '@/lib/chat-stream';
 import { useFetch } from '@/lib/useFetch';
-import { sidebarOpen, closeSidebar } from '@/lib/sidebar';
+import { closeSidebar } from '@/lib/sidebar';
 import {
   collapsedSections,
   toggleSectionCollapsed,
@@ -19,7 +19,6 @@ export function Sidebar() {
   const [pathname] = useLocation();
   const collapsed = collapsedSections.value;
   const modLabel = modKeyLabel();
-  const open = sidebarOpen.value;
 
   // Mobile: fixed drawer that slides in from the left. Desktop (>=md):
   // always-visible inline column. Tailwind's `md:` prefix flips between
