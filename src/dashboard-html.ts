@@ -1,16 +1,4 @@
-/**
- * JSON-encode a string for safe embedding inside an inline <script> block.
- * JSON.stringify alone leaves "<", ">", and "&" intact, so a value containing
- * "</script>" or "<!--" could break out of the script element. Escaping those
- * three as < / > / & keeps the decoded value byte-for-byte
- * identical at JS parse time while making the source inert.
- */
-function jsLiteral(s: string): string {
-  return JSON.stringify(s)
-    .replace(/</g, '\\u003c')
-    .replace(/>/g, '\\u003e')
-    .replace(/&/g, '\\u0026');
-}
+import { jsLiteral } from './html-escape.js';
 
 export function getDashboardHtml(token: string, chatId: string, warroomEnabled = false): string {
 const WARROOM_ENABLED = warroomEnabled;
