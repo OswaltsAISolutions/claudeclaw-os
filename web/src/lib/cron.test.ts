@@ -91,6 +91,44 @@ describe('describeCron', () => {
       text: 'Unsupported cron syntax — try a simpler form like "0 9 * * *"',
     });
   });
+
+  it('joins a two-day custom set with "and" (no comma)', () => {
+    // joinList uses ' and ' for exactly two items; the three-plus path uses
+    // the Oxford comma. This pins the two-item branch for day-of-week.
+    expect(describeCron('0 9 * * 2,4')).toEqual({ ok: true, text: 'At 9 AM on Tue and Thu' });
+  });
+
+  it('lists a six-day custom set with an Oxford comma', () => {
+    expect(describeCron('0 9 * * 1-6')).toEqual({
+      ok: true,
+      text: 'At 9 AM on Mon, Tue, Wed, Thu, Fri, and Sat',
+    });
+  });
+
+  it('describes a multi-month restriction', () => {
+    expect(describeCron('0 9 * 1,6,12 *')).toEqual({
+      ok: true,
+      text: 'At 9 AM in Jan, Jun, and Dec',
+    });
+  });
+
+  it('treats dow 0-7 (8 values incl. both Sundays) as every day', () => {
+    expect(describeCron('0 9 * * 0-7')).toEqual({ ok: true, text: 'Every day at 9 AM' });
+  });
+
+  it('enumerates step-minutes inside a single fixed hour', () => {
+    expect(describeCron('*/15 9 * * *')).toEqual({
+      ok: true,
+      text: 'Every day at 9 AM, 9:15 AM, 9:30 AM, and 9:45 AM',
+    });
+  });
+
+  it('rejects a zero step (divide-by-zero guard)', () => {
+    expect(describeCron('*/0 * * * *')).toEqual({
+      ok: false,
+      text: 'Unsupported cron syntax — try a simpler form like "0 9 * * *"',
+    });
+  });
 });
 
 describe('parseSchedule', () => {
@@ -123,6 +161,17 @@ describe('parseSchedule', () => {
     expect(parseSchedule('0,30 9 * * *')?.times).toEqual([
       { h: 9, m: 0 },
       { h: 9, m: 30 },
+    ]);
+  });
+
+  it('expands a multi-hour multi-minute field into the full cross product', () => {
+    // cron fires the cartesian product of the minute and hour lists; the
+    // picker model must enumerate every (h, m) pair so it does not drop times.
+    expect(parseSchedule('0,30 9,17 * * *')?.times).toEqual([
+      { h: 9, m: 0 },
+      { h: 9, m: 30 },
+      { h: 17, m: 0 },
+      { h: 17, m: 30 },
     ]);
   });
 
@@ -183,6 +232,22 @@ describe('buildSchedule', () => {
     expect(out.warning).toContain('2 extra combinations');
   });
 
+  it('does not warn when the full minute x hour grid is present', () => {
+    // Complement of the cross-product warning: when every (h, m) combination
+    // is explicitly listed, the emitted cron fires exactly those and nothing
+    // extra, so there must be no warning.
+    const out = buildSchedule({
+      times: [
+        { h: 9, m: 0 },
+        { h: 9, m: 30 },
+        { h: 17, m: 0 },
+        { h: 17, m: 30 },
+      ],
+      days: { kind: 'every' },
+    });
+    expect(out).toEqual({ cron: '0,30 9,17 * * *', warning: undefined });
+  });
+
   it('defaults empty custom days to every day with a warning', () => {
     const out = buildSchedule({ times: [{ h: 9, m: 0 }], days: { kind: 'custom', dows: [] } });
     expect(out.cron).toBe('0 9 * * *');
@@ -193,7 +258,14 @@ describe('buildSchedule', () => {
 describe('parse/build round-trip', () => {
   // For every picker-representable expression, parse then build must return
   // an equivalent cron (the picker must never silently rewrite a schedule).
-  const cases = ['0 9 * * *', '30 7 * * 1-5', '0 9 * * 0,6', '0 9 * * 1,3,5', '0,30 9 * * *'];
+  const cases = [
+    '0 9 * * *',
+    '30 7 * * 1-5',
+    '0 9 * * 0,6',
+    '0 9 * * 1,3,5',
+    '0,30 9 * * *',
+    '0,30 9,17 * * *',
+  ];
   for (const cron of cases) {
     it(`round-trips ${cron}`, () => {
       const model = parseSchedule(cron) as SchedModel;
