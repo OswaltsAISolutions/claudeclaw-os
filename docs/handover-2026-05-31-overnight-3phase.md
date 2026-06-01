@@ -808,6 +808,43 @@ current code path logs a secret that way, and a non-mutating deep clone on
 every log call is cost/risk not worth paying until something needs it. The
 request logger already logs only `path`, never the `?token=` query string.
 
+### Real bug fix: Telegram plain-text fallback data loss (2026-06-01, fifteenth slice) - DONE + DEPLOYED
+
+Third RUNTIME fix of the run, on the north-star Jarvis->Telegram delivery
+path. `sendTelegramSafe` already had a "if Telegram rejects our HTML, resend
+as plain text" guard so a malformed-HTML reply never silently vanishes. But
+the fallback was wrong in two ways:
+- It did `await ctx.reply(text.slice(0, 4096)); return;`. For a reply long
+  enough to span multiple 4096-char chunks, the very chunk that fails is
+  usually NOT the first, so slicing the WHOLE original text from 0 both
+  re-sent already-delivered chunks (DUPLICATE) and dropped everything past
+  4096 (DATA LOSS). It also shipped the raw HTML SOURCE (tags + `&lt;`
+  entities) as the "plain" text.
+- The delegation/specialist reply path bypassed `sendTelegramSafe` entirely
+  with a bare `parse_mode:'HTML'` loop, so a specialist answer with malformed
+  HTML could silently fail to reach the operator with no fallback at all.
+
+Fix (`src/bot.ts`, commit `6cfd204`):
+- New `htmlToPlain()` (exported, unit-tested): best-effort inverse of
+  `formatForTelegram` for the fallback only. Links become `text (url)` so the
+  URL survives; the limited tag set we emit (`b/i/s/u/code/pre/a`) is stripped
+  open-or-closed/balanced-or-not (the trigger is usually a `<pre>` cut across
+  the 4096 boundary => unbalanced tag); unescapes `&lt; &gt; &amp;` with
+  `&amp;` LAST so the others are not re-mangled.
+- `sendTelegramSafe` fallback is now PER-CHUNK: only the failing chunk is
+  re-sent (htmlToPlain'd + re-split to respect the length cap), then `continue`
+  so later valid-HTML chunks still send. No drop, no duplicate.
+- Routed the delegation response through `sendTelegramSafe` instead of the
+  bare HTML loop.
+
+Verified: 9 new tests (htmlToPlain link/tag/entity handling; sendTelegramSafe
+HTML-happy-path, parse-error fallback, non-format error re-throw, and a
+multi-part regression asserting the failing chunk reaches the user as plain
+text while chunk A is sent exactly once - no drop, no dup). Full suite 952 ->
+961 passed / 4 skipped, tsc + build green. DEPLOYED via the busy-guarded
+`POST /api/agents/main/restart` (no force); health 200 on attempt 1, clean
+boot (@GCruiseJarvisBot online, 0 errors/0 leaked tokens on the new PID).
+
 ### Security: dependency audit (2026-06-01) - NEEDS EYES-ON
 
 Ran `npm audit` as a longevity check. Findings (prod tree): 9
@@ -927,6 +964,17 @@ compiled `dist/logger.js` under real node and both a grammy-shaped nested
 error and a plain `?token=` message rendered `<redacted>`. Origin/main at
 deployed HEAD (`a0a5088`, 0 ahead). Same stale `wr_tf7gr3_f40873` orphan
 meeting still present, still irrelevant.
+
+DONE 2026-06-01 ~04:47. Deployed the Telegram plain-text fallback data-loss
+fix (`6cfd204`, fifteenth slice). Built `npm run build` (vite + tsc, exit 0),
+confirmed `dist/bot.js` carries the new code (`htmlToPlain` present, per-chunk
+"sending chunk as plain text" marker present), restarted via the busy-guarded
+`POST /api/agents/main/restart` WITHOUT `?force=true` -> 200 (no turn in
+flight). Service recovered <1s: `GET /api/health` 200 on poll attempt 1,
+@GCruiseJarvisBot online, DB ready, scheduler + ollama-proxy + War Room all
+up. New PID (309880) boot journal clean: 0 errors/warn/fatal (the lone WARN in
+the window was my own earlier tokenless `/api/health` 401 probe on the OLD
+PID, not the new process). Origin/main at deployed HEAD (`6cfd204`, 0 ahead).
 
 FOLLOW-UP (refactor, not urgent): the four generators duplicate security
 helpers, but a 2026-06-01 audit found the duplication is NOT uniform - do NOT
