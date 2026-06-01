@@ -334,7 +334,7 @@ Batch A (6 commits, 633 -> 687) - previously-uncovered pure helpers:
   bare host gets fallback port) out of resolveOllamaBaseUrl and rewired it (one
   source of truth). Behavior-identical.
 
-Batch B (4 commits, 687 -> 738) - security/reliability primitives:
+Batch B (5 commits, 687 -> 747) - security/reliability primitives:
 - `src/warroom-text-picker-html.ts` + `.test.ts` (commit `71ac15a`, 7 tests):
   hardened the inline-`<script>` embedding. getWarRoomPickerHtml put token /
   chatId into a `<script>` block via JSON.stringify alone, which leaves
@@ -372,6 +372,15 @@ Batch B (4 commits, 687 -> 738) - security/reliability primitives:
   have corrupted the URL). The legacy page is off by default
   (`DASHBOARD_LEGACY`) and token-gated, so practical severity is low; this is
   the SECOND served-code change of the slice - see Deploy note.
+- `src/warroom-html.ts` + `src/warroom-text-html.ts` + tests (commit `85afded`,
+  9 tests): completed the HTML-generator consistency audit. Both War Room pages
+  had the same bare-`JSON.stringify`-into-`<script>` pattern for TOKEN /
+  CHAT_ID (and MEETING_ID on the text page); their HTML-attribute reflections
+  were already escapeHtml'd. Added a local `jsLiteral()` to each and routed the
+  script constants through it. All four generators (picker, dashboard-html,
+  warroom voice, warroom text) now share the dual-guard pattern: escapeHtml for
+  attribute contexts, jsLiteral for `<script>` constants. THIRD served-code
+  change - see Deploy note + the consolidation follow-up there.
 
 Assessed-and-skipped this slice (poor extraction-to-value ratio - the
 meaningful behavior IS the I/O): `daily-client.ts`, `slack.ts`, `whatsapp.ts`
@@ -397,13 +406,16 @@ of Phases 0-2 are now live. Origin/main at the deployed HEAD (0 ahead).
 Next deploys this session follow the same gate: build + full vitest green,
 commit, push, restart, verify health 200 + clean logs.
 
-PENDING (2026-06-01 third slice): TWO served-code changes since the last
-restart are pushed but NOT yet live - the warroom-text-picker `jsLiteral`
-hardening (commit `71ac15a`) and the matching dashboard-html chatId hardening
-(commit `5515c8f`). Both are deliberately deferred: their functional impact on
-real traffic is nil (output only changes when a token / chatId contains
-`<` `>` `&` or, for the dashboard onclick, a `&` / space in the token - none
-of which operator tokens or numeric Telegram chatIds ever contain), so an
+PENDING (2026-06-01 third slice): an HTML-generator inline-`<script>`
+hardening across THREE served-code commits is pushed but NOT yet live -
+warroom-text-picker (`71ac15a`), dashboard-html (`5515c8f`), and the voice +
+text War Room pages (`85afded`). All FOUR HTML generators now route their
+`<script>` JS constants (TOKEN / CHAT_ID / MEETING_ID) through a `jsLiteral()`
+that escapes `<` `>` `&`, and dashboard-html additionally builds its War Room
+onclick from runtime constants via encodeURIComponent. Deliberately deferred:
+functional impact on real traffic is nil (output only changes when a token /
+chatId / meetingId contains `<` `>` `&`, which operator tokens, numeric
+Telegram chatIds, and WARROOM_TEXT_ID_RE-validated meetingIds never do), so an
 unattended restart was judged not worth its specific cost: the main-restart
 handler (dashboard.ts ~2718) emits a Telegram message to ALLOWED_CHAT_ID
 worded "Restarting the service now. Any in-flight task did not finish." -
@@ -412,11 +424,20 @@ which would ping the sleeping operator at ~01:50 with an inaccurate
 other two third-slice source edits (`ollama-prefix-proxy`, `dashboard`) are
 export-only and byte-identical at runtime, so they need no deploy at all.
 
-`dist/` IS already rebuilt (2026-06-01 ~01:49) and verified to contain the
-hardening (jsLiteral + encodeURIComponent(TOKEN) in dist/dashboard-html.js),
-so the change is armed: ANY restart (the next active-window deploy, or any
-natural/systemd restart) picks it up cleanly with no further build step. Only
-the restart itself is deferred. Action for the next active window: restart via
-the busy-guarded `POST /api/agents/main/restart` (or bundle with the next
-served-code change) and verify health 200. Origin/main is otherwise at the
-deployed HEAD plus these pushed-but-runtime-inert commits.
+`dist/` IS already rebuilt (2026-06-01 ~01:56) and verified to contain the
+hardening (jsLiteral present in all four dist/*-html.js, plus
+encodeURIComponent(TOKEN) in dist/dashboard-html.js), so the change is armed:
+ANY restart (the next active-window deploy, or any natural/systemd restart)
+picks it up cleanly with no further build step. Only the restart itself is
+deferred. Action for the next active window: restart via the busy-guarded
+`POST /api/agents/main/restart` (or bundle with the next served-code change)
+and verify health 200. Origin/main is otherwise at the deployed HEAD plus
+these pushed-but-runtime-inert commits.
+
+FOLLOW-UP (refactor, not urgent): all four generators now carry byte-identical
+local copies of `escapeHtml` (predating this work) AND `jsLiteral` (added this
+slice). Consolidating both into one shared `src/html-escape.ts` would give a
+single audited security helper. Deferred deliberately - it is a cross-cutting
+refactor touching all four served generators (plus their tests) and is better
+done as a focused, reviewable change than bundled into an overnight slice; the
+duplication is inert and fully test-pinned, so there is no rush.
