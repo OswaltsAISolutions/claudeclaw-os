@@ -158,14 +158,23 @@ async function main(): Promise<void> {
   // multi-process over-decay (5x decay on simultaneous restart) and
   // duplicate consolidation records from overlapping memory batches.
   if (AGENT_ID === 'main') {
-    runDecaySweep();
-    cleanupOldMissionTasks(7);
-    // Telegram media downloads (voice/photo/document) accumulate in
-    // workspace/uploads. Only main runs the bot handlers that write them, so
-    // sweep here at boot AND every 24h. Without the interval, disk grows
-    // unbounded between restarts on a service meant to run for weeks.
-    cleanupOldUploads();
-    setInterval(() => { runDecaySweep(); cleanupOldMissionTasks(7); cleanupOldUploads(); }, 24 * 60 * 60 * 1000);
+    // Best-effort housekeeping: memory decay + conversation/messaging retention,
+    // mission-task pruning, and old Telegram upload cleanup. Each is guarded so a
+    // transient failure (e.g. a SQLITE_BUSY hiccup under write contention) logs and
+    // is skipped until the next cycle rather than throwing. An unguarded throw here
+    // — at boot or inside the setInterval callback — would crash the whole bot and
+    // drop message delivery on a service meant to run for weeks, so we mirror the
+    // .catch() convention the consolidation timer below already uses. The three are
+    // independent, so one failing must not skip the others. cleanupOldUploads only
+    // matters for main, which runs the bot handlers that write uploads; it grows
+    // workspace/uploads unbounded without the periodic sweep (restart-only before).
+    const runMaintenance = () => {
+      try { runDecaySweep(); } catch (err) { logger.error({ err }, 'Decay/retention sweep failed'); }
+      try { cleanupOldMissionTasks(7); } catch (err) { logger.error({ err }, 'Mission-task cleanup failed'); }
+      try { cleanupOldUploads(); } catch (err) { logger.error({ err }, 'Upload cleanup failed'); }
+    };
+    runMaintenance();
+    setInterval(runMaintenance, 24 * 60 * 60 * 1000);
 
     // One-time bundled→mutable avatar migration. After this lands, any
     // previously user-uploaded main avatar that we wrote into the
