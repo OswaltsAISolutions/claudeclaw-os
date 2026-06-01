@@ -5,6 +5,19 @@ import { getWarRoomPickerHtml } from './warroom-text-picker-html.js';
 // attribute (the Back link href) and an inline <script> as JS constants.
 // These tests pin the escaping so a token/chatId carrying HTML or quote
 // metacharacters can never break out of either context.
+
+// Mirror of the module-private jsLiteral so the script-escaping contract is
+// pinned exactly without exporting the helper. The plain-JSON.stringify
+// assertions below only exercise quote-escaping; these breakout tests prove
+// the page actually carries the < > & escaping (a downgrade to bare
+// JSON.stringify would silently pass every other test in this file).
+function jsLiteral(s: string): string {
+  return JSON.stringify(s)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026');
+}
+
 describe('getWarRoomPickerHtml', () => {
   it('returns a full HTML document', () => {
     const html = getWarRoomPickerHtml('abc', '123');
@@ -44,6 +57,22 @@ describe('getWarRoomPickerHtml', () => {
     const chatId = "o'reilly";
     const html = getWarRoomPickerHtml('tok', chatId);
     expect(html).toContain(`const CHAT_ID = ${JSON.stringify(chatId)};`);
+  });
+
+  it('neutralizes a </script> breakout attempt in the token constant', () => {
+    const evil = '</script><img src=x onerror=alert(1)>';
+    const html = getWarRoomPickerHtml(evil, '');
+    expect(html).toContain(`const TOKEN = ${jsLiteral(evil)};`);
+    expect(html).not.toContain('</script><img');
+    expect(html).toContain('\\u003c/script\\u003e');
+  });
+
+  it('neutralizes a </script> breakout attempt in the chatId constant', () => {
+    const evil = '</script><svg onload=alert(1)>';
+    const html = getWarRoomPickerHtml('tok', evil);
+    expect(html).toContain(`const CHAT_ID = ${jsLiteral(evil)};`);
+    expect(html).not.toContain('</script><svg');
+    expect(html).toContain('\\u003c/script\\u003e');
   });
 
   it('round-trips a plain token into both the href and the JS constant', () => {
