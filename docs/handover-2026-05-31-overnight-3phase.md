@@ -761,6 +761,53 @@ already established, its "Restarting..." emitChatEvent reaches only
 dashboard-browser SSE clients, NEVER Telegram. Use the endpoint next time;
 the ping fear is moot.
 
+### Security: redact secrets from logs (2026-06-01, fourteenth slice) - DONE + DEPLOYED
+
+Second RUNTIME fix of the run. During the thirteenth-slice deploy
+verification the boot journal showed the live Telegram bot token leaking
+into journald: grammy's HttpError nests a FetchError whose `.message` is the
+full `https://api.telegram.org/bot<id>:<token>/deleteWebhook` URL, so a
+transient network blip on `deleteWebhook` prints the credential. Dashboard /
+API `?token=...` links leak the same way. Low external severity (journald is
+local) but a real longevity hazard: any log later pasted into an issue or
+shared for debugging carried a live secret.
+
+`src/logger.ts` (was bare pino, no redaction). Landed in two commits:
+- `be9ef43`: `redactSecrets()` (pure, idempotent: Telegram bot-token pattern
+  `bot(\d+):[A-Za-z0-9_-]{20,}` + secret query params token/api_key/apikey/
+  access_token/key), a depth-capped cycle-safe `deepRedact()` walker, and
+  `scrubErrSerializer()` wired as pino's `err` serializer (scrubs the whole
+  error tree incl. nested cause; try/catch falls back to the std serializer
+  because logging must never throw).
+- `a0a5088`: closed a gap the first commit MISSED. An end-to-end probe of the
+  compiled `dist/logger.js` proved the err-tree path redacted but a secret in
+  a PLAIN `logger.x("...")` message string still wrote cleartext (the err
+  serializer never sees it). Added a pino `logMethod` hook (`redactLogArgs`)
+  that scrubs STRING positional args only, so caller objects are never
+  mutated on the log hot path.
+
+Verified, not assumed: ran the compiled dist under real node (NODE_ENV=
+production) with a synthetic grammy-shaped nested error AND a plain
+`?token=` warn. Before `a0a5088` the warn leaked; after, both render
+`<redacted>` (3 markers) with zero false positives on a secret-free line.
+15 logger unit tests (regex patterns, case-insensitivity, idempotency,
+no-false-positives, nested-cause + cyclic err serializer, logMethod arg
+redaction + no-mutation). Full suite 949 -> 952 passed / 4 skipped, tsc +
+build green.
+
+DEPLOYED via the busy-guarded `POST /api/agents/main/restart` (no force) -
+used the PREFERRED endpoint this time per the thirteenth-slice PROCESS NOTE,
+not a raw systemctl. Health 200 in ~2s after each of the two restarts,
+telegramConnected true, 8d session preserved across restart, clean boot
+(0 errors, 0 un-redacted tokens in the post-boot journal).
+
+SCOPE NOTE (honest): redaction covers the err tree and string log messages -
+the two real vectors. It does NOT deep-walk arbitrary non-err OBJECT fields
+passed as log context (e.g. `logger.info({ url: secretUrl }, ...)`); no
+current code path logs a secret that way, and a non-mutating deep clone on
+every log call is cost/risk not worth paying until something needs it. The
+request logger already logs only `path`, never the `?token=` query string.
+
 ### Security: dependency audit (2026-06-01) - NEEDS EYES-ON
 
 Ran `npm audit` as a longevity check. Findings (prod tree): 9
@@ -864,6 +911,22 @@ orphan - meeting `wr_tf7gr3_f40873`, started 2026-05-17 (~14 days prior),
 `entry_count:0`, last transcript entry the same timestamp. Not live work; it
 persists post-restart as expected (the /new flow lazily auto-ends stale text
 meetings per chat). No action taken.
+
+DONE 2026-06-01 ~04:35. Deployed the log secret-redaction fix (commits
+`be9ef43` then `a0a5088`, fourteenth slice). The transient `deleteWebhook`
+ECONNRESET noted in the prior (~04:16) deploy is exactly the leak vector this
+fix neutralizes. Used the busy-guarded `POST /api/agents/main/restart` WITHOUT
+`?force=true` for BOTH restarts (the PREFERRED gate per the thirteenth-slice
+PROCESS NOTE, correcting that note's raw-systemctl shortcut): each returned
+200 (no turn in flight), service recovered in ~2s, `active`, `GET /api/health`
+200 with model `claude-opus-4-7` + `telegramConnected:true`, 8d session
+preserved. Post-boot journal clean: 0 errors/fatal, 0 un-redacted bot tokens,
+normal startup sequence (Database ready, Scheduler, ollama-proxy listening,
+War Room server started). Confirmed the SERVED artifact redacts: probed the
+compiled `dist/logger.js` under real node and both a grammy-shaped nested
+error and a plain `?token=` message rendered `<redacted>`. Origin/main at
+deployed HEAD (`a0a5088`, 0 ahead). Same stale `wr_tf7gr3_f40873` orphan
+meeting still present, still irrelevant.
 
 FOLLOW-UP (refactor, not urgent): the four generators duplicate security
 helpers, but a 2026-06-01 audit found the duplication is NOT uniform - do NOT
