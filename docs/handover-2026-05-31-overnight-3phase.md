@@ -667,8 +667,31 @@ instead of trusting the rendered text.
 With this the frontend pure-lib depth audit is genuinely exhausted:
 remaining lib files are already well-covered, pure network/SSE,
 canvas/WebGL (not jsdom-exercisable), or trivial signal wrappers.
-Further low-risk test value is in clear diminishing returns; the
-high-value queued work that remains is the eyes-on items below.
+Further low-risk test value in the frontend pure-lib layer is in clear
+diminishing returns; the next genuine value was on the backend
+reliability surface (eleventh slice), and the remaining high-value work
+after that is the eyes-on items below.
+
+### Coverage expansion (2026-06-01, eleventh slice) - DONE
+
+Highest-value reliability test, not padding. `src/claw-runner.test.ts`
+(`0a62cc2`, 11 -> 13 tests). The retry-policy suite already covered every
+retryable class (stray XML, wall-clock timeout, empty no-op) SUCCEEDING
+on the second attempt, plus the two non-retryable classes (deterministic
+non-zero exit, user abort). The untested property was the persistent
+failure: when the retry ALSO fails. Added a double-stray-XML case and a
+double-timeout case. Both pin (a) the retry is bounded to exactly one
+(mockSpawn called twice, never three, so a wedged local model cannot
+loop and pin the GPU) and (b) the failure flag (strayToolSyntax /
+timedOut) survives on the final result so specialists.ts logs the
+persistent failure to hive_mind rather than masking it. A naive
+while(retryable) regression would pass every prior test but fail these.
+
+Suite 929 -> 931 passed (4 skipped, 68 files); full `npm run build`
+green at HEAD. Test-only, nothing deployed. This is the claw
+retry/timeout/fabrication gate, the system's core reliability contract
+per the local-specialist pivot, so it earns coverage of its failure
+modes and not just its happy paths.
 
 ### Security: dependency audit (2026-06-01) - NEEDS EYES-ON
 
