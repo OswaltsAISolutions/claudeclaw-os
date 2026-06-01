@@ -510,6 +510,39 @@ a `.tsx` component (render-harness territory, mostly thin useFetch wiring that
 broadly pinned; further web gains would be component render tests (higher
 fragility, lower value) rather than more lib coverage.
 
+### Coverage expansion (2026-06-01, sixth slice) - DONE
+
+Pivoted from web to the backend Telegram boundary. `formatForTelegram`
+(`src/bot.ts`, exported) is the markdown-to-Telegram-HTML converter run on
+every Claude response sent to Telegram, but `bot.test.ts` only covered
+`splitMessage` + `extractFileMarkers`. It renders with parse_mode=HTML, so
+it is the security-critical escaping seam for model output. Test-only,
+no source change, nothing to deploy.
+
+- `bot.test.ts` (`2a720f5`, +18 -> file now 46 tests): pins the &-first escape
+  order (the only order that doesn't double-escape its own &lt;/&gt;), fenced
+  code-block + inline-code protection (contents must NOT be re-interpreted as
+  markdown: `**not bold**` inside a fence stays literal), language-tag strip +
+  trim, heading->`<b>`, hr removal, checked/unchecked checkboxes, bold/italic/
+  strike, snake_case left untouched (`(?<!\w)_..._(?!\w)`), links restricted to
+  http(s) so a `javascript:` URL never becomes an anchor (security), and 3+
+  blank-line collapse. Tested through the public export (zero source change),
+  the codebase-preferred pattern.
+
+Suite 864 -> 882 passed (4 skipped, 68 files); web tsc unchanged at 13.
+
+KNOWN BEHAVIOR worth a focused look later (NOT fixed - served code, runtime
+change, out of scope for a test slice): `formatForTelegram` step 3 re-escapes
+inline-code content that step 2 already escaped, so inline code literally
+containing `<`, `>`, or `&` double-escapes. e.g. `` `a<b` `` emits
+`<code>a&amp;lt;b</code>`, which Telegram then displays as the literal text
+`a&lt;b` instead of `a<b`. Fenced blocks are fine (escaped once, in step 1).
+Low impact (inline code with raw angle brackets is rare in model output) and
+the new tests deliberately avoid special chars in inline code so they pin
+current behavior rather than asserting the bug. Fix = drop the re-escape in
+step 3 since step 2 already ran; verify against the protected-placeholder
+flow before changing.
+
 ## Guardrails in force
 
 Push + service-deploy now AUTHORIZED (see intro). Still NO PC restart /
