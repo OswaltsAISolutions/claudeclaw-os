@@ -194,12 +194,6 @@ export function StandupConfigPane() {
             const agent = agents.find((a) => a.id === id);
             if (!agent) return null;
             const isEnabled = enabled.has(id);
-            const willRun = isEnabled && idx < (() => {
-              // Can't easily compute "is this agent within the cap" since
-              // disabled rows pad the list. Compute against enabledOrdered.
-              const enabledIdx = enabledOrdered.indexOf(id);
-              return enabledIdx >= 0 && enabledIdx < maxSpeakers ? Number.MAX_SAFE_INTEGER : -1;
-            })();
             const enabledIdx = enabledOrdered.indexOf(id);
             const inCap = isEnabled && enabledIdx >= 0 && enabledIdx < maxSpeakers;
             return (

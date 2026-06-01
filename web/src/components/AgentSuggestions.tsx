@@ -49,8 +49,8 @@ export function AgentSuggestionModal({ suggestion, onClose, onActed, onChange }:
   function act() {
     // Mark as acted on the server then ask the parent (Agents page) to
     // open the create wizard pre-filled with the suggested values.
-    void apiPost(`/api/agents/suggestions/${suggestion.id}/acted`).catch(() => {});
-    onActed(suggestion);
+    void apiPost(`/api/agents/suggestions/${suggestion!.id}/acted`).catch(() => {});
+    onActed(suggestion!);
   }
 
   const share = suggestion.activity_share_pct ?? 0;
