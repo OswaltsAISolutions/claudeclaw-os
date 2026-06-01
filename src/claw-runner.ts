@@ -101,6 +101,12 @@ export interface ClawRunOptions {
    *  specialists (sentinel) that need host-wide read access. Namespace isolation
    *  remains on; this only widens filesystem visibility. */
   disableFilesystemSandbox?: boolean;
+  /** Hard wall-clock cap (ms) on a single claw subprocess. When exceeded we
+   *  SIGTERM (then SIGKILL) the child and resolve with timedOut=true so
+   *  runClaw can retry once. Default DEFAULT_CLAW_TIMEOUT_MS (4 min), long
+   *  enough for a 30B local model's multi-turn loop, short enough that a
+   *  wedged model can't pin the GPU indefinitely. */
+  timeoutMs?: number;
 }
 
 export interface ClawRunResult {
@@ -126,10 +132,19 @@ export interface ClawRunResult {
    *  once. Callers can read this on the FINAL result if they want to log the
    *  occurrence (specialists.ts logs to hive_mind for dashboard visibility). */
   strayToolSyntax?: boolean;
-  /** Number of times the run was retried due to strayToolSyntax (0 on first
-   *  successful attempt; max 1 in current implementation). */
+  /** Number of times the run was retried (0 on first successful attempt; max
+   *  1 in current implementation). Retries fire on stray XML tool syntax, a
+   *  wall-clock timeout, or a total no-op (no text + no tool calls). */
   retryAttempts?: number;
+  /** True when the subprocess was killed by the wall-clock timeout
+   *  (opts.timeoutMs / DEFAULT_CLAW_TIMEOUT_MS). runClaw retries these once. */
+  timedOut?: boolean;
 }
+
+/** Default wall-clock cap per claw subprocess. 4 min covers a 30B local
+ *  model's multi-turn loop with headroom; past that the model is almost
+ *  certainly wedged and a fresh attempt beats waiting. */
+export const DEFAULT_CLAW_TIMEOUT_MS = 240_000;
 
 /** Detection regex for OpenAI-style XML tool-call syntax that occasionally
  *  shows up in qwen3-coder:30b output instead of the proper OpenAI-compat
@@ -138,18 +153,38 @@ export interface ClawRunResult {
  *  Pattern matches the literal `<function=<name>` opener. */
 const STRAY_TOOL_SYNTAX_RE = /<function=[a-zA-Z_][a-zA-Z0-9_-]*\s*>/;
 
-/** Public entry point. Wraps runClawOnce with retry-on-stray-syntax. */
+/** Classify a result as worth one automatic retry. Covers transient/mechanical
+ *  failures only. Deterministic errors (binary missing, model-emitted error,
+ *  non-zero exit with stderr) and user aborts are NOT retryable and surface
+ *  to the caller as-is. */
+function isRetryableFailure(r: ClawRunResult): boolean {
+  // qwen3-coder:30b occasionally emits OpenAI-style <function=...> XML that
+  // claw v0.1.3 can't parse; a fresh roll usually parses cleanly.
+  if (r.strayToolSyntax) return true;
+  // Wedged model that blew the wall-clock cap. Worst case the retry also
+  // times out (2x wall time), but the abort signal can still cancel.
+  if (r.timedOut) return true;
+  // Total no-op: claw exited cleanly but the model produced no text and
+  // called no tools. Nothing actionable came back; one retry is cheap.
+  if (!r.text && r.toolCalls === 0 && !r.error) return true;
+  return false;
+}
+
+/** Public entry point. Wraps runClawOnce with a single retry on transient
+ *  failures (stray XML tool syntax, wall-clock timeout, or a total no-op). */
 export async function runClaw(opts: ClawRunOptions): Promise<ClawRunResult> {
   const first = await runClawOnce(opts);
-  // Only retry on stray-syntax. Other errors (model-emitted error, abort,
-  // exit code) are real failures the caller should handle as-is. Aborted
-  // runs must not be retried under any circumstance.
-  if (!first.strayToolSyntax || opts.signal?.aborted) {
+  // Aborted runs must NEVER be retried (user hit /stop). Only retry the
+  // transient classes isRetryableFailure recognizes.
+  if (opts.signal?.aborted || !isRetryableFailure(first)) {
     return first;
   }
+  const reason = first.strayToolSyntax ? 'stray-xml'
+    : first.timedOut ? 'timeout'
+    : 'empty-output';
   logger.warn(
-    { model: opts.model, durationMs: first.durationMs },
-    '[claw] stray XML tool-call syntax detected; killing + retrying once',
+    { model: opts.model, durationMs: first.durationMs, reason },
+    '[claw] transient failure; killing + retrying once',
   );
   const second = await runClawOnce(opts);
   return {
@@ -157,9 +192,10 @@ export async function runClaw(opts: ClawRunOptions): Promise<ClawRunResult> {
     // Mark the result so the caller (specialists.ts) can log to hive_mind
     // for dashboard visibility. retryAttempts=1 always since we cap there.
     retryAttempts: 1,
-    // If the retry ALSO hit stray-syntax, preserve the flag so the caller
-    // surfaces it; otherwise clear it (retry succeeded).
+    // Preserve the failure flags from the retry so the caller can see if it
+    // ALSO failed; cleared automatically when the retry succeeds.
     strayToolSyntax: second.strayToolSyntax === true,
+    timedOut: second.timedOut === true ? true : undefined,
   };
 }
 
@@ -309,6 +345,8 @@ async function runClawOnce(opts: ClawRunOptions): Promise<ClawRunResult> {
     // Set when the model emits OpenAI-style XML tool-call syntax that claw
     // can't parse. Triggers an early subprocess kill so runClaw can retry.
     let strayToolSyntax = false;
+    // Set when the wall-clock timeout fires and we kill the subprocess.
+    let timedOut = false;
 
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
@@ -371,8 +409,24 @@ async function runClawOnce(opts: ClawRunOptions): Promise<ClawRunResult> {
     };
     opts.signal?.addEventListener('abort', abortHandler);
 
+    // Wall-clock guard. A local model can wedge (infinite tool loop, stuck
+    // generation) and never exit on its own; without this the whole turn
+    // hangs. On expiry, mark timedOut, SIGTERM, then SIGKILL after a grace
+    // window. The exit handler clears this timer and reports timedOut so
+    // runClaw can retry once.
+    const timeoutMs = opts.timeoutMs ?? DEFAULT_CLAW_TIMEOUT_MS;
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      logger.warn({ model: opts.model, timeoutMs }, '[claw] wall-clock timeout, killing subprocess');
+      try { child.kill('SIGTERM'); } catch { /* already dead */ }
+      setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* */ } }, 2000).unref();
+    }, timeoutMs);
+    timeoutTimer.unref();
+
     child.on('error', (err) => {
       // Spawn-time errors (ENOENT, EACCES) land here, NOT in `exit`.
+      clearTimeout(timeoutTimer);
+      opts.signal?.removeEventListener('abort', abortHandler);
       logger.error({ err: err.message }, '[claw] subprocess error event');
       resolve({
         text: assistantText.trim(),
@@ -385,6 +439,7 @@ async function runClawOnce(opts: ClawRunOptions): Promise<ClawRunResult> {
     });
 
     child.on('exit', (code, signal) => {
+      clearTimeout(timeoutTimer);
       opts.signal?.removeEventListener('abort', abortHandler);
       if (opts.useFullClaw) {
         // Full claw end-of-run: stdoutBuf holds one JSON object.
@@ -470,6 +525,8 @@ async function runClawOnce(opts: ClawRunOptions): Promise<ClawRunResult> {
         error = modelEmittedError;
       } else if (aborted) {
         error = 'aborted';
+      } else if (timedOut) {
+        error = `claw timed out after ${timeoutMs}ms`;
       } else if (code !== 0) {
         error = stderrBuf.trim().slice(-800) || `claw exited code=${code} signal=${signal ?? ''}`;
       }
@@ -483,6 +540,7 @@ async function runClawOnce(opts: ClawRunOptions): Promise<ClawRunResult> {
         usage: lastUsage,
         error,
         strayToolSyntax: strayToolSyntax || undefined,
+        timedOut: timedOut || undefined,
       });
     });
 
