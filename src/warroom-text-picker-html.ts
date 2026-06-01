@@ -17,11 +17,25 @@ function escapeHtml(s: string): string {
     .replace(/'/g, '&#39;');
 }
 
+/**
+ * JSON-encode a string for safe embedding inside an inline <script> block.
+ * JSON.stringify alone leaves "<", ">", and "&" intact, so a value containing
+ * "</script>" or "<!--" could break out of the script element. Escaping those
+ * three as < / > / & keeps the decoded value byte-for-byte
+ * identical at JS parse time while making the source inert.
+ */
+function jsLiteral(s: string): string {
+  return JSON.stringify(s)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026');
+}
+
 export function getWarRoomPickerHtml(token: string, chatId: string): string {
   const safeToken = escapeHtml(token);
   const safeChatId = escapeHtml(chatId);
-  const jsToken = JSON.stringify(token);
-  const jsChatId = JSON.stringify(chatId);
+  const jsToken = jsLiteral(token);
+  const jsChatId = jsLiteral(chatId);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
