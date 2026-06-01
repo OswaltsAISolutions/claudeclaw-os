@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { splitMessage, extractFileMarkers } from './bot.js';
+import { splitMessage, extractFileMarkers, formatForTelegram } from './bot.js';
 
 describe('splitMessage', () => {
   it('returns single-element array for short messages', () => {
@@ -249,5 +249,97 @@ describe('extractFileMarkers', () => {
     expect(result.text).toContain('Line 1');
     expect(result.text).toContain('Line 2');
     expect(result.text).toContain('Line 3');
+  });
+});
+
+// formatForTelegram is the markdown -> Telegram-HTML boundary for every Claude
+// response that reaches Telegram. It is security-critical: Telegram renders the
+// output with parse_mode=HTML, so any unescaped `<`/`&` from model output could
+// inject markup. The most important contract is the &-first escaping order in
+// step 2 (escaping `&` last would double-escape the `&lt;`/`&gt;` it just
+// produced). The rest is markdown conversion: code-block/inline-code protection
+// (their contents must NOT be re-interpreted as markdown), headings, rules,
+// checkboxes, bold/italic/strike, and links restricted to http(s) (so a
+// javascript: URL can never become a clickable anchor).
+describe('formatForTelegram', () => {
+  it('returns empty string for empty input', () => {
+    expect(formatForTelegram('')).toBe('');
+  });
+
+  it('passes through plain text unchanged', () => {
+    expect(formatForTelegram('just a sentence')).toBe('just a sentence');
+  });
+
+  it('escapes & before < and > so entities are never double-escaped', () => {
+    // If & were escaped last, the &lt;/&gt; produced here would become
+    // &amp;lt;/&amp;gt;. &-first is the only correct order.
+    expect(formatForTelegram('a < b & c > d')).toBe('a &lt; b &amp; c &gt; d');
+  });
+
+  it('wraps a fenced code block in <pre>, strips the language tag, escapes and trims', () => {
+    expect(formatForTelegram('```js\nconst x = 1 < 2;\n```')).toBe(
+      '<pre>const x = 1 &lt; 2;</pre>',
+    );
+  });
+
+  it('does not interpret markdown inside a code block', () => {
+    expect(formatForTelegram('```\n**not bold**\n```')).toBe('<pre>**not bold**</pre>');
+  });
+
+  it('wraps inline code in <code>', () => {
+    expect(formatForTelegram('use `hello` here')).toBe('use <code>hello</code> here');
+  });
+
+  it('does not interpret markdown inside inline code', () => {
+    expect(formatForTelegram('`**x**`')).toBe('<code>**x**</code>');
+  });
+
+  it('converts a heading to bold, dropping the # prefix', () => {
+    expect(formatForTelegram('## Title')).toBe('<b>Title</b>');
+  });
+
+  it('removes a horizontal rule and its surrounding blank lines', () => {
+    expect(formatForTelegram('a\n---\nb')).toBe('a\nb');
+  });
+
+  it('converts a checked checkbox to a check mark', () => {
+    expect(formatForTelegram('- [x] done')).toBe('✓ done');
+  });
+
+  it('converts an unchecked checkbox to an empty box', () => {
+    expect(formatForTelegram('- [ ] todo')).toBe('☐ todo');
+  });
+
+  it('converts **bold** and __bold__ to <b>', () => {
+    expect(formatForTelegram('**a** and __b__')).toBe('<b>a</b> and <b>b</b>');
+  });
+
+  it('converts *italic* to <i>', () => {
+    expect(formatForTelegram('an *it* word')).toBe('an <i>it</i> word');
+  });
+
+  it('leaves snake_case identifiers untouched (underscores inside words)', () => {
+    expect(formatForTelegram('call some_func_name now')).toBe('call some_func_name now');
+  });
+
+  it('converts ~~strike~~ to <s>', () => {
+    expect(formatForTelegram('~~gone~~')).toBe('<s>gone</s>');
+  });
+
+  it('converts an http(s) link to an anchor', () => {
+    expect(formatForTelegram('[ok](https://example.com)')).toBe(
+      '<a href="https://example.com">ok</a>',
+    );
+  });
+
+  it('never turns a javascript: URL into an anchor', () => {
+    const out = formatForTelegram('[x](javascript:alert(1))');
+    expect(out).not.toContain('<a');
+    expect(out).not.toContain('href');
+    expect(out).toContain('[x](javascript:alert(1))');
+  });
+
+  it('collapses 3+ consecutive blank lines down to a single blank line', () => {
+    expect(formatForTelegram('a\n\n\n\nb')).toBe('a\n\nb');
   });
 });
