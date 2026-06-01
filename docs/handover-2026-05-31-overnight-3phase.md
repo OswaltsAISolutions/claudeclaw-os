@@ -845,6 +845,42 @@ text while chunk A is sent exactly once - no drop, no dup). Full suite 952 ->
 `POST /api/agents/main/restart` (no force); health 200 on attempt 1, clean
 boot (@GCruiseJarvisBot online, 0 errors/0 leaked tokens on the new PID).
 
+### Real bug fix: same fallback bug on the dashboard relay path (2026-06-01, sixteenth slice) - DONE + DEPLOYED
+
+Immediate follow-on to the fifteenth slice. While auditing every Telegram
+send site in `bot.ts` I found the dashboard->Telegram relay
+(`processDashboardMessage`, the leg that mirrors a dashboard-typed reply out
+to Telegram) carried a BYTE-FOR-BYTE copy of the same pre-fix bug:
+`botApi.sendMessage(chatId, telegramText.slice(0, 4096))` + `break` on HTML
+parse failure - same duplicate + drop + raw-HTML-as-plain defect, just via
+`Api.sendMessage` instead of `ctx.reply`. The fifteenth-slice fix to
+`sendTelegramSafe` did NOT cover this path because it is a different
+transport.
+
+Fix (`907937c`): extracted the send-with-fallback core into a
+transport-agnostic `sendHtmlWithPlainFallback(text, send)` where `send:
+(chunk, html) => Promise` is the only transport detail. `sendTelegramSafe`
+is now a thin wrapper binding it to `ctx.reply`; the relay binds it to
+`botApi.sendMessage(chatId, ...)`. ONE correct implementation, both paths,
+and any future send site can reuse it. Non-parse errors still propagate so
+the relay's outer 401-bad-token handler is unchanged.
+
+Audited the THIRD HTML send too (`notifyWhatsAppIncoming`, bot.ts ~1985):
+left as-is on purpose - it is a short, balanced, controlled notification
+(`<b>name</b> ... <i>/wa ...</i>`, the only dynamic part escapeHtml'd) well
+under 4096, with its own try/catch; no split or parse-failure risk, so the
+fallback would be dead weight.
+
+Verified: +3 tests driving the core through a `sendMessage`-shaped transport
+(happy path; failing-chunk-only plain resend with no drop/duplicate;
+non-parse error propagation). Full suite 961 -> 964 passed / 4 skipped, tsc
++ build green. Confirmed the SERVED artifact: `dist/bot.js` no longer
+contains `telegramText.slice(0, 4096)` and does contain
+`sendHtmlWithPlainFallback`. DEPLOYED via the busy-guarded restart (no
+force) -> 200, health 200 on poll attempt 1, clean boot (PID 315110,
+@GCruiseJarvisBot online, 0 errors/0 leaked tokens). Origin/main at deployed
+HEAD (`907937c`, 0 ahead).
+
 ### Security: dependency audit (2026-06-01) - NEEDS EYES-ON
 
 Ran `npm audit` as a longevity check. Findings (prod tree): 9
@@ -975,6 +1011,15 @@ flight). Service recovered <1s: `GET /api/health` 200 on poll attempt 1,
 up. New PID (309880) boot journal clean: 0 errors/warn/fatal (the lone WARN in
 the window was my own earlier tokenless `/api/health` 401 probe on the OLD
 PID, not the new process). Origin/main at deployed HEAD (`6cfd204`, 0 ahead).
+
+DONE 2026-06-01 ~04:54. Deployed the relay-path copy of the same fallback fix
+(`907937c`, sixteenth slice - extracted `sendHtmlWithPlainFallback`, fixed
+`processDashboardMessage`). Built `npm run build` (exit 0); verified the
+served `dist/bot.js` dropped `telegramText.slice(0, 4096)` and gained
+`sendHtmlWithPlainFallback`. Busy-guarded `POST /api/agents/main/restart`
+WITHOUT force -> 200, `GET /api/health` 200 on poll attempt 1, clean boot
+(PID 315110, "ClaudeClaw online: @GCruiseJarvisBot", DB ready, 0 errors/0
+leaked tokens). Origin/main at deployed HEAD (`907937c`, 0 ahead).
 
 FOLLOW-UP (refactor, not urgent): the four generators duplicate security
 helpers, but a 2026-06-01 audit found the duplication is NOT uniform - do NOT
