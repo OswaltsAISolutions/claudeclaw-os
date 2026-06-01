@@ -9,8 +9,37 @@ type Sender = (text: string) => Promise<void>;
 
 const CREDENTIALS_PATH = path.join(os.homedir(), '.claude', '.credentials.json');
 
+/** Alert levels for OAuth token health, ordered by urgency. */
+export type OAuthAlertLevel = 'none' | 'warning' | 'expired';
+
+export interface OAuthAlertDecision {
+  level: OAuthAlertLevel;
+  /** True only on a transition into a new alert-worthy level (dedup). */
+  shouldAlert: boolean;
+}
+
+/**
+ * Decide the OAuth alert level purely from the time remaining and the
+ * level we last alerted at. No clock and no I/O: `remainingMs` is
+ * `expiresAt - now`, and the dedup check stops us re-announcing a level we
+ * have already alerted on. Healthy never alerts the user.
+ */
+export function decideOAuthAlert(
+  remainingMs: number,
+  alertThresholdMs: number,
+  lastLevel: OAuthAlertLevel,
+): OAuthAlertDecision {
+  if (remainingMs <= 0) {
+    return { level: 'expired', shouldAlert: lastLevel !== 'expired' };
+  }
+  if (remainingMs <= alertThresholdMs) {
+    return { level: 'warning', shouldAlert: lastLevel !== 'warning' };
+  }
+  return { level: 'none', shouldAlert: false };
+}
+
 /** Don't spam - track last alert level to avoid repeating */
-let lastAlertLevel: 'none' | 'warning' | 'expired' = 'none';
+let lastAlertLevel: OAuthAlertLevel = 'none';
 
 interface Credentials {
   claudeAiOauth?: {
@@ -79,9 +108,10 @@ async function checkOAuthHealth(sender: Sender): Promise<void> {
   const remainingMinutes = Math.floor((remainingMs % (60 * 60 * 1000)) / (60 * 1000));
   const alertThresholdMs = getAlertThresholdMs();
 
-  if (remainingMs <= 0) {
-    if (lastAlertLevel !== 'expired') {
-      lastAlertLevel = 'expired';
+  const decision = decideOAuthAlert(remainingMs, alertThresholdMs, lastAlertLevel);
+
+  if (decision.level === 'expired') {
+    if (decision.shouldAlert) {
       logger.error({ expiresAt, remainingMs }, 'OAuth token EXPIRED');
       await sender(
         '<b>OAuth Health Check - TOKEN EXPIRED</b>\n\n' +
@@ -91,9 +121,9 @@ async function checkOAuthHealth(sender: Sender): Promise<void> {
         '<code>claude auth logout && claude auth login</code>',
       );
     }
-  } else if (remainingMs <= alertThresholdMs) {
-    if (lastAlertLevel !== 'warning') {
-      lastAlertLevel = 'warning';
+    lastAlertLevel = 'expired';
+  } else if (decision.level === 'warning') {
+    if (decision.shouldAlert) {
       logger.warn({ expiresAt, remainingHours, remainingMinutes }, 'OAuth token expiring soon');
       await sender(
         '<b>OAuth Health Check - Expiring soon</b>\n\n' +
@@ -102,6 +132,7 @@ async function checkOAuthHealth(sender: Sender): Promise<void> {
         '<code>claude auth logout && claude auth login</code>',
       );
     }
+    lastAlertLevel = 'warning';
   } else {
     if (lastAlertLevel !== 'none') {
       lastAlertLevel = 'none';
