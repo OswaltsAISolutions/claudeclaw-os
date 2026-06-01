@@ -1,3 +1,17 @@
+/**
+ * JSON-encode a string for safe embedding inside an inline <script> block.
+ * JSON.stringify alone leaves "<", ">", and "&" intact, so a value containing
+ * "</script>" or "<!--" could break out of the script element. Escaping those
+ * three as < / > / & keeps the decoded value byte-for-byte
+ * identical at JS parse time while making the source inert.
+ */
+function jsLiteral(s: string): string {
+  return JSON.stringify(s)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026');
+}
+
 export function getDashboardHtml(token: string, chatId: string, warroomEnabled = false): string {
 const WARROOM_ENABLED = warroomEnabled;
   return `<!DOCTYPE html>
@@ -211,7 +225,7 @@ const WARROOM_ENABLED = warroomEnabled;
 </div>
 
 <!-- War Room Quick Access (only shown when WARROOM_ENABLED) -->
-${WARROOM_ENABLED ? `<div class="card" style="display:flex;align-items:center;justify-content:space-between;cursor:pointer;border:1px solid #1e3a5f;background:linear-gradient(135deg,#0f172a 0%,#1a1a1a 100%)" onclick="window.location.href='/warroom?token=${token}&chatId=${chatId}'">
+${WARROOM_ENABLED ? `<div class="card" style="display:flex;align-items:center;justify-content:space-between;cursor:pointer;border:1px solid #1e3a5f;background:linear-gradient(135deg,#0f172a 0%,#1a1a1a 100%)" onclick="window.location.href='/warroom?token=' + encodeURIComponent(TOKEN) + '&chatId=' + encodeURIComponent(CHAT_ID)">
   <div>
     <div style="font-size:14px;font-weight:600;color:#60a5fa">War Room</div>
     <div style="font-size:12px;color:#6b7280;margin-top:2px">Voice standup with your agent team</div>
@@ -624,8 +638,8 @@ ${WARROOM_ENABLED ? `<div class="card" style="border:1px solid #1e3a5f">
 </div>
 
 <script>
-const TOKEN = ${JSON.stringify(token)};
-const CHAT_ID = ${JSON.stringify(chatId)};
+const TOKEN = ${jsLiteral(token)};
+const CHAT_ID = ${jsLiteral(chatId)};
 const BASE = location.origin;
 
 // Device detection
