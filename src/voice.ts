@@ -288,12 +288,22 @@ async function synthesizeSpeechElevenLabs(text: string): Promise<Buffer> {
   if (!apiKey) throw new Error('ELEVENLABS_API_KEY not set');
   if (!voiceId) throw new Error('ELEVENLABS_VOICE_ID not set');
 
+  // Voice settings tuned for the real JARVIS (Paul Bettany) read:
+  // understated, calm, matter-of-fact British butler — NOT theatrical.
+  //   stability:  0.65 — locked in, no emotional swing. JARVIS is calm.
+  //   similarity: 0.90 — hold the British identity hard.
+  //   style:      0.25 — much LESS dramatic. Real JARVIS is dry, not
+  //                      operatic. Higher values push toward narrator
+  //                      drama which is the opposite of what we want.
+  //   speaker_boost: true — crisps consonants for clarity.
   const payload = JSON.stringify({
     text,
     model_id: 'eleven_turbo_v2_5',
     voice_settings: {
-      stability: 0.5,
-      similarity_boost: 0.75,
+      stability: 0.65,
+      similarity_boost: 0.90,
+      style: 0.25,
+      use_speaker_boost: true,
     },
   });
 
@@ -434,21 +444,70 @@ export async function synthesizeSpeechLocal(text: string): Promise<Buffer> {
   }
 }
 
-// ── TTS: Cascade (ElevenLabs → Gradium → Kokoro → macOS say) ────────────────
+// ── TTS: Groq PlayAI (free with Groq key) ───────────────────────────────────
+
+/**
+ * Convert text to speech using Groq's PlayAI TTS endpoint.
+ * Free with any Groq API key. Returns WAV bytes. Voice defaults to
+ * Fritz-PlayAI (deep masculine, JARVIS-grade) but can be overridden
+ * via GROQ_TTS_VOICE env var (e.g. Briggs-PlayAI, Atlas-PlayAI, etc).
+ *
+ * Added 2026-05-24 because (a) ElevenLabs free plan rejects library
+ * voices with HTTP 402, and (b) the macOS-only local fallback can't
+ * work on WSL. Groq + GROQ_API_KEY is the user's working baseline.
+ */
+async function synthesizeSpeechGroq(text: string): Promise<Buffer> {
+  const env = readEnvFile(['GROQ_API_KEY', 'GROQ_TTS_VOICE', 'GROQ_TTS_MODEL']);
+  if (!env.GROQ_API_KEY) throw new Error('GROQ_API_KEY not set');
+  // Orpheus voices on Groq (verified live 2026-05-24):
+  //   masculine: austin, daniel, troy
+  //   feminine:  autumn, diana, hannah
+  // Default `troy` is the deepest masculine voice; reads calmer and
+  // more authoritative than `daniel` (which can sound clipped/annoyed
+  // on shorter sentences). Override via GROQ_TTS_VOICE env var.
+  const voice = env.GROQ_TTS_VOICE || 'troy';
+  // playai-tts was decommissioned 2026; canopylabs/orpheus-v1-english is
+  // the current Groq TTS model. If/when Groq lists a successor, update
+  // GROQ_TTS_MODEL via env.
+  const model = env.GROQ_TTS_MODEL || 'canopylabs/orpheus-v1-english';
+  const payload = JSON.stringify({
+    model,
+    voice,
+    input: text,
+    response_format: 'wav',
+  });
+  return httpsRequest(
+    'https://api.groq.com/openai/v1/audio/speech',
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${env.GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload).toString(),
+      },
+    },
+    payload,
+  );
+}
+
+// ── TTS: Cascade (ElevenLabs → Gradium → Kokoro → Groq → macOS say) ─────────
 
 /**
  * Convert text to speech using the first available provider.
- * Priority: ElevenLabs → Gradium AI → Kokoro (local) → macOS say + ffmpeg.
+ * Priority: ElevenLabs → Gradium AI → Kokoro (local) → Groq PlayAI →
+ * macOS say + ffmpeg. Groq is the cross-platform free-tier fallback.
  */
 export async function synthesizeSpeech(text: string): Promise<Buffer> {
   const env = readEnvFile([
     'ELEVENLABS_API_KEY', 'ELEVENLABS_VOICE_ID',
     'GRADIUM_API_KEY', 'GRADIUM_VOICE_ID',
     'KOKORO_URL',
+    'GROQ_API_KEY',
   ]);
 
   const hasElevenLabs = !!(env.ELEVENLABS_API_KEY && env.ELEVENLABS_VOICE_ID);
   const hasGradium = !!(env.GRADIUM_API_KEY && env.GRADIUM_VOICE_ID);
+  const hasGroq = !!env.GROQ_API_KEY;
 
   if (hasElevenLabs) {
     try {
@@ -471,7 +530,16 @@ export async function synthesizeSpeech(text: string): Promise<Buffer> {
     try {
       return await synthesizeSpeechKokoro(text);
     } catch (err) {
-      logger.warn({ err }, 'Kokoro TTS failed, trying local fallback');
+      logger.warn({ err }, 'Kokoro TTS failed, trying next provider');
+    }
+  }
+
+  // Groq PlayAI - free with the user's existing Groq key, cross-platform
+  if (hasGroq) {
+    try {
+      return await synthesizeSpeechGroq(text);
+    } catch (err) {
+      logger.warn({ err }, 'Groq TTS failed, trying local fallback');
     }
   }
 

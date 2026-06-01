@@ -33,7 +33,7 @@ import {
 import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, logConversationTurn, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, saveCompactionEvent, getCompactionCount } from './db.js';
 import { logger } from './logger.js';
 import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage } from './media.js';
-import { buildMemoryContext, evaluateMemoryRelevance, logAssistantTurn, shouldNudgeMemory, MEMORY_NUDGE_TEXT } from './memory.js';
+import { buildMemoryContext, createPinnedMemory, evaluateMemoryRelevance, logAssistantTurn, shouldNudgeMemory, MEMORY_NUDGE_TEXT } from './memory.js';
 import { classifyMessageComplexity } from './message-classifier.js';
 import { scanForSecrets, redactSecrets } from './exfiltration-guard.js';
 import { trackUsage, getRateStatus } from './rate-tracker.js';
@@ -668,6 +668,10 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       },
       MODEL_FALLBACK_CHAIN.length > 0 ? MODEL_FALLBACK_CHAIN : undefined,
       agentMcpAllowlist,
+      // Route and delegate on the clean user message, not the
+      // memory-context-bloated fullMessage. See the comment at the
+      // matching dashboard call site for the full rationale.
+      { userText: message, chatId: chatIdStr },
     );
 
     clearTimeout(timeoutId);
@@ -1160,15 +1164,36 @@ export function createBot(): Bot {
   });
 
   // /pin <id> — make a memory permanent (never decays)
+  // /pin is polymorphic:
+  //   /pin <integer>   → promote an existing memory by ID (legacy)
+  //   /pin <free text> → create a new pinned memory from the text
+  // Free-text form is the natural "remember this fact" workflow; users
+  // rarely have memory IDs at hand. Integer form is kept for power
+  // users + the /memory listing flow.
   bot.command('pin', async (ctx) => {
     if (await replyIfLocked(ctx)) return;
-    const id = parseInt(ctx.match?.trim() || '', 10);
-    if (isNaN(id)) {
-      await ctx.reply('Usage: /pin <memory_id>\n\nUse /memory to see recent IDs.');
+    const arg = ctx.match?.trim() || '';
+    if (!arg) {
+      await ctx.reply('Usage:\n  /pin <text>          remember this as permanent\n  /pin <memory_id>     promote existing memory (see /memory)');
       return;
     }
-    pinMemory(id);
-    await ctx.reply(`Pinned memory #${id}. It will never decay.`);
+    // Strictly-integer arg → legacy "pin by id" path. We require the
+    // whole arg to be digits (with optional leading minus), so a
+    // free-text fact that happens to start with a digit ("3rd quarter
+    // numbers came in at...") still goes to the text path.
+    if (/^-?\d+$/.test(arg)) {
+      const id = parseInt(arg, 10);
+      pinMemory(id);
+      await ctx.reply(`Pinned memory #${id}. It will never decay.`);
+      return;
+    }
+    try {
+      const chatIdStr = ctx.chat!.id.toString();
+      const result = await createPinnedMemory(chatIdStr, arg, AGENT_ID);
+      await ctx.reply(`Pinned ✓  #${result.id}\n${result.summary}`);
+    } catch (err) {
+      await ctx.reply(`Failed to pin: ${(err as Error).message}`);
+    }
   });
 
   // /unpin <id> — remove permanent flag, memory will decay normally
@@ -1722,7 +1747,25 @@ async function processDashboardMessage(
     const fullMessage = dashParts.join('\n\n');
 
     const onProgress = (event: AgentProgressEvent) => {
-      emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
+      if (event.type === 'tool_use') {
+        emitChatEvent({
+          type: 'tool_use',
+          chatId: chatIdStr,
+          toolUseId: event.toolUseId,
+          toolName: event.toolName,
+          input: event.input,
+          description: event.description,
+        });
+      } else if (event.type === 'tool_result') {
+        emitChatEvent({
+          type: 'tool_result',
+          chatId: chatIdStr,
+          toolUseId: event.toolUseId,
+          output: event.output,
+        });
+      } else {
+        emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
+      }
     };
 
     const abortCtrl = new AbortController();
@@ -1741,6 +1784,12 @@ async function processDashboardMessage(
       abortCtrl,
       undefined, // no streaming for dashboard
       agentMcpAllowlist,
+      // Hand the router and any downstream specialist the CLEAN user
+      // text, not the memory-context-bloated fullMessage. Otherwise
+      // sleuth/coder/etc see [Memory context]…[End memory context]
+      // jammed on top of every prompt AND that bloated string ends up
+      // persisted under agent_id=specialist:<callsign>.
+      { userText: text, chatId: chatIdStr },
     );
 
     clearTimeout(dashTimeout);
