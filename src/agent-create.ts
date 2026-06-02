@@ -147,7 +147,6 @@ export function validateAgentId(id: string): { ok: boolean; error?: string } {
     };
   }
   if (id === 'main') return { ok: false, error: '"main" is reserved for the primary bot' };
-  if (id.startsWith('_')) return { ok: false, error: 'Agent IDs starting with _ are reserved for templates' };
 
   // Check for collisions
   const existing = listAgentIds();
@@ -299,7 +298,7 @@ export async function createAgent(opts: CreateAgentOpts): Promise<CreateAgentRes
     name,
     description,
     telegram_bot_token_env: envKey,
-    model: model || 'claude-opus-4-7',
+    model: model || 'claude-opus-4-8',
   };
   fs.writeFileSync(
     path.join(agentDir, 'agent.yaml'),

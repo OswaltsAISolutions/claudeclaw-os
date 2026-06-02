@@ -179,7 +179,7 @@ export async function runAgent(
   // this task belongs to a specialist (coder, scribe, sleuth, archivist,
   // sentinel, cipher, eye, reaper, atlas, mercury). 3-stage chain:
   //   1) Keyword heuristic (~1ms)
-  //   2) Opus 4.7 LLM router (~3-4s) for ambiguous tasks ≥ 20 chars
+  //   2) Opus 4.8 LLM router (~3-4s) for ambiguous tasks ≥ 20 chars
   //   3) Local mistral-small:24b fallback if Opus fails
   // Documented never-throws (try/catch + 'self' fallback inside), but we
   // wrap defensively anyway — a routing failure must never block Jarvis.
