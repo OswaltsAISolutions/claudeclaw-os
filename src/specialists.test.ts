@@ -42,10 +42,12 @@ import {
 } from './specialists.js';
 import { ollamaChat, ollamaListModels } from './ollama.js';
 import { runClaw } from './claw-runner.js';
+import { getSpecialistTierOverride } from './db.js';
 
 const mockRunClaw = vi.mocked(runClaw);
 const mockOllamaChat = vi.mocked(ollamaChat);
 const mockListModels = vi.mocked(ollamaListModels);
+const mockTierOverride = vi.mocked(getSpecialistTierOverride);
 
 function clawResult(over: Record<string, unknown> = {}) {
   return {
@@ -61,8 +63,15 @@ function clawResult(over: Record<string, unknown> = {}) {
 describe('delegate (claw tier) honesty labeling', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    // sentinel + cipher + archivist all prefer qwen3-coder:30b with
-    // mistral-small:24b as first fallback.
+    // The 2026-06-01 cloud rebalance moved sentinel (and the other
+    // tool-required specialists) to the cloud tier. These tests exercise the
+    // CLAW path + ungrounded labeling, so put sentinel back on claw via a
+    // runtime tier override. cloud->claw is a supported transition:
+    // applyTierOverride swaps preferredModel to localFallbackModel
+    // (qwen3-coder:30b) and preserves expectsToolUse, recreating the exact
+    // claw scenario these assertions were written against. scribe stays claw
+    // statically, so its override is a no-op.
+    mockTierOverride.mockImplementation((cs) => (cs === 'sentinel' ? 'claw' : null));
     mockListModels.mockResolvedValue([
       { name: 'qwen3-coder:30b' },
       { name: 'mistral-small:24b' },
@@ -143,24 +152,29 @@ describe('delegate (claw tier) honesty labeling', () => {
 describe('resolveSpecialistModel', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockTierOverride.mockReturnValue(null);
   });
 
+  // resolveSpecialistModel only walks the Ollama tag chain for local/claw
+  // specialists (cloud tiers short-circuit to preferredModel). After the
+  // 2026-06-01 rebalance, reaper is the canonical statically-claw specialist,
+  // so it exercises the installed-tag resolution + fallback logic.
   it('returns the preferred tag when it is installed', async () => {
-    mockListModels.mockResolvedValue([{ name: 'qwen3-coder:30b' }] as Awaited<ReturnType<typeof ollamaListModels>>);
-    const r = await resolveSpecialistModel('sentinel');
-    expect(r).toEqual({ model: 'qwen3-coder:30b' });
+    mockListModels.mockResolvedValue([{ name: 'huihui_ai/Qwen3.6-abliterated:35b' }] as Awaited<ReturnType<typeof ollamaListModels>>);
+    const r = await resolveSpecialistModel('reaper');
+    expect(r).toEqual({ model: 'huihui_ai/Qwen3.6-abliterated:35b' });
   });
 
   it('falls back to the next installed tag when the preferred one is missing', async () => {
-    mockListModels.mockResolvedValue([{ name: 'mistral-small:24b' }] as Awaited<ReturnType<typeof ollamaListModels>>);
-    const r = await resolveSpecialistModel('sentinel');
-    expect(r?.model).toBe('mistral-small:24b');
-    expect(r?.fellBackFrom).toBe('qwen3-coder:30b');
+    mockListModels.mockResolvedValue([{ name: 'huihui_ai/Qwen3.6-abliterated:27b' }] as Awaited<ReturnType<typeof ollamaListModels>>);
+    const r = await resolveSpecialistModel('reaper');
+    expect(r?.model).toBe('huihui_ai/Qwen3.6-abliterated:27b');
+    expect(r?.fellBackFrom).toBe('huihui_ai/Qwen3.6-abliterated:35b');
   });
 
   it('returns null when nothing in the chain is installed', async () => {
     mockListModels.mockResolvedValue([{ name: 'some-unrelated-model:1b' }] as Awaited<ReturnType<typeof ollamaListModels>>);
-    const r = await resolveSpecialistModel('sentinel');
+    const r = await resolveSpecialistModel('reaper');
     expect(r).toBeNull();
   });
 });

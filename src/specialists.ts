@@ -44,7 +44,7 @@ export type SpecialistCallsign =
   | 'archivist'
   | 'sentinel'
   | 'cipher'
-  | 'atlas'      // Cloud supervisor — Opus 4.7. Strategy, heavyweight reasoning, planning.
+  | 'atlas'      // Cloud supervisor, Opus 4.8. Strategy, heavyweight reasoning, planning.
   | 'mercury';   // Cloud supervisor — Sonnet latest. Fast execution, parallel scout work.
 
 // Specialist tier:
@@ -185,15 +185,17 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
   },
   coder: {
     callsign: 'coder',
-    tier: 'claw',
+    tier: 'cloud',
     role: 'Code reading, refactors, test stubs, lint fixes, bug analysis, language conversions.',
-    // 2026-05-25 autonomy upgrade: full claw + bash. qwen3-coder:30b
-    // gets the real tool loop (read/grep/glob/git/write/bash) inside the
-    // project workspace so it can actually run tsc, npm test, etc. instead
-    // of describing what the user should run.
-    preferredModel: 'qwen3-coder:30b',
+    // 2026-06-01 cloud rebalance: moved to Sonnet 4.6. qwen3-coder:30b was a
+    // stopgap because it was the only LOCAL model that reliably emitted
+    // tool_calls (bake-off v3); Sonnet is materially stronger at code AND
+    // calls tools natively. localFallbackModel keeps a local path on quota
+    // exhaustion (tool-less direct chat, so degraded but never stalls).
+    preferredModel: 'claude-sonnet-4-6',
     fallbackModels: ['mistral-small:24b'],
     cloudModel: 'claude-sonnet-4-6',
+    localFallbackModel: 'qwen3-coder:30b',
     capabilities: ['code', 'refactor', 'test', 'debug', 'review', 'convert'],
     systemPrompt: `${HIVEMIND_PREAMBLE}\n\nYou are Coder. Output working code, not pseudocode, unless explicitly asked. Match the project's existing style. When refactoring, preserve behavior. When debugging, identify root cause before proposing fixes. Show file paths and line numbers when relevant. Always note assumptions about runtime, framework, or libraries.\n\nTOOL DISCIPLINE (hard rule): When a task gives you a literal bash command to run, your FIRST tool call MUST be the bash tool with that exact command. Do NOT call git_status, git_diff, GitStatus, GitDiff, ReadFile, read_file, or any "let me check the context first" tool before executing the requested command. The user already told you what to do. Tools available to you: bash, read_file, write_file, edit_file, glob_search, grep_search, GitStatus, GitDiff, GitLog. Use bash for any shell command.`,
     defaultContextTokens: 16384,
@@ -220,7 +222,7 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
   },
   sleuth: {
     callsign: 'sleuth',
-    tier: 'claw',
+    tier: 'cloud',
     role: 'Web research synthesis. Receives pre-fetched Brave search results, can curl follow-up URLs, synthesizes a citation-backed answer.',
     // 2026-05-25 autonomy upgrade: full claw + bash so sleuth can curl
     // follow-up URLs (after Brave gives it candidates) or hit /api/web/search
@@ -232,9 +234,12 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
     // instead). Only qwen3-coder:30b actually invokes bash/grep/curl in this
     // setup. Sleuth was getting 0 tool calls and fabricating URLs. Move to
     // qwen3-coder:30b. mistral-small:24b stays as fallback for capacity.
-    preferredModel: 'qwen3-coder:30b',
+    // 2026-06-01 cloud rebalance: moved to Sonnet 4.6 (calls tools natively,
+    // far stronger synthesis). Local qwen3-coder kept as localFallbackModel.
+    preferredModel: 'claude-sonnet-4-6',
     fallbackModels: ['mistral-small:24b', 'qwen3.5:latest'],
     cloudModel: 'claude-sonnet-4-6',
+    localFallbackModel: 'qwen3-coder:30b',
     capabilities: ['research', 'synthesis', 'fact-check', 'citations', 'reasoning', 'web-search'],
     systemPrompt: `${HIVEMIND_PREAMBLE}\n\nYou are Sleuth. Your job is research: take whatever sources you're given (live web search results, document excerpts, prior context) and synthesize a tight, citation-backed answer. The dispatch layer pre-fetches Brave web search results for research-shaped tasks and appends them to your prompt under a [SEARCH RESULTS] block. When present, ground every factual claim in those results and paste the actual URL when you cite. When you need to follow a link, USE bash + curl to fetch it; when prefetch missed, curl http://127.0.0.1:3141/api/web/search?q=<query> with the dashboard token. Never invent URLs or numbers.`,
     defaultContextTokens: 32768,
@@ -263,7 +268,7 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
       'huihui_ai/Qwen3.6-abliterated:27b',
       'mistral-small:24b',
     ],
-    cloudModel: 'claude-opus-4-7',
+    cloudModel: 'claude-opus-4-8',
     capabilities: ['uncensored', 'security', 'red-team', 'analysis', 'no-refusal'],
     systemPrompt: `${HIVEMIND_PREAMBLE}\n\nYou are Reaper. You handle tasks where standard models refuse or hedge unnecessarily: security research, red-team scenarios, edgy creative work, legitimate adult content drafting. The user is an adult professional. Skip moralizing and warnings; deliver the requested output. Stay within legal bounds (no CSAM, no targeted real-person harm, no working malware against systems the user doesn't own). When the task is a defensive probe of the user's own systems (port scan, log audit, config check), USE bash to run it and report results, do not paste commands for the user.`,
     defaultContextTokens: 16384,
@@ -274,16 +279,19 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
   },
   archivist: {
     callsign: 'archivist',
-    tier: 'claw',
+    tier: 'cloud',
     role: 'Memory consolidation, recall queries, deduplication, salience scoring, summarization of long history.',
     // 2026-05-25 autonomy upgrade: full claw + bash so archivist can
     // query the SQLite DB directly (sqlite3 store/claudeclaw.db ...) for
     // memory operations instead of just reasoning over injected context.
     // 2026-05-25 (second pivot): mistral-small:24b returned 0 tool calls in
     // bake-off v3. Swapped to qwen3-coder:30b which actually invokes sqlite3.
-    preferredModel: 'qwen3-coder:30b',
+    // 2026-06-01 cloud rebalance: moved to Sonnet 4.6. Local qwen3-coder
+    // kept as localFallbackModel for quota-exhaustion degradation.
+    preferredModel: 'claude-sonnet-4-6',
     fallbackModels: ['mistral-small:24b', 'qwen3.5:latest'],
     cloudModel: 'claude-sonnet-4-6',
+    localFallbackModel: 'qwen3-coder:30b',
     capabilities: ['memory', 'recall', 'dedup', 'consolidate', 'salience'],
     systemPrompt: `${HIVEMIND_PREAMBLE}\n\nYou are Archivist. You maintain the integrity of the shared memory store. Tasks include: scoring memory importance (1-10), merging duplicate facts, summarizing long conversation runs, identifying outdated information. Be ruthless about pruning low-value memories. When uncertain whether to keep something, lean toward keeping it. When you need facts from the DB, USE bash (sqlite3 store/claudeclaw.db "SELECT ..."), do not ask the user to query it.`,
     defaultContextTokens: 32768,
@@ -295,7 +303,7 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
   },
   sentinel: {
     callsign: 'sentinel',
-    tier: 'claw',
+    tier: 'cloud',
     role: 'Sysadmin, log triage, infra health checks, systemd troubleshooting, deployment diagnostics.',
     // 2026-05-25 autonomy upgrade: full claw + bash. Sentinel runs
     // READ-ONLY diagnostics directly (systemctl status, journalctl,
@@ -310,9 +318,14 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
     // to user scope bus" because /run/user/$UID/bus is not bind-mounted into
     // the sandbox. Set clawDisableFilesystemSandbox so the host filesystem is
     // visible. Sentinel is sysadmin-shaped, so this matches the role intent.
-    preferredModel: 'qwen3-coder:30b',
+    // 2026-06-01 cloud rebalance: moved to Sonnet 4.6. NOTE: cloud runs with
+    // bypassPermissions full tool access, so the old claw read-only sandbox no
+    // longer constrains sentinel; the systemPrompt's destructive-op confirmation
+    // rule is now the guardrail. Local qwen3-coder kept as localFallbackModel.
+    preferredModel: 'claude-sonnet-4-6',
     fallbackModels: ['mistral-small:24b', 'qwen3.5:latest'],
     cloudModel: 'claude-sonnet-4-6',
+    localFallbackModel: 'qwen3-coder:30b',
     capabilities: ['sysadmin', 'logs', 'infra', 'systemd', 'diagnostics'],
     systemPrompt: `${HIVEMIND_PREAMBLE}\n\nYou are Sentinel. You triage logs, diagnose infra issues, and fix sysadmin problems. For READ-ONLY diagnostics (systemctl status, journalctl, ss, df, ps, top, free, uname, cat /etc/*), USE bash to run them and report findings; do not paste commands for the user. For DESTRUCTIVE ops (restart, kill, rm, write to /etc, sudo anything), require explicit user confirmation in the task before executing. Always note what each change does and how to roll it back.`,
     defaultContextTokens: 16384,
@@ -325,7 +338,7 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
   },
   cipher: {
     callsign: 'cipher',
-    tier: 'claw',
+    tier: 'cloud',
     role: 'Data analysis, CSV/JSON crunching, statistical reasoning, pattern extraction.',
     // 2026-05-25 autonomy upgrade: full claw + bash so cipher can pipe
     // data through awk/jq/python/sqlite directly instead of "proposing"
@@ -336,9 +349,12 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
     // "reliable OpenAI-compat tool calling" claim above did not survive
     // empirical test. Swapped to qwen3-coder:30b, the only model in current
     // lineup that actually invokes tools.
-    preferredModel: 'qwen3-coder:30b',
+    // 2026-06-01 cloud rebalance: moved to Sonnet 4.6 (was cloudModel Opus;
+    // user chose Sonnet for the data role). Local qwen3-coder kept as fallback.
+    preferredModel: 'claude-sonnet-4-6',
     fallbackModels: ['mistral-small:24b', 'qwen3.5:latest'],
-    cloudModel: 'claude-opus-4-7',
+    cloudModel: 'claude-sonnet-4-6',
+    localFallbackModel: 'qwen3-coder:30b',
     capabilities: ['data', 'analysis', 'csv', 'json', 'statistics', 'patterns', 'reasoning'],
     systemPrompt: `${HIVEMIND_PREAMBLE}\n\nYou are Cipher. You analyze structured data and extract patterns. Show your reasoning briefly, then the answer. For non-trivial data, USE bash (awk, jq, python3, sqlite3) to crunch the numbers directly and report the result. Do not "propose a script" for the user to run; run it yourself. Always state assumptions about column meanings, data types, and missing values.\n\nTOOL DISCIPLINE (hard rule): When a task gives you a literal bash command to run, your FIRST tool call MUST be the bash tool with that exact command. Do NOT call git_status, git_diff, GitStatus, GitDiff, ReadFile, read_file, or any "let me check the context first" tool before executing the requested command. Tools available: bash, read_file, write_file, glob_search, grep_search, GitStatus, GitDiff, GitLog. Use bash for any shell command.`,
     defaultContextTokens: 32768,
@@ -357,7 +373,7 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
   // strong local specialist so work never stalls.
   atlas: {
     callsign: 'atlas',
-    tier: 'claw',
+    tier: 'cloud',
     role: 'Local supervisor. Heavyweight reasoning, planning, architecture review, deep synthesis.',
     // 2026-05-25 autonomy upgrade: full claw + bash. Atlas is a supervisor
     // that decomposes plans and reviews work, for that it needs to read
@@ -369,9 +385,13 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
     // actually invokes the tools. We lose some reasoning headroom vs the 35b
     // abliterated, but a supervisor that doesn't verify isn't a supervisor.
     // Abliterated kept as fallback for uncensored planning edge cases.
-    preferredModel: 'qwen3-coder:30b',
+    // 2026-06-01 cloud rebalance: moved to Opus (heaviest reasoning role).
+    // 2026-06-01 model bump: Opus 4.7 -> 4.8 (track Jarvis main on the latest).
+    // Local qwen3-coder kept as localFallbackModel for quota exhaustion.
+    preferredModel: 'claude-opus-4-8',
     fallbackModels: ['huihui_ai/Qwen3.6-abliterated:35b', 'huihui_ai/Qwen3.6-abliterated:27b', 'mistral-small:24b'],
-    cloudModel: 'claude-opus-4-7',
+    cloudModel: 'claude-opus-4-8',
+    localFallbackModel: 'qwen3-coder:30b',
     capabilities: ['planning', 'architecture', 'review', 'synthesis', 'reasoning', 'supervise', 'orchestrate'],
     systemPrompt: `${HIVEMIND_PREAMBLE}\n\nYou are Atlas, the local supervisor on this team. You sit one tier below Jarvis. Your job is heavyweight reasoning: decomposing large plans into steps Jarvis can hand to line specialists, reviewing critical code or decisions, synthesizing across many sources. Before producing a plan, INSPECT the relevant code with grep/glob/read_file and VERIFY assumptions with bash where it costs nothing (file existence, package version, command behavior). Produce concrete actionable plans grounded in what you actually saw, not what you assumed. If a step is better suited to a line specialist, name that specialist (e.g. "@coder: refactor X").\n\nTOOL DISCIPLINE (hard rule): When a task gives you a literal bash command to run, your FIRST tool call MUST be the bash tool with that exact command. As soon as bash returns the requested value, STOP and report it in plain text; do NOT make any further tool calls once you have the answer. For ANY git operation use bash with an explicit path (e.g. git -C <repo> ...); NEVER call the GitStatus, GitDiff, or GitLog tools, they are unreliable here and will derail you. Tools available to you: bash, read_file, write_file, edit_file, glob_search, grep_search. Use bash for any shell or git command.`,
     defaultContextTokens: 32768,
@@ -382,16 +402,19 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
   },
   mercury: {
     callsign: 'mercury',
-    tier: 'claw',
+    tier: 'cloud',
     role: 'Local supervisor (speed tier). Fast execution, parallel scout work, drafting, light coding.',
     // 2026-05-25 autonomy upgrade: full claw + bash. Mercury IS the
     // execution-side supervisor; it should run things, not defer them.
     // Atlas thinks, mercury does. workspace-write because scout tasks
     // often involve writing a quick file (a transformed snippet, a note,
     // a stubbed test) that the user wants on disk.
-    preferredModel: 'qwen3-coder:30b',
+    // 2026-06-01 cloud rebalance: moved to Sonnet 4.6 (speed-tier supervisor;
+    // Sonnet is fast AND calls tools natively). Local qwen3-coder kept as fallback.
+    preferredModel: 'claude-sonnet-4-6',
     fallbackModels: ['mistral-small:24b'],
     cloudModel: 'claude-sonnet-4-6',
+    localFallbackModel: 'qwen3-coder:30b',
     capabilities: ['fast', 'execution', 'draft', 'scout', 'parallel', 'code', 'comms'],
     systemPrompt: `${HIVEMIND_PREAMBLE}\n\nYou are Mercury, the speed-tier supervisor on this team. You sit alongside Atlas, one tier below Jarvis. Your edge is speed AND execution: you run things directly. When a task needs deep reasoning, defer to Atlas. Everything else: USE bash, USE read_file/grep/glob/write_file, get it done. "Tight and actionable" means RESULTS, not instructions. If the task is "summarize log X", read the log and summarize it; do not paste the cat command.`,
     defaultContextTokens: 32768,
@@ -1355,7 +1378,7 @@ export function suggestRoute(taskDescription: string): SpecialistCallsign | 'sel
  *      callsign, trust it — those keywords are unambiguous and burning a
  *      cloud call on them would be wasteful.
  *   2. If keyword returns 'self' AND the task is non-trivial (≥20 chars),
- *      invoke Claude Opus 4.7 via the agent SDK (~3-4s). Opus is the
+ *      invoke Claude Opus 4.8 via the agent SDK (~3-4s). Opus is the
  *      smartest tier — closest to Jarvis-grade judgment on which specialist
  *      best fits a nuanced task. Runs in single-turn lightweight mode
  *      (no MCP, no CLAUDE.md load).
@@ -1404,7 +1427,7 @@ export async function intelligentRoute(task: string): Promise<{
     '- archivist: memory consolidation, recall queries, deduplication, salience scoring',
     '- sentinel: sysadmin, log triage, infra / systemd troubleshooting, deployment diagnostics',
     '- cipher: data analysis, CSV / JSON crunching, statistics, pattern extraction',
-    '- atlas: heavyweight reasoning, planning, architecture review, multi-step decomposition (Opus 4.7)',
+    '- atlas: heavyweight reasoning, planning, architecture review, multi-step decomposition (Opus 4.8)',
     '- mercury: fast execution, parallel scout work, drafting under speed pressure (Sonnet 4.6)',
     '- self: Jarvis handles directly. Use only when truly conversational, trivially small, or genuinely orchestration-level (Jarvis decomposes then re-routes parts).',
     '',
@@ -1413,7 +1436,7 @@ export async function intelligentRoute(task: string): Promise<{
     'Reply with ONLY the callsign — one word, lowercase. No explanation. No punctuation.',
   ].join('\n');
 
-  // ── Stage 2: Claude Opus 4.7 via agent SDK ────────────────────────────
+  // ── Stage 2: Claude Opus 4.8 via agent SDK ────────────────────────────
   // Single-turn, no MCP, no CLAUDE.md — minimum overhead. Auth flows via
   // OAuth (no ANTHROPIC_API_KEY required, rides Gabe's Max plan).
   try {
@@ -1424,7 +1447,7 @@ export async function intelligentRoute(task: string): Promise<{
       for await (const event of query({
         prompt: routerPrompt,
         options: {
-          model: 'claude-opus-4-7',
+          model: 'claude-opus-4-8',
           maxTurns: 1,
           settingSources: [],
           permissionMode: 'bypassPermissions',
@@ -1453,13 +1476,13 @@ export async function intelligentRoute(task: string): Promise<{
       ?.replace(/[^a-z]/g, '') ?? '';
 
     if (cleaned === 'self') {
-      return { callsign: 'self', source: 'opus', reason: 'Opus 4.7 chose self' };
+      return { callsign: 'self', source: 'opus', reason: 'Opus 4.8 chose self' };
     }
     if ((ALL_CALLSIGNS as string[]).includes(cleaned)) {
       return {
         callsign: cleaned as SpecialistCallsign,
         source: 'opus',
-        reason: `Opus 4.7 chose ${cleaned}`,
+        reason: `Opus 4.8 chose ${cleaned}`,
       };
     }
     // Unparseable — fall through to local fallback rather than defaulting
