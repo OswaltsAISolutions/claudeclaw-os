@@ -73,6 +73,25 @@ default; the complex/default path is now Opus 4.8.
 creds. Result: `usedModel=claude-opus-4-8 reply="PONG"`. Model ID is real
 and accepted. Probe deleted after.
 
+## 3. Cloud→local fallback honesty label (follow-on)
+
+Moving 7 specialists to cloud ACTIVATED a previously-dormant code path:
+`delegateCloud`'s rate-limit degrade to `localFallbackModel` (direct,
+no-tool-loop ollamaChat). It was returning that no-tools local output
+UNLABELED, while the sibling claw no-tools fallback prefixes
+`NO_TOOLS_FALLBACK_NOTICE`. Same fabrication risk (bake-off proved local
+no-tool models invent ports/URLs/figures), so the same honesty contract
+must apply. This collided with the standing "show honestly / never invent
+values" rule, so it was fixed in the same arc rather than left as debt.
+
+`src/specialists.ts`:
+- Added `CLOUD_FALLBACK_NOTICE` (cloud rate-limited → no-tools local).
+- The cloud→local return now prefixes that notice (output + the logged
+  conversation turn); empty output keeps the bare
+  `[local fallback produced no output]` marker.
+- The `specialist-cloud-to-local-fallback` hive_mind entry now carries
+  `unverified:true` (parity with the claw fallback's flag).
+
 ## Tests
 
 7 stale-config failures in `src/specialists.test.ts`, all because the
@@ -87,7 +106,10 @@ moved to cloud. Fixed by intent, not by reverting config:
   remaining statically-claw specialist) and its real Ollama fallback
   chain (35b → 27b → null).
 
-Full suite GREEN: 991 passed / 4 skipped / 71 files. `npm run build`
+Plus 2 NEW tests for section 3 (cloud→local fallback labeled / empty-output
+unlabeled), in a new `specialists.test.ts` describe block.
+
+Full suite GREEN: 993 passed / 4 skipped / 71 files. `npm run build`
 (vite + tsc) GREEN.
 
 ## Deploy + verification (live)
@@ -100,7 +122,9 @@ Deployed via `POST /api/agents/main/restart` (busy-guarded). Post-restart:
 
 ## Status
 
-Both changes complete, deployed, verified. Not yet committed/pushed to
-git as of this writing (source + dist built and live). Next: commit in
-two logical chunks (rebalance, opus-4.8) and push. Nothing in this slice
-left to design or re-investigate.
+All three changes complete, deployed (busy-guarded restart), and verified
+live: `/api/health` model=claude-opus-4-8 + telegramConnected; all 10
+specialists match the table and report available=true. Rebalance + opus-4.8
+pushed earlier (6459d42 / 8b8b56e / 2dc2a72). Section 3 (cloud→local label)
+committed + pushed as its own logical chunk. Nothing in this slice left to
+design or re-investigate.

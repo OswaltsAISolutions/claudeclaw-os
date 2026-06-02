@@ -752,6 +752,13 @@ export const NO_TOOLS_FALLBACK_NOTICE =
   '[unverified: claw failed, so this answer came from a no-tools fallback model and was NOT checked against files, commands, or the web]';
 export const UNGROUNDED_NOTICE =
   '[unverified: produced without any tool calls, so factual claims (paths, URLs, figures) are NOT grounded and may be fabricated]';
+// Cloud specialist was rate-limited and degraded to a direct (no tool loop)
+// local model. Same fabrication risk as NO_TOOLS_FALLBACK_NOTICE: text-in/
+// text-out with no files, commands, or web access. Made live for all 7 cloud
+// roles by the 2026-06-01 rebalance, so the quota-degrade answer must carry
+// the same honesty flag the claw fallback already does.
+export const CLOUD_FALLBACK_NOTICE =
+  '[unverified: cloud was rate-limited, so this answer came from a no-tools local fallback model and was NOT checked against files, commands, or the web]';
 
 /**
  * Claw delegation. Local agentic loop via the `claw-code` Rust harness
@@ -1194,7 +1201,7 @@ async function delegateCloud(
           logToHiveMind(
             agentNs, chatId, 'specialist-cloud-to-local-fallback',
             `${spec.callsign}: ${spec.preferredModel} → ${spec.localFallbackModel}`,
-            JSON.stringify({ error: String(err).slice(0, 200) }),
+            JSON.stringify({ error: String(err).slice(0, 200), unverified: true }),
           );
         } catch { /* best-effort */ }
 
@@ -1222,13 +1229,18 @@ async function delegateCloud(
           if (!localOutput.trim() && localThinking.trim()) {
             localOutput = `[no final answer; partial reasoning]\n${localThinking.trim()}`;
           }
+          // No-tools local degrade: label it unverified before it reaches the
+          // user or Jarvis, exactly as the claw no-tools fallback does above.
+          const labeledLocalOutput = localOutput.trim()
+            ? `${CLOUD_FALLBACK_NOTICE}\n\n${localOutput.trim()}`
+            : '[local fallback produced no output]';
           if (localOutput.trim()) {
-            logConversationTurn(chatId, 'assistant', localOutput, undefined, agentNs);
+            logConversationTurn(chatId, 'assistant', labeledLocalOutput, undefined, agentNs);
           }
           return {
             callsign: spec.callsign,
             modelUsed: spec.localFallbackModel,
-            output: localOutput.trim() || '[local fallback produced no output]',
+            output: labeledLocalOutput,
             durationMs: Date.now() - startedAt,
             tokenEstimate: 0,
             fellBackFrom: spec.preferredModel,

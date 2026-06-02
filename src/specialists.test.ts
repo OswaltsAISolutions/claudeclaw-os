@@ -39,15 +39,30 @@ import {
   resolveSpecialistModel,
   NO_TOOLS_FALLBACK_NOTICE,
   UNGROUNDED_NOTICE,
+  CLOUD_FALLBACK_NOTICE,
 } from './specialists.js';
 import { ollamaChat, ollamaListModels } from './ollama.js';
 import { runClaw } from './claw-runner.js';
 import { getSpecialistTierOverride } from './db.js';
+import { query } from '@anthropic-ai/claude-agent-sdk';
 
 const mockRunClaw = vi.mocked(runClaw);
 const mockOllamaChat = vi.mocked(ollamaChat);
 const mockListModels = vi.mocked(ollamaListModels);
 const mockTierOverride = vi.mocked(getSpecialistTierOverride);
+const mockQuery = vi.mocked(query);
+
+// Async-iterable whose first `next()` rejects, simulating the cloud SDK
+// stream throwing a rate-limit error part-way through delegateCloud's
+// `for await`. Hand-rolled (not an async generator) so there is no unused
+// `yield` and the rejection surfaces exactly where the real SDK's would.
+function rateLimitedStream(message: string) {
+  return {
+    [Symbol.asyncIterator]() {
+      return { next: () => Promise.reject(new Error(message)) };
+    },
+  } as unknown as ReturnType<typeof query>;
+}
 
 function clawResult(over: Record<string, unknown> = {}) {
   return {
@@ -176,5 +191,51 @@ describe('resolveSpecialistModel', () => {
     mockListModels.mockResolvedValue([{ name: 'some-unrelated-model:1b' }] as Awaited<ReturnType<typeof ollamaListModels>>);
     const r = await resolveSpecialistModel('reaper');
     expect(r).toBeNull();
+  });
+});
+
+// The 2026-06-01 rebalance moved 7 tool/reasoning specialists to the cloud
+// tier, which activated delegateCloud's previously-dormant cloud->local
+// quota-degrade path. That local model runs with no tool loop, so (like the
+// claw no-tools fallback) its answer must be labeled unverified before it
+// reaches the user or Jarvis. These lock that honesty contract.
+describe('delegateCloud rate-limit → local fallback honesty labeling', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // No tier override: exercise the real cloud tier so a rate-limit error
+    // drives the cloud->local fallback rather than the claw path.
+    mockTierOverride.mockReturnValue(null);
+  });
+
+  it('labels the cloud→local quota fallback output as unverified', async () => {
+    mockQuery.mockImplementation(() => rateLimitedStream('429 rate limit exceeded'));
+    mockOllamaChat.mockImplementation((async (
+      _model: string,
+      _msgs: unknown,
+      onEvent: (e: { delta?: string }) => void,
+    ) => {
+      onEvent({ delta: 'Open ports: 22, 3000' });
+    }) as unknown as typeof ollamaChat);
+
+    const res = await delegate('sentinel', 'list open ports');
+    expect(res.output.startsWith(CLOUD_FALLBACK_NOTICE)).toBe(true);
+    expect(res.output).toContain('Open ports: 22, 3000');
+    expect(res.modelUsed).toBe('qwen3-coder:30b');
+    expect(res.fellBackFrom).toBe('claude-sonnet-4-6');
+  });
+
+  it('does NOT prepend the notice when the local fallback yields no output', async () => {
+    mockQuery.mockImplementation(() => rateLimitedStream('429 rate limit exceeded'));
+    mockOllamaChat.mockImplementation((async (
+      _model: string,
+      _msgs: unknown,
+      onEvent: (e: { delta?: string }) => void,
+    ) => {
+      onEvent({ delta: '' });
+    }) as unknown as typeof ollamaChat);
+
+    const res = await delegate('sentinel', 'list open ports');
+    expect(res.output).toBe('[local fallback produced no output]');
+    expect(res.output).not.toContain('unverified');
   });
 });
