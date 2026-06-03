@@ -1343,43 +1343,50 @@ async function delegateCloud(
 }
 
 /**
+ * Keyword routing table. Order matters: more specific specialists first.
+ * Cloud supervisors come AFTER local specialists for routine work (so we
+ * don't burn Max quota on tasks a local can handle), but BEFORE the 'self'
+ * fallback when the task is heavy-reasoning or tool-heavy. Each callsign
+ * appears exactly once, so a task's matched-domain count is the number of
+ * distinct entries it trips (see matchedSpecialists).
+ */
+const ROUTING_RULES: Array<[SpecialistCallsign, string[]]> = [
+  ['coder', ['refactor', 'unit test', 'compile', 'function', 'class ', 'typescript', 'python', 'javascript', 'lint', 'bug', 'stack trace', 'syntax']],
+  ['eye', ['image', 'photo', 'screenshot', 'ocr', 'video frame', 'picture', 'what is in this', 'analyze this image']],
+  ['cipher', ['csv', 'json data', 'spreadsheet', 'dataset', 'statistics', 'count rows', 'group by']],
+  ['sentinel', ['systemd', 'log', 'crash', 'service', 'restart', 'cron', 'deployment', 'health check', 'journalctl']],
+  ['reaper', ['uncensored', 'no guardrail', 'red team', 'jailbreak', 'security research', 'no warnings']],
+  ['archivist', ['memory', 'remember', 'recall', 'consolidate', 'dedupe', 'salience']],
+  ['sleuth', ['research', 'find out about', 'who is', 'what is the latest', 'sources', 'citations']],
+  ['scribe', ['summarize', 'rewrite', 'draft', 'format this', 'tldr', 'clean up text', 'caption']],
+  // Cloud supervisors — invoked when the task is heavyweight or
+  // explicitly named. Atlas for deep / strategic / architectural work,
+  // Mercury for parallel scout / fast turn-around.
+  ['atlas', ['deep dive', 'architecture review', 'plan this out', 'strategic', 'long-form', 'review the design', 'post-mortem', 'opus']],
+  ['mercury', ['quick scout', 'parallel', 'fast draft', 'spin up', 'spin out', 'sonnet']],
+];
+
+/** Planning / orchestration triggers that keep a task with Jarvis. */
+const SELF_MARKERS = [
+  'plan', 'orchestrate', 'decide', 'what should i', 'help me think',
+  'figure out', 'strategy', 'design the', 'architect',
+];
+
+/**
  * Routing helper. Given a task description, suggest the best specialist
  * or 'self' (meaning Jarvis handles it). This is intentionally simple
  * keyword-based; the smarter version uses an LLM router. Either way,
- * Jarvis has final say.
+ * Jarvis has final say. Returns the FIRST matching specialist — callers
+ * that need the multi-domain picture use matchedSpecialists().
  */
 export function suggestRoute(taskDescription: string): SpecialistCallsign | 'self' {
   const t = taskDescription.toLowerCase();
 
   // Hard "stay with Jarvis" triggers: anything ambiguous, planning,
   // multi-step orchestration, novel reasoning.
-  const selfMarkers = [
-    'plan', 'orchestrate', 'decide', 'what should i', 'help me think',
-    'figure out', 'strategy', 'design the', 'architect',
-  ];
-  for (const m of selfMarkers) if (t.includes(m)) return 'self';
+  for (const m of SELF_MARKERS) if (t.includes(m)) return 'self';
 
-  // Order matters: more specific specialists first. Cloud supervisors
-  // come AFTER local specialists for routine work (so we don't burn Max
-  // quota on tasks a local can handle), but BEFORE 'self' fallback when
-  // the task is heavy-reasoning or tool-heavy.
-  const rules: Array<[SpecialistCallsign, string[]]> = [
-    ['coder', ['refactor', 'unit test', 'compile', 'function', 'class ', 'typescript', 'python', 'javascript', 'lint', 'bug', 'stack trace', 'syntax']],
-    ['eye', ['image', 'photo', 'screenshot', 'ocr', 'video frame', 'picture', 'what is in this', 'analyze this image']],
-    ['cipher', ['csv', 'json data', 'spreadsheet', 'dataset', 'statistics', 'count rows', 'group by']],
-    ['sentinel', ['systemd', 'log', 'crash', 'service', 'restart', 'cron', 'deployment', 'health check', 'journalctl']],
-    ['reaper', ['uncensored', 'no guardrail', 'red team', 'jailbreak', 'security research', 'no warnings']],
-    ['archivist', ['memory', 'remember', 'recall', 'consolidate', 'dedupe', 'salience']],
-    ['sleuth', ['research', 'find out about', 'who is', 'what is the latest', 'sources', 'citations']],
-    ['scribe', ['summarize', 'rewrite', 'draft', 'format this', 'tldr', 'clean up text', 'caption']],
-    // Cloud supervisors — invoked when the task is heavyweight or
-    // explicitly named. Atlas for deep / strategic / architectural work,
-    // Mercury for parallel scout / fast turn-around.
-    ['atlas', ['deep dive', 'architecture review', 'plan this out', 'strategic', 'long-form', 'review the design', 'post-mortem', 'opus']],
-    ['mercury', ['quick scout', 'parallel', 'fast draft', 'spin up', 'spin out', 'sonnet']],
-  ];
-
-  for (const [callsign, keywords] of rules) {
+  for (const [callsign, keywords] of ROUTING_RULES) {
     for (const kw of keywords) {
       if (t.includes(kw)) return callsign;
     }
@@ -1389,10 +1396,38 @@ export function suggestRoute(taskDescription: string): SpecialistCallsign | 'sel
 }
 
 /**
- * Smart auto-router. Three-stage fallback chain (Gabe explicitly requested
+ * Every distinct specialist domain a task's keywords touch, in rule order.
+ *
+ * This is what makes Jarvis an orchestrator instead of a switchboard: a
+ * request like "research the latest X, refactor the parser, and summarize
+ * the result" trips sleuth + coder + scribe. suggestRoute would ship the
+ * whole thing to whichever matched first; intelligentRoute instead sees the
+ * multi-domain signal and routes to 'self' so Jarvis can decompose it and
+ * fan the parts out to his team (delegate / delegate_parallel), several at
+ * once. Single-domain tasks return a one-element array and keep their fast
+ * keyword path. SELF_MARKERS are deliberately NOT counted here; they are
+ * handled by suggestRoute's own self short-circuit.
+ */
+export function matchedSpecialists(taskDescription: string): SpecialistCallsign[] {
+  const t = taskDescription.toLowerCase();
+  const hits: SpecialistCallsign[] = [];
+  for (const [callsign, keywords] of ROUTING_RULES) {
+    if (keywords.some((kw) => t.includes(kw)) && !hits.includes(callsign)) {
+      hits.push(callsign);
+    }
+  }
+  return hits;
+}
+
+/**
+ * Smart auto-router. Staged fallback chain (Gabe explicitly requested
  * the smartest available model do the routing, since misroutes waste
  * specialist work):
  *
+ *   0. Multi-domain check (~1ms). If the task trips 2+ distinct specialist
+ *      domains, return 'self' so Jarvis decomposes it and fans the parts
+ *      out to his team in parallel. This runs FIRST so a multi-part request
+ *      never collapses onto whichever specialist matched first.
  *   1. Keyword fast-path via suggestRoute (~1ms). If it returns a specific
  *      callsign, trust it — those keywords are unambiguous and burning a
  *      cloud call on them would be wasteful.
@@ -1415,6 +1450,22 @@ export async function intelligentRoute(task: string): Promise<{
   source: 'keyword' | 'opus' | 'local-fallback' | 'fallback';
   reason: string;
 }> {
+  // ── Stage 0: multi-domain detection ──────────────────────────────────
+  // If the task spans 2+ distinct specialist domains, no single specialist
+  // can finish it well. Hand it to Jarvis ('self') so he decomposes it and
+  // fans the parts out to his team, running independent parts at once via
+  // delegate_parallel. This is the orchestration path Jarvis exists for, and
+  // it runs BEFORE the single-pick keyword/Opus stages so a multi-part
+  // request never collapses onto whichever specialist matched first.
+  const domains = matchedSpecialists(task);
+  if (domains.length >= 2) {
+    return {
+      callsign: 'self',
+      source: 'keyword',
+      reason: `multi-domain task touches ${domains.map((d) => '@' + d).join(', ')} so Jarvis decomposes and delegates`,
+    };
+  }
+
   const keywordPick = suggestRoute(task);
   if (keywordPick !== 'self') {
     return {

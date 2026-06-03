@@ -37,6 +37,9 @@ vi.mock('./claw-runner.js', () => ({ runClaw: vi.fn() }));
 import {
   delegate,
   resolveSpecialistModel,
+  suggestRoute,
+  matchedSpecialists,
+  intelligentRoute,
   NO_TOOLS_FALLBACK_NOTICE,
   UNGROUNDED_NOTICE,
   CLOUD_FALLBACK_NOTICE,
@@ -238,5 +241,55 @@ describe('delegateCloud rate-limit → local fallback honesty labeling', () => {
     const res = await delegate('sentinel', 'list open ports');
     expect(res.output).toBe('[local fallback produced no output]');
     expect(res.output).not.toContain('unverified');
+  });
+});
+
+// The orchestration upgrade makes Jarvis a planner, not a switchboard: a task
+// that spans 2+ specialist domains is handed to 'self' so the main agent can
+// decompose it and fan the parts out (team.delegate_parallel) instead of
+// shipping the whole thing to whichever specialist matched first. These lock
+// the multi-domain detection + escalation while preserving the single-domain
+// fast path that existing routing relied on.
+describe('routing: multi-domain detection + escalation to Jarvis', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockTierOverride.mockReturnValue(null);
+  });
+
+  it('matchedSpecialists returns one domain for a single-specialty task', () => {
+    expect(matchedSpecialists('refactor this function')).toEqual(['coder']);
+  });
+
+  it('matchedSpecialists dedupes several keywords from the same specialist', () => {
+    // refactor + function + bug all map to coder; still one distinct domain.
+    expect(matchedSpecialists('refactor the function to fix the bug')).toEqual(['coder']);
+  });
+
+  it('matchedSpecialists returns distinct domains in rule order', () => {
+    // research -> sleuth, summarize -> scribe; sleuth precedes scribe in the table.
+    expect(matchedSpecialists('research the latest framework and summarize it')).toEqual(['sleuth', 'scribe']);
+  });
+
+  it('matchedSpecialists returns empty when no keyword matches', () => {
+    expect(matchedSpecialists('hello there how are you today')).toEqual([]);
+  });
+
+  it('intelligentRoute escalates a multi-domain task to self without an Opus call', async () => {
+    const r = await intelligentRoute('refactor this function and research the latest framework');
+    expect(r.callsign).toBe('self');
+    expect(r.source).toBe('keyword');
+    expect(r.reason).toContain('multi-domain');
+    expect(mockQuery).not.toHaveBeenCalled();
+  });
+
+  it('intelligentRoute keeps the single-domain keyword fast path (no Opus call)', async () => {
+    const r = await intelligentRoute('refactor this function');
+    expect(r.callsign).toBe('coder');
+    expect(r.source).toBe('keyword');
+    expect(mockQuery).not.toHaveBeenCalled();
+  });
+
+  it('suggestRoute still returns the first single match (dashboard suggestion contract)', () => {
+    expect(suggestRoute('refactor this function')).toBe('coder');
   });
 });

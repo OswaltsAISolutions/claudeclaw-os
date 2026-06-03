@@ -3,13 +3,14 @@ import path from 'path';
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
 
-import { AGENT_MAX_TURNS, PROJECT_ROOT, agentCwd, agentSystemPrompt } from './config.js';
+import { AGENT_ID, AGENT_MAX_TURNS, PROJECT_ROOT, agentCwd, agentSystemPrompt } from './config.js';
 import { readEnvFile } from './env.js';
 import { classifyError, AgentError } from './errors.js';
 import { logger } from './logger.js';
 import { getScrubbedSdkEnv } from './security.js';
 import { requireEnabled } from './kill-switches.js';
 import { intelligentRoute, delegate as delegateToSpecialist } from './specialists.js';
+import { createTeamMcpServer } from './team-tools.js';
 import { toolLabel } from './tool-labels.js';
 
 // ── MCP server loading ──────────────────────────────────────────────
@@ -268,16 +269,35 @@ export async function runAgent(
   const typingInterval = setInterval(onTyping, 4000);
 
   try {
-    // Load MCP servers from project + user settings files, filtered by agent allowlist
-    const mcpServers = loadMcpServers(mcpAllowlist);
-    const mcpServerNames = Object.keys(mcpServers);
+    // Load MCP servers from project + user settings files, filtered by agent allowlist.
+    // SDK Options.mcpServers expects Record<string, McpServerConfig>, whose union
+    // accepts in-process SDK servers alongside stdio ones, so we can mix them here.
+    const mcpServerSpecs: Record<string, McpStdioConfig | ReturnType<typeof createTeamMcpServer>> = {
+      ...loadMcpServers(mcpAllowlist),
+    };
+
+    // The MAIN Jarvis agent gets an in-process "team" MCP server so he can do
+    // the job he exists for: think big, make a plan, break it into independent
+    // sub-tasks, and hand each to the specialist best suited to it, running
+    // several at once. Attached ONLY here, on main's own live turn, gated three
+    // ways:
+    //   AGENT_ID === 'main'     never on a delegated sub-agent process
+    //   routingOptions present  the real Telegram/scheduler path, not an
+    //                           internal caller that opted out via skip
+    //   chatId present          so the hive_mind log + shared memory key off
+    //                           the actual conversation
+    // Recursion is bounded by construction: a delegated specialist runs through
+    // delegateCloud / delegateClaw, neither of which wires this server in, so a
+    // specialist can never sub-delegate. Depth is exactly one.
+    if (AGENT_ID === 'main' && !!routingOptions && !routingOptions.skip && routingOptions.chatId) {
+      mcpServerSpecs['team'] = createTeamMcpServer(routingOptions.chatId);
+    }
+
+    const mcpServerNames = Object.keys(mcpServerSpecs);
     logger.info(
       { sessionId: sessionId ?? 'new', messageLen: message.length, mcpServers: mcpServerNames },
       'Starting agent query',
     );
-
-    // SDK Options.mcpServers expects Record<string, McpServerConfig>
-    const mcpServerSpecs = mcpServerNames.length > 0 ? mcpServers : undefined;
 
     for await (const event of query({
       prompt: singleTurn(message),
@@ -314,8 +334,9 @@ export async function runAgent(
         // Pass secrets to the subprocess without polluting our own process.env
         env: sdkEnv,
 
-        // MCP servers loaded from .claude/settings.json and ~/.claude/settings.json
-        ...(mcpServerSpecs ? { mcpServers: mcpServerSpecs } : {}),
+        // MCP servers loaded from .claude/settings.json and ~/.claude/settings.json,
+        // plus the in-process "team" server on the main agent's live turn.
+        ...(mcpServerNames.length > 0 ? { mcpServers: mcpServerSpecs } : {}),
 
         // Stream partial text so Telegram can show progressive updates
         includePartialMessages: !!onStreamText,
