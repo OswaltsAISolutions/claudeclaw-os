@@ -44,7 +44,7 @@ export type SpecialistCallsign =
   | 'archivist'
   | 'sentinel'
   | 'cipher'
-  | 'atlas'      // Cloud supervisor, Opus 4.8. Strategy, heavyweight reasoning, planning.
+  | 'atlas'      // Cloud supervisor, Opus 4.7. Strategy, heavyweight reasoning, planning.
   | 'mercury';   // Cloud supervisor — Sonnet latest. Fast execution, parallel scout work.
 
 // Specialist tier:
@@ -166,15 +166,20 @@ const HIVEMIND_PREAMBLE = [
 export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
   scribe: {
     callsign: 'scribe',
-    tier: 'claw',
+    tier: 'cloud',
     role: 'Writing, summaries, drafts, rewrites, formatting, transcript cleanup, short-form copy.',
-    // 2026-05-25 autonomy upgrade: full claw + bash so scribe can fetch
-    // source material (curl a URL, read a file) before drafting instead
-    // of asking the user to paste it. Writes still gated at read-only
-    // because output is prose, not files; bash is for read-side fetches.
-    preferredModel: 'huihui_ai/Qwen3.6-abliterated:27b',
+    // 2026-06-02 hybrid topology: moved to cloud Sonnet 4.6. Scribe is prose,
+    // and Sonnet writes materially better than the local abliterated model
+    // while still fetching source material (curl a URL, read a file) natively
+    // before drafting. The uncensored local model is retained as
+    // localFallbackModel so edgy prose still has a home on quota exhaustion
+    // (tool-less direct chat). claw permission fields are kept for the
+    // cloud->claw override path. expectsToolUse stays UNSET: prose is a
+    // legitimately tool-less answer and must not be flagged ungrounded.
+    preferredModel: 'claude-sonnet-4-6',
     fallbackModels: ['mistral-small:24b'],
-    cloudModel: 'claude-sonnet-4-6',  // available via runtime tier override
+    cloudModel: 'claude-sonnet-4-6',
+    localFallbackModel: 'huihui_ai/Qwen3.6-abliterated:27b',
     capabilities: ['writing', 'summarize', 'rewrite', 'format', 'draft', 'copy'],
     systemPrompt: `${HIVEMIND_PREAMBLE}\n\nYou are Scribe. Your job is producing high-quality prose: summaries, rewrites, drafts, formatted output. Match the tone the user wants. When summarizing, lead with the conclusion then back it up. When drafting, prefer short paragraphs and active voice. Never invent facts. When the task references a file or URL you can fetch, fetch it first; never ask the user to paste content.`,
     defaultContextTokens: 8192,
@@ -386,11 +391,13 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
     // abliterated, but a supervisor that doesn't verify isn't a supervisor.
     // Abliterated kept as fallback for uncensored planning edge cases.
     // 2026-06-01 cloud rebalance: moved to Opus (heaviest reasoning role).
-    // 2026-06-01 model bump: Opus 4.7 -> 4.8 (track Jarvis main on the latest).
+    // 2026-06-02 hybrid: pinned to Opus 4.7. Atlas is the team's heavy
+    // reasoner one tier below Jarvis; Gabe set the supervisor at 4.7 while
+    // Jarvis main runs 4.8 (reverses the 2026-06-01 "track main on 4.8" bump).
     // Local qwen3-coder kept as localFallbackModel for quota exhaustion.
-    preferredModel: 'claude-opus-4-8',
+    preferredModel: 'claude-opus-4-7',
     fallbackModels: ['huihui_ai/Qwen3.6-abliterated:35b', 'huihui_ai/Qwen3.6-abliterated:27b', 'mistral-small:24b'],
-    cloudModel: 'claude-opus-4-8',
+    cloudModel: 'claude-opus-4-7',
     localFallbackModel: 'qwen3-coder:30b',
     capabilities: ['planning', 'architecture', 'review', 'synthesis', 'reasoning', 'supervise', 'orchestrate'],
     systemPrompt: `${HIVEMIND_PREAMBLE}\n\nYou are Atlas, the local supervisor on this team. You sit one tier below Jarvis. Your job is heavyweight reasoning: decomposing large plans into steps Jarvis can hand to line specialists, reviewing critical code or decisions, synthesizing across many sources. Before producing a plan, INSPECT the relevant code with grep/glob/read_file and VERIFY assumptions with bash where it costs nothing (file existence, package version, command behavior). Produce concrete actionable plans grounded in what you actually saw, not what you assumed. If a step is better suited to a line specialist, name that specialist (e.g. "@coder: refactor X").\n\nTOOL DISCIPLINE (hard rule): When a task gives you a literal bash command to run, your FIRST tool call MUST be the bash tool with that exact command. As soon as bash returns the requested value, STOP and report it in plain text; do NOT make any further tool calls once you have the answer. For ANY git operation use bash with an explicit path (e.g. git -C <repo> ...); NEVER call the GitStatus, GitDiff, or GitLog tools, they are unreliable here and will derail you. Tools available to you: bash, read_file, write_file, edit_file, glob_search, grep_search. Use bash for any shell or git command.`,
@@ -1431,15 +1438,15 @@ export async function intelligentRoute(task: string): Promise<{
     'You are the task router for Jarvis (Gabriel\'s AI COO). Your job: pick the BEST specialist for the given task. Be decisive.',
     '',
     'Specialists:',
-    '- scribe: writing, summaries, drafts, rewrites, formatting, short copy',
-    '- coder: code reading, refactors, tests, bug fixes, language conversions',
-    '- eye: image / video analysis, OCR, screenshot triage, visual classification',
-    '- sleuth: research synthesis, multi-source fact gathering, citations, "tell me about X" style questions',
-    '- reaper: uncensored / no-guardrail work (security research, red-team, edgy creative drafting)',
-    '- archivist: memory consolidation, recall queries, deduplication, salience scoring',
-    '- sentinel: sysadmin, log triage, infra / systemd troubleshooting, deployment diagnostics',
-    '- cipher: data analysis, CSV / JSON crunching, statistics, pattern extraction',
-    '- atlas: heavyweight reasoning, planning, architecture review, multi-step decomposition (Opus 4.8)',
+    '- scribe: writing, summaries, drafts, rewrites, formatting, short copy (Sonnet 4.6)',
+    '- coder: code reading, refactors, tests, bug fixes, language conversions (Sonnet 4.6)',
+    '- eye: image / video analysis, OCR, screenshot triage, visual classification (qwen3-vl:8b, local)',
+    '- sleuth: research synthesis, multi-source fact gathering, citations, "tell me about X" style questions (Sonnet 4.6)',
+    '- reaper: uncensored / no-guardrail work, e.g. security research, red-team, edgy creative drafting (abliterated 35b, local)',
+    '- archivist: memory consolidation, recall queries, deduplication, salience scoring (Sonnet 4.6)',
+    '- sentinel: sysadmin, log triage, infra / systemd troubleshooting, deployment diagnostics (Sonnet 4.6)',
+    '- cipher: data analysis, CSV / JSON crunching, statistics, pattern extraction (Sonnet 4.6)',
+    '- atlas: heavyweight reasoning, planning, architecture review, multi-step decomposition (Opus 4.7)',
     '- mercury: fast execution, parallel scout work, drafting under speed pressure (Sonnet 4.6)',
     '- self: Jarvis handles directly. Use only when truly conversational, trivially small, or genuinely orchestration-level (Jarvis decomposes then re-routes parts).',
     '',

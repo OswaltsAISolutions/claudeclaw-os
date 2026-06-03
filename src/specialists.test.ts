@@ -78,15 +78,16 @@ function clawResult(over: Record<string, unknown> = {}) {
 describe('delegate (claw tier) honesty labeling', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    // The 2026-06-01 cloud rebalance moved sentinel (and the other
-    // tool-required specialists) to the cloud tier. These tests exercise the
-    // CLAW path + ungrounded labeling, so put sentinel back on claw via a
-    // runtime tier override. cloud->claw is a supported transition:
-    // applyTierOverride swaps preferredModel to localFallbackModel
-    // (qwen3-coder:30b) and preserves expectsToolUse, recreating the exact
-    // claw scenario these assertions were written against. scribe stays claw
-    // statically, so its override is a no-op.
-    mockTierOverride.mockImplementation((cs) => (cs === 'sentinel' ? 'claw' : null));
+    // The 2026-06-01 cloud rebalance moved sentinel, and the 2026-06-02 hybrid
+    // moved scribe, to the cloud tier. These tests exercise the CLAW path +
+    // ungrounded labeling, so push BOTH back to claw via a runtime tier
+    // override. cloud->claw is a supported transition: applyTierOverride swaps
+    // preferredModel to localFallbackModel (sentinel -> qwen3-coder:30b,
+    // scribe -> huihui_ai/Qwen3.6-abliterated:27b) and preserves expectsToolUse,
+    // recreating the exact claw scenario these assertions were written against.
+    mockTierOverride.mockImplementation((cs) =>
+      cs === 'sentinel' || cs === 'scribe' ? 'claw' : null,
+    );
     mockListModels.mockResolvedValue([
       { name: 'qwen3-coder:30b' },
       { name: 'mistral-small:24b' },
