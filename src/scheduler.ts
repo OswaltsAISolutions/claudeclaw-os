@@ -12,6 +12,7 @@ import {
   completeMissionTask,
   resetStuckMissionTasks,
   getMissionTask,
+  updateProjectItem,
 } from './db.js';
 import { logger } from './logger.js';
 import { messageQueue } from './message-queue.js';
@@ -163,6 +164,17 @@ async function runDueMissionTasks(): Promise<void> {
     const abortController = new AbortController();
     const timeout = setTimeout(() => abortController.abort(), TASK_TIMEOUT_MS);
 
+    // When this mission is a project research run, mirror its outcome into the
+    // linked project_item so the Workspace research library updates live.
+    const writeBackResearch = (status: 'done' | 'failed', content: string) => {
+      if (!mission.project_item_id) return;
+      try {
+        updateProjectItem(mission.project_item_id, { content, status });
+      } catch (e) {
+        logger.warn({ err: e, missionId: mission.id }, 'Failed to write research result back to project item');
+      }
+    };
+
     // Cross-process cancel signal: dashboard flips status to 'cancelled' in
     // SQLite, this poll picks it up within 5s and aborts the runAgent call.
     let cancelledByUser = false;
@@ -185,7 +197,12 @@ async function runDueMissionTasks(): Promise<void> {
     }, 5_000);
 
     try {
-      const result = await runAgent(mission.prompt, undefined, () => {}, undefined, agentDefaultModel, abortController, undefined, agentMcpAllowlist);
+      // A project research run is a forced-main turn: skip the single-specialist
+      // pre-pass router (skip:true) and hand the whole task to Jarvis with the
+      // team server attached, so he runs the dual-track research recipe. Regular
+      // missions keep their existing routing behavior (no routingOptions).
+      const missionRouting = mission.project_id ? { chatId, skip: true } : undefined;
+      const result = await runAgent(mission.prompt, undefined, () => {}, undefined, agentDefaultModel, abortController, undefined, agentMcpAllowlist, missionRouting);
       clearTimeout(timeout);
       clearInterval(cancelPoll);
 
@@ -193,8 +210,10 @@ async function runDueMissionTasks(): Promise<void> {
         if (cancelledByUser) {
           // Status is already 'cancelled' from the dashboard write — leave it.
           logger.info({ missionId: mission.id }, 'Mission task cancelled by user');
+          writeBackResearch('failed', 'Research run cancelled.');
         } else {
           completeMissionTask(mission.id, null, 'failed', 'Timed out after 10 minutes');
+          writeBackResearch('failed', 'Research run timed out after 10 minutes.');
           logger.warn({ missionId: mission.id }, 'Mission task timed out');
           try {
             await sender('Mission task timed out: "' + mission.title + '"');
@@ -207,6 +226,7 @@ async function runDueMissionTasks(): Promise<void> {
       } else {
         const text = result.text?.trim() || 'Task completed with no output.';
         completeMissionTask(mission.id, text, 'completed');
+        writeBackResearch('done', text);
         logger.info({ missionId: mission.id }, 'Mission task completed');
 
         // Send result to Telegram
@@ -227,8 +247,10 @@ async function runDueMissionTasks(): Promise<void> {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (cancelledByUser) {
         logger.info({ missionId: mission.id }, 'Mission task cancelled by user (threw on abort)');
+        writeBackResearch('failed', 'Research run cancelled.');
       } else {
         completeMissionTask(mission.id, null, 'failed', errMsg.slice(0, 500));
+        writeBackResearch('failed', 'Research run failed: ' + errMsg.slice(0, 500));
         logger.error({ err, missionId: mission.id }, 'Mission task failed');
       }
     } finally {

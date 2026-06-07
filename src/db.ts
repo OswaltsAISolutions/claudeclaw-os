@@ -234,6 +234,46 @@ function createSchema(database: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_mission_status
       ON mission_tasks(assigned_agent, status, priority DESC, created_at ASC);
 
+    -- Workspace: Claude-Projects-style hub. A project groups goals, tasks, and
+    -- a research library; project_items is the flexible content store.
+    CREATE TABLE IF NOT EXISTS projects (
+      id              TEXT PRIMARY KEY,
+      name            TEXT NOT NULL,
+      description     TEXT NOT NULL DEFAULT '',
+      instructions    TEXT NOT NULL DEFAULT '',
+      status          TEXT NOT NULL DEFAULT 'active',
+      color           TEXT NOT NULL DEFAULT 'cyan',
+      created_by      TEXT NOT NULL DEFAULT 'dashboard',
+      created_at      INTEGER NOT NULL,
+      updated_at      INTEGER NOT NULL,
+      last_worked_at  INTEGER
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_projects_status
+      ON projects(status, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS project_items (
+      id              TEXT PRIMARY KEY,
+      project_id      TEXT NOT NULL,
+      kind            TEXT NOT NULL,              -- 'goal' | 'task' | 'research'
+      category        TEXT,                       -- research category; null for goal/task
+      title           TEXT NOT NULL,
+      content         TEXT NOT NULL DEFAULT '',
+      url             TEXT,
+      source          TEXT,
+      status          TEXT,                       -- goal/task: open|doing|done ; research: null|running|done|failed
+      assigned_agent  TEXT,
+      metadata        TEXT,                       -- JSON blob
+      pinned          INTEGER NOT NULL DEFAULT 0,
+      sort_order      INTEGER NOT NULL DEFAULT 0,
+      created_by      TEXT NOT NULL DEFAULT 'dashboard',
+      created_at      INTEGER NOT NULL,
+      updated_at      INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_project_items_project
+      ON project_items(project_id, kind, sort_order ASC, created_at DESC);
+
     CREATE TABLE IF NOT EXISTS meet_sessions (
       id              TEXT PRIMARY KEY,         -- session id from the provider's join response
       agent_id        TEXT NOT NULL,            -- which agent is in the meeting
@@ -466,6 +506,10 @@ function runMigrations(database: Database.Database): void {
   if (!hasContextTokens) {
     database.exec(`ALTER TABLE token_usage ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0`);
   }
+
+  // Workspace: link a mission task back to the project + research item it fills.
+  addColumnIfMissing(database, 'mission_tasks', 'project_id', 'TEXT');
+  addColumnIfMissing(database, 'mission_tasks', 'project_item_id', 'TEXT');
 
   // Multi-agent: migrate sessions table to composite primary key (chat_id, agent_id)
   // Check if PK is composite by looking at pk column count in pragma
@@ -2259,6 +2303,10 @@ export interface MissionTask {
   created_at: number;
   started_at: number | null;
   completed_at: number | null;
+  // Workspace linkage: when a mission task is a project research run, these
+  // point back at the project and the project_item the result fills in.
+  project_id: string | null;
+  project_item_id: string | null;
 }
 
 export function createMissionTask(
@@ -2268,12 +2316,14 @@ export function createMissionTask(
   assignedAgent: string | null = null,
   createdBy = 'dashboard',
   priority = 0,
+  projectId: string | null = null,
+  projectItemId: string | null = null,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO mission_tasks (id, title, prompt, assigned_agent, status, created_by, priority, created_at)
-     VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)`,
-  ).run(id, title, prompt, assignedAgent, createdBy, priority, now);
+    `INSERT INTO mission_tasks (id, title, prompt, assigned_agent, status, created_by, priority, created_at, project_id, project_item_id)
+     VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)`,
+  ).run(id, title, prompt, assignedAgent, createdBy, priority, now, projectId, projectItemId);
 }
 
 export function getUnassignedMissionTasks(): MissionTask[] {
@@ -2364,6 +2414,219 @@ export function cleanupOldMissionTasks(olderThanDays = 7): number {
     `DELETE FROM mission_tasks WHERE status IN ('completed', 'cancelled', 'failed') AND completed_at < ?`,
   ).run(cutoff);
   return result.changes;
+}
+
+// ── Workspace: projects + project_items ─────────────────────────────────────
+// A project is a Claude-Projects-style container. project_items is a single
+// flexible table holding goals, tasks, and the research library (papers,
+// sources, notes, video ideas, key points, transcripts, research videos,
+// video links, analysis), discriminated by `kind` (+ `category` for research).
+
+export interface Project {
+  id: string;
+  name: string;
+  description: string;
+  instructions: string;
+  status: string; // 'active' | 'archived'
+  color: string;
+  created_by: string;
+  created_at: number;
+  updated_at: number;
+  last_worked_at: number | null;
+}
+
+export interface ProjectSummary extends Project {
+  goal_count: number;
+  task_count: number;
+  task_done_count: number;
+  research_count: number;
+}
+
+export interface ProjectItem {
+  id: string;
+  project_id: string;
+  kind: string; // 'goal' | 'task' | 'research'
+  category: string | null;
+  title: string;
+  content: string;
+  url: string | null;
+  source: string | null;
+  status: string | null; // goal/task: open|doing|done ; research: null|running|done|failed
+  assigned_agent: string | null;
+  metadata: string | null;
+  pinned: number; // 0 | 1
+  sort_order: number;
+  created_by: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export function createProject(
+  id: string,
+  name: string,
+  description = '',
+  instructions = '',
+  color = 'cyan',
+  createdBy = 'dashboard',
+): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `INSERT INTO projects (id, name, description, instructions, status, color, created_by, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)`,
+  ).run(id, name, description, instructions, color, createdBy, now, now);
+}
+
+export function getProject(id: string): Project | null {
+  return (db.prepare('SELECT * FROM projects WHERE id = ?').get(id) as Project) ?? null;
+}
+
+export function listProjects(includeArchived = false): ProjectSummary[] {
+  const where = includeArchived ? '' : `WHERE p.status = 'active'`;
+  return db
+    .prepare(
+      `SELECT p.*,
+         COALESCE(SUM(CASE WHEN i.kind = 'goal' THEN 1 ELSE 0 END), 0) AS goal_count,
+         COALESCE(SUM(CASE WHEN i.kind = 'task' THEN 1 ELSE 0 END), 0) AS task_count,
+         COALESCE(SUM(CASE WHEN i.kind = 'task' AND i.status = 'done' THEN 1 ELSE 0 END), 0) AS task_done_count,
+         COALESCE(SUM(CASE WHEN i.kind = 'research' THEN 1 ELSE 0 END), 0) AS research_count
+       FROM projects p
+       LEFT JOIN project_items i ON i.project_id = p.id
+       ${where}
+       GROUP BY p.id
+       ORDER BY (p.status = 'active') DESC, p.updated_at DESC`,
+    )
+    .all() as ProjectSummary[];
+}
+
+export function updateProject(
+  id: string,
+  patch: { name?: string; description?: string; instructions?: string; status?: string; color?: string },
+): boolean {
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  for (const key of ['name', 'description', 'instructions', 'status', 'color'] as const) {
+    if (patch[key] !== undefined) {
+      sets.push(`${key} = ?`);
+      vals.push(patch[key]);
+    }
+  }
+  if (sets.length === 0) return false;
+  sets.push('updated_at = ?');
+  vals.push(Math.floor(Date.now() / 1000));
+  vals.push(id);
+  const res = db.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+  return res.changes > 0;
+}
+
+/** Bump updated_at + last_worked_at, e.g. when a research run starts. */
+export function touchProject(id: string): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare('UPDATE projects SET updated_at = ?, last_worked_at = ? WHERE id = ?').run(now, now, id);
+}
+
+export function deleteProject(id: string): boolean {
+  const txn = db.transaction(() => {
+    db.prepare('DELETE FROM project_items WHERE project_id = ?').run(id);
+    return db.prepare('DELETE FROM projects WHERE id = ?').run(id).changes > 0;
+  });
+  return txn();
+}
+
+export function createProjectItem(
+  id: string,
+  projectId: string,
+  kind: string,
+  opts: {
+    category?: string | null;
+    title: string;
+    content?: string;
+    url?: string | null;
+    source?: string | null;
+    status?: string | null;
+    assignedAgent?: string | null;
+    metadata?: string | null;
+    sortOrder?: number;
+    createdBy?: string;
+  },
+): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `INSERT INTO project_items
+       (id, project_id, kind, category, title, content, url, source, status, assigned_agent, metadata, pinned, sort_order, created_by, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    projectId,
+    kind,
+    opts.category ?? null,
+    opts.title,
+    opts.content ?? '',
+    opts.url ?? null,
+    opts.source ?? null,
+    opts.status ?? null,
+    opts.assignedAgent ?? null,
+    opts.metadata ?? null,
+    opts.sortOrder ?? 0,
+    opts.createdBy ?? 'dashboard',
+    now,
+    now,
+  );
+}
+
+export function getProjectItems(projectId: string, kind?: string): ProjectItem[] {
+  if (kind) {
+    return db
+      .prepare(
+        `SELECT * FROM project_items WHERE project_id = ? AND kind = ?
+         ORDER BY pinned DESC, sort_order ASC, created_at DESC`,
+      )
+      .all(projectId, kind) as ProjectItem[];
+  }
+  return db
+    .prepare(
+      `SELECT * FROM project_items WHERE project_id = ?
+       ORDER BY pinned DESC, sort_order ASC, created_at DESC`,
+    )
+    .all(projectId) as ProjectItem[];
+}
+
+export function getProjectItem(id: string): ProjectItem | null {
+  return (db.prepare('SELECT * FROM project_items WHERE id = ?').get(id) as ProjectItem) ?? null;
+}
+
+export function updateProjectItem(
+  id: string,
+  patch: {
+    title?: string;
+    content?: string;
+    category?: string | null;
+    url?: string | null;
+    source?: string | null;
+    status?: string | null;
+    assigned_agent?: string | null;
+    metadata?: string | null;
+    pinned?: number;
+    sort_order?: number;
+  },
+): boolean {
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  for (const key of ['title', 'content', 'category', 'url', 'source', 'status', 'assigned_agent', 'metadata', 'pinned', 'sort_order'] as const) {
+    if (patch[key] !== undefined) {
+      sets.push(`${key} = ?`);
+      vals.push(patch[key]);
+    }
+  }
+  if (sets.length === 0) return false;
+  sets.push('updated_at = ?');
+  vals.push(Math.floor(Date.now() / 1000));
+  vals.push(id);
+  const res = db.prepare(`UPDATE project_items SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+  return res.changes > 0;
+}
+
+export function deleteProjectItem(id: string): boolean {
+  return db.prepare('DELETE FROM project_items WHERE id = ?').run(id).changes > 0;
 }
 
 export function reassignMissionTask(id: string, newAgent: string): boolean {

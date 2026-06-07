@@ -279,17 +279,20 @@ export async function runAgent(
     // The MAIN Jarvis agent gets an in-process "team" MCP server so he can do
     // the job he exists for: think big, make a plan, break it into independent
     // sub-tasks, and hand each to the specialist best suited to it, running
-    // several at once. Attached ONLY here, on main's own live turn, gated three
-    // ways:
+    // several at once. Attached ONLY here, on main's own live turn, gated:
     //   AGENT_ID === 'main'     never on a delegated sub-agent process
-    //   routingOptions present  the real Telegram/scheduler path, not an
-    //                           internal caller that opted out via skip
+    //   routingOptions present  a real orchestratable turn (Telegram, scheduler,
+    //                           or a forced-main caller like a project research
+    //                           run that passes skip:true to bypass routing)
     //   chatId present          so the hive_mind log + shared memory key off
     //                           the actual conversation
+    // NOTE: skip is intentionally NOT part of this gate. A forced-main caller
+    // (skip:true) still wants the team so it can orchestrate; skip only governs
+    // the pre-pass single-specialist router above, not team availability.
     // Recursion is bounded by construction: a delegated specialist runs through
     // delegateCloud / delegateClaw, neither of which wires this server in, so a
     // specialist can never sub-delegate. Depth is exactly one.
-    if (AGENT_ID === 'main' && !!routingOptions && !routingOptions.skip && routingOptions.chatId) {
+    if (AGENT_ID === 'main' && !!routingOptions && routingOptions.chatId) {
       mcpServerSpecs['team'] = createTeamMcpServer(routingOptions.chatId);
     }
 

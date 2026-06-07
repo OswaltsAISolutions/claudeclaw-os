@@ -67,6 +67,17 @@ import {
   dismissAgentSuggestion,
   markAgentSuggestionActed,
   getRecentlySuggestedSplits,
+  listProjects,
+  getProject,
+  createProject,
+  updateProject,
+  deleteProject,
+  touchProject,
+  getProjectItems,
+  getProjectItem,
+  createProjectItem,
+  updateProjectItem,
+  deleteProjectItem,
 } from './db.js';
 import { computeNextRun } from './scheduler.js';
 import { generateContent, parseJsonResponse } from './gemini.js';
@@ -1740,6 +1751,153 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const limit = parseInt(c.req.query('limit') || '30', 10);
     const offset = parseInt(c.req.query('offset') || '0', 10);
     return c.json(getMissionTaskHistory(limit, offset));
+  });
+
+  // ── Workspace: projects + research library ─────────────────────────────
+  // Claude-Projects-style hub. A project groups goals, tasks, and a research
+  // library; project_items is the flexible content store (kind = goal/task/
+  // research; research rows also carry a category). The research action below
+  // enqueues a forced-main mission task so Jarvis runs the dual-track research
+  // recipe and the scheduler writes the synthesized report back into the item.
+  const PROJECT_ITEM_KINDS = new Set(['goal', 'task', 'research']);
+  const RESEARCH_CATEGORIES = new Set([
+    'paper', 'source', 'note', 'video_idea', 'key_point',
+    'transcript', 'research_video', 'video_link', 'analysis',
+  ]);
+
+  app.get('/api/projects', (c) => {
+    const includeArchived = c.req.query('archived') === '1';
+    return c.json({ projects: listProjects(includeArchived) });
+  });
+
+  app.get('/api/projects/:id', (c) => {
+    const project = getProject(c.req.param('id'));
+    if (!project) return c.json({ error: 'Not found' }, 404);
+    return c.json({ project, items: getProjectItems(project.id) });
+  });
+
+  app.post('/api/projects', async (c) => {
+    let body: { name?: string; description?: string; instructions?: string; color?: string };
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    const name = body?.name?.trim();
+    if (!name || name.length > 200) return c.json({ error: 'name required (max 200 chars)' }, 400);
+    const id = crypto.randomBytes(4).toString('hex');
+    createProject(id, name, (body?.description ?? '').slice(0, 4000), (body?.instructions ?? '').slice(0, 8000), (body?.color ?? 'cyan').slice(0, 24), 'dashboard');
+    return c.json({ project: getProject(id) }, 201);
+  });
+
+  app.patch('/api/projects/:id', async (c) => {
+    const id = c.req.param('id');
+    if (!getProject(id)) return c.json({ error: 'Not found' }, 404);
+    let body: { name?: string; description?: string; instructions?: string; status?: string; color?: string };
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    if (body.status && !['active', 'archived'].includes(body.status)) return c.json({ error: 'status must be active or archived' }, 400);
+    if (body.name !== undefined && (!body.name.trim() || body.name.length > 200)) return c.json({ error: 'name must be 1..200 chars' }, 400);
+    updateProject(id, { name: body.name?.trim(), description: body.description, instructions: body.instructions, status: body.status, color: body.color });
+    return c.json({ project: getProject(id) });
+  });
+
+  app.delete('/api/projects/:id', (c) => {
+    return c.json({ ok: deleteProject(c.req.param('id')) });
+  });
+
+  app.get('/api/projects/:id/items', (c) => {
+    const id = c.req.param('id');
+    if (!getProject(id)) return c.json({ error: 'Not found' }, 404);
+    return c.json({ items: getProjectItems(id, c.req.query('kind') || undefined) });
+  });
+
+  app.post('/api/projects/:id/items', async (c) => {
+    const id = c.req.param('id');
+    if (!getProject(id)) return c.json({ error: 'Not found' }, 404);
+    let body: { kind?: string; category?: string; title?: string; content?: string; url?: string; source?: string; status?: string };
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    const kind = body?.kind?.trim();
+    if (!kind || !PROJECT_ITEM_KINDS.has(kind)) return c.json({ error: 'kind must be goal, task, or research' }, 400);
+    const title = body?.title?.trim();
+    if (!title || title.length > 300) return c.json({ error: 'title required (max 300 chars)' }, 400);
+    let category: string | null = null;
+    if (kind === 'research') {
+      category = body?.category?.trim() || 'note';
+      if (!RESEARCH_CATEGORIES.has(category)) return c.json({ error: 'invalid research category' }, 400);
+    }
+    let status: string | null = null;
+    if (kind === 'goal' || kind === 'task') status = body?.status && ['open', 'doing', 'done'].includes(body.status) ? body.status : 'open';
+    const itemId = crypto.randomBytes(4).toString('hex');
+    createProjectItem(itemId, id, kind, {
+      category, title,
+      content: (body?.content ?? '').slice(0, 100000),
+      url: body?.url?.trim() || null,
+      source: body?.source?.trim() || null,
+      status, createdBy: 'dashboard',
+    });
+    touchProject(id);
+    return c.json({ item: getProjectItem(itemId) }, 201);
+  });
+
+  app.patch('/api/projects/:id/items/:itemId', async (c) => {
+    const itemId = c.req.param('itemId');
+    const existing = getProjectItem(itemId);
+    if (!existing) return c.json({ error: 'Not found' }, 404);
+    let body: Record<string, unknown>;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    const patch: Parameters<typeof updateProjectItem>[1] = {};
+    if (typeof body.title === 'string') patch.title = body.title.trim().slice(0, 300);
+    if (typeof body.content === 'string') patch.content = body.content.slice(0, 100000);
+    if (typeof body.url === 'string') patch.url = body.url.trim() || null;
+    if (typeof body.source === 'string') patch.source = body.source.trim() || null;
+    if (typeof body.category === 'string' && (existing.kind !== 'research' || RESEARCH_CATEGORIES.has(body.category))) patch.category = body.category;
+    if (typeof body.status === 'string') {
+      const allowed = existing.kind === 'research' ? ['running', 'done', 'failed'] : ['open', 'doing', 'done'];
+      if (!allowed.includes(body.status)) return c.json({ error: 'invalid status' }, 400);
+      patch.status = body.status;
+    }
+    if (typeof body.pinned === 'boolean') patch.pinned = body.pinned ? 1 : 0;
+    if (typeof body.pinned === 'number') patch.pinned = body.pinned ? 1 : 0;
+    if (typeof body.sort_order === 'number') patch.sort_order = body.sort_order;
+    updateProjectItem(itemId, patch);
+    touchProject(existing.project_id);
+    return c.json({ item: getProjectItem(itemId) });
+  });
+
+  app.delete('/api/projects/:id/items/:itemId', (c) => {
+    return c.json({ ok: deleteProjectItem(c.req.param('itemId')) });
+  });
+
+  // Kick off a dual-track research run with Jarvis + the team. Creates a
+  // placeholder research item (status=running) and a forced-main mission task
+  // linked to it; the scheduler runs Jarvis (team server + dual-track recipe)
+  // and the scheduler write-back fills the item in on completion.
+  app.post('/api/projects/:id/research', async (c) => {
+    const id = c.req.param('id');
+    const project = getProject(id);
+    if (!project) return c.json({ error: 'Not found' }, 404);
+    let body: { query?: string; title?: string };
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    const query = body?.query?.trim();
+    if (!query || query.length > 4000) return c.json({ error: 'query required (max 4000 chars)' }, 400);
+    const title = (body?.title?.trim() || query).slice(0, 300);
+
+    const itemId = crypto.randomBytes(4).toString('hex');
+    createProjectItem(itemId, id, 'research', {
+      category: 'analysis', title,
+      content: 'Researching with Jarvis and the team...',
+      status: 'running', source: 'Jarvis + team', createdBy: 'dashboard',
+    });
+
+    const prompt = [
+      `You are researching for the project "${project.name}".`,
+      project.instructions ? `Project context: ${project.instructions}` : '',
+      '',
+      'Use the dual-track research recipe: in parallel, sleuth (regular, cloud) and oracle (uncensored, abliterated) research the question; then prism analyzes the regular findings while heretic cross-references regular vs uncensored for bias, censorship, or false information; escalate any HIGH-risk flag to reaper. Produce one synthesized report and end with a clear "Censorship / Bias Delta" section.',
+      '',
+      `Research question:\n${query}`,
+    ].filter(Boolean).join('\n');
+
+    const taskId = crypto.randomBytes(4).toString('hex');
+    createMissionTask(taskId, ('Research: ' + title).slice(0, 200), prompt, 'main', 'workspace', 5, id, itemId);
+    touchProject(id);
+    return c.json({ ok: true, item: getProjectItem(itemId), task_id: taskId }, 201);
   });
 
   // ── Live Meetings (Pika meet-cli wrapper) ──────────────────────────
