@@ -23,6 +23,7 @@ import { AgentFiles } from '@/pages/AgentFiles';
 import { LocalModels } from '@/pages/LocalModels';
 import { Specialists } from '@/pages/Specialists';
 import { JarvisHome } from '@/pages/JarvisHome';
+import { Workspace } from '@/pages/Workspace';
 
 export function App() {
   // Token gate: if the SPA loaded without a token in either URL or
@@ -50,6 +51,7 @@ export function App() {
       <main class="flex-1 min-w-0 overflow-hidden pl-0 md:pl-0 pb-[52px] md:pb-0">
         <Switch>
           <Route path="/"><JarvisHome /></Route>
+          <Route path="/workspace"><Workspace /></Route>
           <Route path="/mission"><MissionControl /></Route>
           <Route path="/scheduled"><Scheduled /></Route>
           <Route path="/agents"><Agents /></Route>

@@ -106,6 +106,7 @@ export function MissionControl() {
     <div class="flex flex-col h-full">
       <PageHeader
         title={headerTitle}
+        breadcrumb="Operations"
         actions={
           <>
             {queue.length > 0 && (

@@ -6,10 +6,11 @@ import {
   Crosshair,
   Settings,
   Sparkles,
+  FolderKanban,
 } from 'lucide-preact';
 import type { ComponentChildren } from 'preact';
 
-export type RouteSection = 'workspace' | 'intelligence' | 'collaborate' | 'configure';
+export type RouteSection = 'hub' | 'workspace' | 'intelligence' | 'collaborate' | 'configure';
 
 export interface RouteDef {
   path: string;
@@ -23,6 +24,8 @@ export interface RouteDef {
 // Voices used to be a top-level item; it now lives under War Room as the
 // "Voice config" sub-tab and is reachable via /warroom?mode=voices.
 export const ROUTES: RouteDef[] = [
+  { path: '/workspace',  label: 'Projects',        section: 'hub',          icon: FolderKanban,  shortcut: 'g k' },
+
   { path: '/',           label: 'J.A.R.V.I.S.',    section: 'workspace',    icon: Sparkles,      shortcut: 'g j' },
   { path: '/mission',    label: 'Mission Control', section: 'workspace',    icon: LayoutGrid,    shortcut: 'g m' },
   { path: '/scheduled',  label: 'Scheduled',       section: 'workspace',    icon: ListTodo,      shortcut: 'g s' },
@@ -42,7 +45,8 @@ export const ROUTES: RouteDef[] = [
 ];
 
 export const SECTION_LABEL: Record<RouteSection, string> = {
-  workspace:    'Workspace',
+  hub:          'Workspace',
+  workspace:    'Operations',
   intelligence: 'Intelligence',
   collaborate:  'Collaborate',
   configure:    'Configure',
