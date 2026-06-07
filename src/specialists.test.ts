@@ -302,9 +302,9 @@ describe('routing: multi-domain detection + escalation to Jarvis', () => {
 // (tier + model per the 16GB-VRAM-aware plan) and that each role is reachable
 // by its own keywords without disturbing the existing single-domain routes.
 describe('research team: prism / oracle / heretic specialists', () => {
-  it('registers prism as a cloud analyst on Sonnet 4.6', () => {
+  it('registers prism as a cloud analyst on Opus 4.7', () => {
     expect(SPECIALISTS.prism.tier).toBe('cloud');
-    expect(SPECIALISTS.prism.preferredModel).toBe('claude-sonnet-4-6');
+    expect(SPECIALISTS.prism.preferredModel).toBe('claude-opus-4-7');
     expect(SPECIALISTS.prism.capabilities).toContain('verification');
   });
 

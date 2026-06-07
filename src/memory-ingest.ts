@@ -135,6 +135,7 @@ EXTRACT only if the exchange reveals:
 - Business rules or workflows that are STANDING RULES
 - Recurring patterns or routines
 - Technical preferences or architectural decisions
+- Durable facts about Gabe's business, content strategy (his GCruise brand, audience, platforms, editorial POV), goals, or a research finding he explicitly says to remember
 
 If extracting, return JSON:
 {

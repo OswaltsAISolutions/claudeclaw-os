@@ -3499,7 +3499,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       const results = [...web, ...news].slice(0, count).map((r) => ({
         title: r.title,
         url: r.url,
-        snippet: (r.description || '').slice(0, 280),
+        snippet: (r.description || '').slice(0, 500),
         age: r.age || null,
       }));
       return c.json({ query: q, count: results.length, results });
