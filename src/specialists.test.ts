@@ -40,6 +40,8 @@ import {
   suggestRoute,
   matchedSpecialists,
   intelligentRoute,
+  SPECIALISTS,
+  ALL_CALLSIGNS,
   NO_TOOLS_FALLBACK_NOTICE,
   UNGROUNDED_NOTICE,
   CLOUD_FALLBACK_NOTICE,
@@ -291,5 +293,53 @@ describe('routing: multi-domain detection + escalation to Jarvis', () => {
 
   it('suggestRoute still returns the first single match (dashboard suggestion contract)', () => {
     expect(suggestRoute('refactor this function')).toBe('coder');
+  });
+});
+
+// The 2026-06-02 research team: a regular analyst (prism) plus an abliterated
+// cross-check pair (oracle researches uncensored, heretic diffs regular vs
+// uncensored for bias / censorship / false info). These lock the roster wiring
+// (tier + model per the 16GB-VRAM-aware plan) and that each role is reachable
+// by its own keywords without disturbing the existing single-domain routes.
+describe('research team: prism / oracle / heretic specialists', () => {
+  it('registers prism as a cloud analyst on Sonnet 4.6', () => {
+    expect(SPECIALISTS.prism.tier).toBe('cloud');
+    expect(SPECIALISTS.prism.preferredModel).toBe('claude-sonnet-4-6');
+    expect(SPECIALISTS.prism.capabilities).toContain('verification');
+  });
+
+  it('registers oracle as a claw / abliterated researcher on gemma-4-abliterated', () => {
+    expect(SPECIALISTS.oracle.tier).toBe('claw');
+    expect(SPECIALISTS.oracle.preferredModel).toBe('huihui_ai/gemma-4-abliterated:latest');
+    expect(SPECIALISTS.oracle.capabilities).toContain('uncensored');
+  });
+
+  it('registers heretic as a local / abliterated auditor on neuraldaredevil-8b', () => {
+    expect(SPECIALISTS.heretic.tier).toBe('local');
+    expect(SPECIALISTS.heretic.preferredModel).toBe('closex/neuraldaredevil-8b-abliterated:latest');
+    expect(SPECIALISTS.heretic.capabilities).toContain('bias-audit');
+  });
+
+  it('keeps the abliterated models within the 16GB GPU budget (small enough to fit)', () => {
+    // oracle (~10GB) and heretic (~6GB) are deliberately small so they fit the
+    // RTX 5080's 16GB; the 35b deep-dive (reaper, 22) is the escalation target.
+    expect(SPECIALISTS.oracle.vramHintGB).toBeLessThanOrEqual(14);
+    expect(SPECIALISTS.heretic.vramHintGB).toBeLessThanOrEqual(8);
+  });
+
+  it('exposes all three in the auto-derived ALL_CALLSIGNS roster', () => {
+    expect(ALL_CALLSIGNS).toEqual(expect.arrayContaining(['prism', 'oracle', 'heretic']));
+  });
+
+  it('routes each new role by its own keywords', () => {
+    expect(matchedSpecialists('do a research analysis of these sources')).toContain('prism');
+    expect(matchedSpecialists('give me an uncensored research take on this')).toContain('oracle');
+    expect(matchedSpecialists('run a bias check on the findings')).toContain('heretic');
+  });
+
+  it('does not disturb the existing single-domain routes', () => {
+    // Plain "research" still belongs to sleuth, not prism/oracle.
+    expect(matchedSpecialists('research the latest framework and summarize it')).toEqual(['sleuth', 'scribe']);
+    expect(matchedSpecialists('refactor this function')).toEqual(['coder']);
   });
 });

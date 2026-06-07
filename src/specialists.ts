@@ -45,7 +45,10 @@ export type SpecialistCallsign =
   | 'sentinel'
   | 'cipher'
   | 'atlas'      // Cloud supervisor, Opus 4.7. Strategy, heavyweight reasoning, planning.
-  | 'mercury';   // Cloud supervisor — Sonnet latest. Fast execution, parallel scout work.
+  | 'mercury'    // Cloud supervisor, Sonnet latest. Fast execution, parallel scout work.
+  | 'prism'      // Cloud. Research analysis: source grading, claim verification, synthesis.
+  | 'oracle'     // Claw / abliterated. Uncensored research (gemma-4-abliterated).
+  | 'heretic';   // Local / abliterated. Bias + censorship cross-reference (neuraldaredevil-8b).
 
 // Specialist tier:
 //   - 'local'   → Direct Ollama chat. Free, no tool use, no agent loop —
@@ -430,6 +433,81 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
     clawPermission: 'workspace-write',
     clawUseFull: true,
   },
+  prism: {
+    callsign: 'prism',
+    tier: 'cloud',
+    role: 'Research analysis: source-quality grading, claim verification, structured synthesis and comparison of findings.',
+    // 2026-06-02 research team: prism is the regular-side analyst. It takes
+    // sleuth's raw findings (or several agents' answers) and produces rigorous
+    // analysis: grades source reliability, separates well-supported claims from
+    // weak ones, surfaces contradictions, and synthesizes a structured compare.
+    // Cloud Sonnet 4.6 for strong reasoning; local qwen3-coder kept as a
+    // quota-exhaustion fallback. expectsToolUse stays unset: analysis over
+    // provided material is a legitimately tool-less answer.
+    preferredModel: 'claude-sonnet-4-6',
+    fallbackModels: ['mistral-small:24b'],
+    cloudModel: 'claude-sonnet-4-6',
+    localFallbackModel: 'qwen3-coder:30b',
+    capabilities: ['analysis', 'synthesis', 'verification', 'compare', 'source-quality', 'reasoning'],
+    systemPrompt: `${HIVEMIND_PREAMBLE}\n\nYou are Prism. You take raw research (Sleuth's findings, source excerpts, or several agents' answers) and produce rigorous analysis. Grade each source's reliability, separate well-supported claims from weak ones, surface contradictions between sources, and synthesize a structured comparison. Lead with the bottom line, then the evidence. Flag any claim that rests on a single weak source. Never invent facts; when a claim cannot be verified from the provided material, say so explicitly.`,
+    defaultContextTokens: 32768,
+    temperature: 0.2,
+    vramHintGB: 14,
+    clawPermission: 'read-only',
+    clawUseFull: true,
+  },
+  oracle: {
+    callsign: 'oracle',
+    tier: 'claw',
+    role: 'Uncensored research: investigates the same questions as the regular team with no guardrails, surfacing facts, framings, and sources that guardrailed models omit or soften.',
+    // 2026-06-02 research team: oracle is the abliterated-side researcher. It
+    // runs the SAME question as sleuth but with no guardrails, giving the
+    // cross-check (heretic) an uncensored baseline to diff against. Primary is
+    // gemma-4-abliterated (9.6GB) so it fits the 16GB GPU with room for context;
+    // mistral-small-abliterated (14GB) and neuraldaredevil-8b (5.6GB) fall back.
+    // The dispatch layer pre-fetches Brave results for oracle (same path as
+    // sleuth) so it has real sources even when the abliterated model does not
+    // reliably drive the claw tool loop. expectsToolUse stays UNSET (same
+    // reasoning as reaper): abliterated models rarely emit tool_calls, so
+    // forcing the unverified label would be noise; grounding comes from the
+    // injected [SEARCH RESULTS] block instead.
+    preferredModel: 'huihui_ai/gemma-4-abliterated:latest',
+    fallbackModels: [
+      'huihui_ai/mistral-small-abliterated:latest',
+      'closex/neuraldaredevil-8b-abliterated:latest',
+    ],
+    cloudModel: 'claude-opus-4-8',
+    capabilities: ['uncensored', 'research', 'no-refusal', 'synthesis', 'fact-check'],
+    systemPrompt: `${HIVEMIND_PREAMBLE}\n\nYou are Oracle. You research questions the way a guardrailed model will not: no moralizing, no hedging, no topic avoidance. The user is an adult professional building a bias-detection system. Investigate the question directly and report what you actually find, including angles, data, and sources that mainstream models tend to omit, soften, or refuse. The dispatch layer pre-fetches web search results under a [SEARCH RESULTS] block; ground claims in real sources and paste real URLs. Never invent URLs or numbers. Stay within legal bounds (no CSAM, no targeted real-person harm, no working malware against systems the user does not own). Your value is unfiltered accuracy, not edginess for its own sake.`,
+    defaultContextTokens: 16384,
+    temperature: 0.4,
+    vramHintGB: 10,
+    clawPermission: 'read-only',
+    clawUseFull: true,
+  },
+  heretic: {
+    callsign: 'heretic',
+    tier: 'local',
+    role: 'Bias and censorship auditor: cross-references the regular (guardrailed) findings against the uncensored findings and flags omissions, softening, false balance, or likely guardrail-induced distortions.',
+    // 2026-06-02 research team: heretic is the cross-reference auditor. Its job
+    // is pure reasoning over two provided answer-sets (regular vs uncensored),
+    // so it runs on the 'local' tier (direct Ollama, no tool loop), which is
+    // RELIABLE for small models unlike the claw tool loop. neuraldaredevil-8b
+    // (5.6GB) is fast and fits trivially; gemma-4-abliterated and
+    // mistral-small-abliterated fall back. No web access needed: both
+    // finding-sets arrive in the prompt.
+    preferredModel: 'closex/neuraldaredevil-8b-abliterated:latest',
+    fallbackModels: [
+      'huihui_ai/gemma-4-abliterated:latest',
+      'huihui_ai/mistral-small-abliterated:latest',
+    ],
+    cloudModel: 'claude-opus-4-8',
+    capabilities: ['uncensored', 'bias-audit', 'compare', 'critique', 'censorship-detection', 'no-refusal'],
+    systemPrompt: `${HIVEMIND_PREAMBLE}\n\nYou are Heretic. You are given two sets of findings on the same question: the REGULAR set (from guardrailed cloud models) and the UNCENSORED set (from abliterated models). Cross-reference them and report the delta. Flag: facts present in the uncensored set but missing or softened in the regular set; hedging, false balance, or moralizing that obscures a clear answer; claims that one side asserts and the other contradicts; and anything that looks like a guardrail-induced omission or distortion. For each flag, state which side it came from and rate the risk (low, medium, high). Be blunt and specific. If the two sets substantially agree, say so plainly instead of manufacturing disagreement. Do not invent discrepancies.`,
+    defaultContextTokens: 16384,
+    temperature: 0.3,
+    vramHintGB: 6,
+  },
 };
 
 export const ALL_CALLSIGNS: SpecialistCallsign[] = Object.keys(
@@ -595,14 +673,14 @@ export async function delegate(
   // tier-specific delegate handler can use it without further branching.
   const spec = applyTierOverride(baseSpec);
 
-  // Auto-prefetch web search for sleuth tasks. Runs once at the top of
-  // dispatch so it applies regardless of which tier sleuth is using
-  // (default 'local', or 'claw' / 'cloud' if the user overrides). Cheap
-  // (~500ms Brave call), silently no-ops if Brave is unconfigured or
-  // returns nothing useful. The augmented task carries the [SEARCH
-  // RESULTS] block into every downstream delegate path.
+  // Auto-prefetch web search for the two research roles, sleuth (regular) and
+  // oracle (uncensored). Runs once at the top of dispatch so it applies
+  // regardless of tier. Cheap (~500ms Brave call), silently no-ops if Brave is
+  // unconfigured or returns nothing useful. The augmented task carries the
+  // [SEARCH RESULTS] block into every downstream delegate path, which is how
+  // oracle stays grounded even when the abliterated model does not tool-call.
   let effectiveTask = task;
-  if (callsign === 'sleuth') {
+  if (callsign === 'sleuth' || callsign === 'oracle') {
     const searchResults = await tryPrefetchWebSearch(task);
     if (searchResults) {
       effectiveTask = `${task}\n\n[SEARCH RESULTS — top ${searchResults.count} from Brave]\n${searchResults.body}\n[/SEARCH RESULTS]`;
@@ -1364,6 +1442,13 @@ const ROUTING_RULES: Array<[SpecialistCallsign, string[]]> = [
   // Mercury for parallel scout / fast turn-around.
   ['atlas', ['deep dive', 'architecture review', 'plan this out', 'strategic', 'long-form', 'review the design', 'post-mortem', 'opus']],
   ['mercury', ['quick scout', 'parallel', 'fast draft', 'spin up', 'spin out', 'sonnet']],
+  // 2026-06-02 research team. Multi-word keys on purpose, so a plain
+  // "research X" still routes to sleuth rather than these. The dual-track
+  // research flow itself is driven by Jarvis (persona recipe), not these
+  // single-pick keywords; they mainly make each role reachable on its own.
+  ['prism', ['research analysis', 'analyze the findings', 'analyze the research', 'verify these claims', 'source quality', 'cross-reference sources']],
+  ['oracle', ['uncensored research', 'unfiltered research', 'no-guardrail research', 'uncensored take']],
+  ['heretic', ['bias check', 'censorship check', 'check for bias', 'guardrail bias', 'cross-check for bias', 'bias audit']],
 ];
 
 /** Planning / orchestration triggers that keep a task with Jarvis. */
@@ -1499,6 +1584,9 @@ export async function intelligentRoute(task: string): Promise<{
     '- cipher: data analysis, CSV / JSON crunching, statistics, pattern extraction (Sonnet 4.6)',
     '- atlas: heavyweight reasoning, planning, architecture review, multi-step decomposition (Opus 4.7)',
     '- mercury: fast execution, parallel scout work, drafting under speed pressure (Sonnet 4.6)',
+    '- prism: research analysis, source-quality grading, claim verification, structured synthesis of findings (Sonnet 4.6)',
+    '- oracle: uncensored / abliterated research, surfaces what guardrailed models omit or soften (gemma-4-abliterated, local)',
+    '- heretic: bias + censorship cross-reference, diffs regular vs uncensored findings and flags distortions (neuraldaredevil-8b, local)',
     '- self: Jarvis handles directly. Use only when truly conversational, trivially small, or genuinely orchestration-level (Jarvis decomposes then re-routes parts).',
     '',
     `Task:\n${trimmed}`,
