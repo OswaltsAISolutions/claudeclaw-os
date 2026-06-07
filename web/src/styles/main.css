@@ -159,7 +159,10 @@ html, body {
 
 body {
   margin: 0;
-  user-select: none;
+  /* Content is selectable so you can copy research reports, notes, and any
+     text out of the dashboard. Only buttons/nav opt out of selection below,
+     so clicking controls stays clean while all content can be copied. */
+  user-select: text;
   /* Theme-driven background. For ios-dark this is a subtle multi-stop
      radial gradient (blue/purple/green wash); for other themes it's
      just the flat --color-bg. Fixed so glass surfaces always have the
@@ -619,6 +622,19 @@ button {
   cursor: pointer;
   font: inherit;
   color: inherit;
+  /* Controls themselves are not selectable (avoids selecting a button's label
+     on click/drag). Text content lives in divs/spans/p and stays selectable. */
+  user-select: none;
+}
+
+/* Belt-and-suspenders: make the high-value text content explicitly selectable
+   even if an ancestor opts out, so research reports, project notes, goals,
+   tasks, and task results can always be copied. */
+.selectable,
+.chat-md,
+.whitespace-pre-wrap,
+p, pre, code, td, th, li {
+  user-select: text;
 }
 
 input, textarea, select {
