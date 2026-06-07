@@ -1889,7 +1889,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       `You are researching for the project "${project.name}".`,
       project.instructions ? `Project context: ${project.instructions}` : '',
       '',
-      'Use the dual-track research recipe: in parallel, sleuth (regular, cloud) and oracle (uncensored, abliterated) research the question; then prism analyzes the regular findings while heretic cross-references regular vs uncensored for bias, censorship, or false information; escalate any HIGH-risk flag to reaper. Produce one synthesized report and end with a clear "Censorship / Bias Delta" section.',
+      'Use the dual-track research recipe: in parallel, sleuth (regular, cloud) and oracle (uncensored, abliterated) research the question; then prism analyzes the regular findings while heretic cross-references regular vs uncensored for bias, censorship, or false information. Only if a HIGH-risk discrepancy would materially change the conclusion, you may escalate that single point to reaper for a deeper uncensored check (reaper is the slow local 35b, so use it sparingly, not by default). Produce one synthesized report and end with a clear "Censorship / Bias Delta" section.',
       '',
       `Research question:\n${query}`,
     ].filter(Boolean).join('\n');

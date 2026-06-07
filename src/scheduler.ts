@@ -24,6 +24,12 @@ type Sender = (text: string) => Promise<void>;
 /** Max time (ms) a scheduled task can run before being killed. */
 const TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
+/** Project research runs are a heavy local dual-track chain (sleuth + oracle,
+ *  then prism + heretic, then synthesis), so they get a much longer ceiling
+ *  than a normal mission. The 10-minute mission cap timed out the first real
+ *  research run; 25 minutes comfortably absorbs the local-model legs. */
+const RESEARCH_TASK_TIMEOUT_MS = 25 * 60 * 1000; // 25 minutes
+
 let sender: Sender;
 
 /**
@@ -162,7 +168,11 @@ async function runDueMissionTasks(): Promise<void> {
   const chatId = ALLOWED_CHAT_ID || 'mission';
   messageQueue.enqueue(chatId, async () => {
     const abortController = new AbortController();
-    const timeout = setTimeout(() => abortController.abort(), TASK_TIMEOUT_MS);
+    // Project research runs get the longer research ceiling; normal missions
+    // keep the 10-minute cap.
+    const taskTimeoutMs = mission.project_id ? RESEARCH_TASK_TIMEOUT_MS : TASK_TIMEOUT_MS;
+    const timeoutMins = Math.round(taskTimeoutMs / 60000);
+    const timeout = setTimeout(() => abortController.abort(), taskTimeoutMs);
 
     // When this mission is a project research run, mirror its outcome into the
     // linked project_item so the Workspace research library updates live.
@@ -212,8 +222,8 @@ async function runDueMissionTasks(): Promise<void> {
           logger.info({ missionId: mission.id }, 'Mission task cancelled by user');
           writeBackResearch('failed', 'Research run cancelled.');
         } else {
-          completeMissionTask(mission.id, null, 'failed', 'Timed out after 10 minutes');
-          writeBackResearch('failed', 'Research run timed out after 10 minutes.');
+          completeMissionTask(mission.id, null, 'failed', 'Timed out after ' + timeoutMins + ' minutes');
+          writeBackResearch('failed', 'Research run timed out after ' + timeoutMins + ' minutes.');
           logger.warn({ missionId: mission.id }, 'Mission task timed out');
           try {
             await sender('Mission task timed out: "' + mission.title + '"');

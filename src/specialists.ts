@@ -47,7 +47,7 @@ export type SpecialistCallsign =
   | 'atlas'      // Cloud supervisor, Opus 4.7. Strategy, heavyweight reasoning, planning.
   | 'mercury'    // Cloud supervisor, Sonnet latest. Fast execution, parallel scout work.
   | 'prism'      // Cloud. Research analysis: source grading, claim verification, synthesis.
-  | 'oracle'     // Claw / abliterated. Uncensored research (gemma-4-abliterated).
+  | 'oracle'     // Local / abliterated. Uncensored research (gemma-4-abliterated).
   | 'heretic';   // Local / abliterated. Bias + censorship cross-reference (neuraldaredevil-8b).
 
 // Specialist tier:
@@ -458,19 +458,18 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
   },
   oracle: {
     callsign: 'oracle',
-    tier: 'claw',
+    tier: 'local',
     role: 'Uncensored research: investigates the same questions as the regular team with no guardrails, surfacing facts, framings, and sources that guardrailed models omit or soften.',
-    // 2026-06-02 research team: oracle is the abliterated-side researcher. It
-    // runs the SAME question as sleuth but with no guardrails, giving the
-    // cross-check (heretic) an uncensored baseline to diff against. Primary is
-    // gemma-4-abliterated (9.6GB) so it fits the 16GB GPU with room for context;
-    // mistral-small-abliterated (14GB) and neuraldaredevil-8b (5.6GB) fall back.
-    // The dispatch layer pre-fetches Brave results for oracle (same path as
-    // sleuth) so it has real sources even when the abliterated model does not
-    // reliably drive the claw tool loop. expectsToolUse stays UNSET (same
-    // reasoning as reaper): abliterated models rarely emit tool_calls, so
-    // forcing the unverified label would be noise; grounding comes from the
-    // injected [SEARCH RESULTS] block instead.
+    // 2026-06-06 fix: oracle is LOCAL tier (direct Ollama, no claw tool loop),
+    // same as heretic. The dispatch layer pre-fetches Brave results for oracle
+    // and injects them as a [SEARCH RESULTS] block, so it reasons over real
+    // sources in a single bounded inference. This is fast and reliable; the
+    // claw tool loop was slow and spin-prone with an abliterated model and was
+    // what pushed the dual-track research run past its timeout. Local keeps the
+    // uncensored value (reads the same sources sleuth gets, with no guardrails)
+    // without the browse overhead abliterated models rarely use anyway. Primary
+    // gemma-4-abliterated (9.6GB) fits the 16GB GPU; mistral-small-abliterated
+    // (14GB) and neuraldaredevil-8b (5.6GB) fall back.
     preferredModel: 'huihui_ai/gemma-4-abliterated:latest',
     fallbackModels: [
       'huihui_ai/mistral-small-abliterated:latest',
@@ -482,8 +481,6 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
     defaultContextTokens: 16384,
     temperature: 0.4,
     vramHintGB: 10,
-    clawPermission: 'read-only',
-    clawUseFull: true,
   },
   heretic: {
     callsign: 'heretic',

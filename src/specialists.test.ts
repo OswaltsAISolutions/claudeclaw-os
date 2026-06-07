@@ -308,8 +308,11 @@ describe('research team: prism / oracle / heretic specialists', () => {
     expect(SPECIALISTS.prism.capabilities).toContain('verification');
   });
 
-  it('registers oracle as a claw / abliterated researcher on gemma-4-abliterated', () => {
-    expect(SPECIALISTS.oracle.tier).toBe('claw');
+  it('registers oracle as a local / abliterated researcher on gemma-4-abliterated', () => {
+    // Local tier (not claw): reasons over injected Brave results in one bounded
+    // inference, so it is fast and cannot spin the claw tool loop past the
+    // research timeout. Same tier as heretic.
+    expect(SPECIALISTS.oracle.tier).toBe('local');
     expect(SPECIALISTS.oracle.preferredModel).toBe('huihui_ai/gemma-4-abliterated:latest');
     expect(SPECIALISTS.oracle.capabilities).toContain('uncensored');
   });
