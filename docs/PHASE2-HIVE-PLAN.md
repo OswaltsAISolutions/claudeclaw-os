@@ -6,6 +6,33 @@ This plan is the single source of truth for Phase 2. It folds in every adversari
 
 ---
 
+## 0. Source Sync (verified against current HEAD — READ FIRST)
+
+This plan was drafted against the repo snapshot at the clone point (commit `90a4ba6`). Immediately afterward the Main PC pushed `1be8946` ("commit live application source so the repo matches the running service"), which added the fuller running-service code: `src/db.ts` +1,577 lines, `src/dashboard.ts` +1,083, `src/config.ts` +34, `src/index.ts` +35. The design was then re-verified against that current HEAD.
+
+**No conflicts. The design is fully valid as written.** Confirmed against current HEAD: no `hive_sessions`/`hive_notes` table exists yet; no `/api/hive/` route, `HIVE_TOKEN`, or `HIVE_ENABLED` exists yet; the auth model is UNCHANGED (the `/api/` gate still checks `safeTokenEqual(token, DASHBOARD_TOKEN)` via `?token=` only, no Authorization header); and `createSchema()`, `_initTestDatabase()`, the mutation kill-switch, `DASHBOARD_BIND`/non-loopback guard, `checkPendingMigrations` order, and `ALL_SWITCHES` all still exist with the same semantics.
+
+**Only line numbers shifted.** Prefer this remap (current HEAD) over the inline numbers in sections 4-5. Better still, re-locate each anchor by SYMBOL at implementation time, since the Main PC may push again before the build.
+
+| Anchor | Inline ref (old snapshot) | Current HEAD |
+|---|---|---|
+| `safeTokenEqual` definition | dashboard.ts:210-214 | dashboard.ts:270 |
+| `/api/` auth gate (insert the `/api/hive/` exemption at its top) | dashboard.ts:343-355 | dashboard.ts ~405-415 (DASHBOARD_TOKEN check at 411) |
+| `requireToken` helper (hive middleware goes just after) | dashboard.ts:~366 | dashboard.ts ~417-425 (check at 422) |
+| `mutationReadonlyExempt` set + mutation gate | dashboard.ts:374-393 | dashboard.ts:434+ |
+| `/api/hive-mind` block (insert new `/api/hive/*` routes AFTER it) | dashboard.ts:4001-4006 | dashboard.ts:5072+ |
+| `DASHBOARD_BIND` + `serve()` + non-loopback warning | dashboard.ts:4277-4286 | dashboard.ts:5348-5357 |
+| `createSchema()` (add the two tables inside it) | db.ts:~450 | db.ts:70 (fn start); `hive_mind` precedent at 192 |
+| `_initTestDatabase()` | db.ts:793-800 | db.ts:1121 |
+| `getOtherAgentActivity` (append hive DAL after it) | db.ts:2066 | db.ts:2381 |
+| `readEnvFile([...])` array | config.ts:7-41 | config.ts:7 (`PROTECTED_ENV_VARS` key at 37) |
+| `DASHBOARD_TOKEN` export | config.ts:177 | config.ts:211 |
+| `PROTECTED_ENV_VARS` export | config.ts:261-264 | config.ts:295 |
+| `KillSwitch` union / `ALL_SWITCHES` | kill-switches.ts:20-35 | kill-switches.ts:20 / 28 (unchanged) |
+| `checkPendingMigrations` / `initDatabase` order | index.ts:116 / 134 | index.ts:116 / 134 (unchanged) |
+
+---
+
 ## 1. Context + Goal
 
 ### Where we are (Phase 1, done, off-limits)
