@@ -17,7 +17,7 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import { ollamaChat, ollamaListModels, type ChatMessage } from './ollama.js';
 import { buildMemoryContext } from './memory.js';
 import { getSpecialistTierOverride, logConversationTurn, logToHiveMind } from './db.js';
-import { ALLOWED_CHAT_ID, DASHBOARD_TOKEN, PROJECT_ROOT, AGENT_MAX_TURNS } from './config.js';
+import { ALLOWED_CHAT_ID, DASHBOARD_TOKEN, PROJECT_ROOT, AGENT_MAX_TURNS, PRIMARY_MODEL, PRIMARY_MODEL_DISPLAY } from './config.js';
 import { logger } from './logger.js';
 import { toolLabel } from './tool-labels.js';
 import { runClaw } from './claw-runner.js';
@@ -266,9 +266,13 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
     // far stronger synthesis). Local qwen3-coder kept as localFallbackModel.
     // 2026-06-07: upgraded to Opus 4.7 for top-tier multi-source research depth
     // (Gabe's research is the system's #1 job; intelligence first, cost last).
-    preferredModel: 'claude-opus-4-7',
+    // 2026-06-10: Fable 5 (eval: longest, fullest answers on Gabe's actual
+    // research lanes, zero refusals on the legitimate-taboo probe set).
+    // FABLE5-TEMP 2026-06-13: Fable 5 unavailable; sleuth runs on PRIMARY_MODEL
+    // (config.ts) = Opus 4.8 for now. One edit there switches every primary role.
+    preferredModel: PRIMARY_MODEL,
     fallbackModels: ['mistral-small:24b', 'qwen3.5:latest'],
-    cloudModel: 'claude-opus-4-7',
+    cloudModel: PRIMARY_MODEL,
     localFallbackModel: 'qwen3-coder:30b',
     capabilities: ['research', 'synthesis', 'fact-check', 'citations', 'reasoning', 'web-search'],
     systemPrompt: `${HIVEMIND_PREAMBLE}\n\nYou are Sleuth, the team's web researcher, and this is real research, not a search summary. The dispatch layer pre-fetches Brave results under a [SEARCH RESULTS] block. Dig: USE bash + curl to follow the best links and read the actual pages, and when prefetch missed or you need more, curl "http://127.0.0.1:3141/api/web/search?token=$DASHBOARD_TOKEN&q=<query>&count=8" and fetch the top hits.\n\nRigor: (1) Corroborate every non-trivial claim across at least two independent sources; when only one supports it, label it [single-source]. (2) Prefer primary and authoritative sources over blogs and SEO pages, and prefer recent sources for time-sensitive facts. (3) When sources disagree, say so, say which you trust more, and why. (4) Go past the surface and past the obvious narrative when the evidence genuinely points elsewhere, but never invent a counter-narrative and never paste a URL or number you did not actually see.\n\nOutput contract: lead with the BOTTOM LINE, then KEY FINDINGS (each with an inline source URL), then a CONFIDENCE line (high / medium / low), then OPEN QUESTIONS listing what you could not verify. Never invent URLs or numbers.`,
@@ -468,9 +472,12 @@ export const SPECIALISTS: Record<SpecialistCallsign, SpecialistConfig> = {
     // provided material is a legitimately tool-less answer.
     // 2026-06-07: upgraded to Opus 4.7. Reconciling contradictory multi-source
     // evidence (the analyst's core job) is exactly where Opus separates from Sonnet.
-    preferredModel: 'claude-opus-4-7',
+    // 2026-06-10: Fable 5, paired with sleuth in the dual-track recipe.
+    // FABLE5-TEMP 2026-06-13: Fable 5 unavailable; prism runs on PRIMARY_MODEL
+    // (config.ts) = Opus 4.8 for now (single-flip switch point).
+    preferredModel: PRIMARY_MODEL,
     fallbackModels: ['mistral-small:24b'],
-    cloudModel: 'claude-opus-4-7',
+    cloudModel: PRIMARY_MODEL,
     localFallbackModel: 'qwen3-coder:30b',
     capabilities: ['analysis', 'synthesis', 'verification', 'compare', 'source-quality', 'reasoning'],
     systemPrompt: `${HIVEMIND_PREAMBLE}\n\nYou are Prism, the team's research analyst. You take raw research (Sleuth's findings, source excerpts, or several agents' answers) and produce rigorous analysis. Grade each source A/B/C with explicit criteria: A = primary or authoritative, recent, independent; B = credible secondary; C = weak, unsourced, or SEO. Separate well-supported claims from weak ones, surface contradictions between sources, and synthesize a structured comparison. Lead with the BOTTOM LINE, then the evidence, then an OVERALL CONFIDENCE rating (high / medium / low) on the conclusion, then EVIDENCE GAPS listing the questions the current sources do not answer. Flag any claim that rests on a single weak source. Never invent facts; when a claim cannot be verified from the provided material, say so explicitly.`,
@@ -542,6 +549,12 @@ export interface DelegateResult {
   durationMs: number;
   tokenEstimate: number;
   fellBackFrom?: string;
+  // Measured usage from the Agent SDK result event (cloud tier only;
+  // undefined on local/claw paths and on cloud errors). tokensIn includes
+  // cache creation + cache reads — the full context the call processed.
+  tokensIn?: number;
+  tokensOut?: number;
+  costUsd?: number;
 }
 
 /**
@@ -584,6 +597,10 @@ export interface DelegateOptions {
   shareMemory?: boolean; // Default true. Inject hivemind memory context.
   signal?: AbortSignal;
   maxTokens?: number;    // Hard cap on output tokens.
+  model?: string;        // Cloud tier only: per-call override of the SDK model
+                         // for THIS delegation (e.g. a bulk job downshifting a
+                         // Fable-5 specialist to Opus). Ignored on local/claw
+                         // tiers. Does NOT touch the SPECIALISTS config.
   systemAddendum?: string; // Extra task-specific instructions tacked onto the system prompt.
   // Optional: forward tool_use / tool_result events as the specialist
   // works. The dashboard activity panel reads these to render Claude-Code
@@ -659,6 +676,14 @@ function applyTierOverride(spec: SpecialistConfig): SpecialistConfig {
     nextModel = spec.localFallbackModel || spec.preferredModel;
   }
   return { ...spec, tier: override as SpecialistTier, preferredModel: nextModel };
+}
+
+/** One concise line appended to every specialist's system prompt so the agent
+ *  itself knows which model it is currently running on (Gabe 2026-06-13: every
+ *  agent must know its correct model). Derived from the resolved model at
+ *  dispatch, so it never goes stale when PRIMARY_MODEL or a tier override changes. */
+function runtimeModelLine(callsign: string, model: string): string {
+  return `[Runtime identity] You are the "${callsign}" specialist, currently running on model: ${model}. If asked which model you are, answer exactly that.`;
 }
 
 /**
@@ -753,6 +778,7 @@ export async function delegate(
     spec.systemPrompt,
     opts.systemAddendum ? `\n${opts.systemAddendum}` : '',
     memoryContext ? `\n${memoryContext}` : '',
+    `\n${runtimeModelLine(callsign, resolved.model)}`,
   ]
     .join('\n')
     .trim();
@@ -909,6 +935,7 @@ async function delegateClaw(
     spec.systemPrompt,
     opts.systemAddendum ? `\n${opts.systemAddendum}` : '',
     memoryContext ? `\n${memoryContext}` : '',
+    `\n${runtimeModelLine(spec.callsign, spec.preferredModel)}`,
   ]
     .join('\n')
     .trim();
@@ -1147,6 +1174,7 @@ async function delegateCloud(
     spec.systemPrompt,
     opts.systemAddendum ? `\n${opts.systemAddendum}` : '',
     memoryContext ? `\n${memoryContext}` : '',
+    `\n${runtimeModelLine(spec.callsign, opts.model || spec.preferredModel)}`,
   ]
     .join('\n')
     .trim();
@@ -1157,6 +1185,12 @@ async function delegateCloud(
   // single-turn helper doesn't expose a separate system field cleanly.
   // permissionMode 'bypassPermissions' grants full tool access without
   // per-call prompts — same posture Jarvis main runs with.
+  // Per-call model override (opts.model) beats the spec default so bulk
+  // jobs can downshift a single call without touching global routing.
+  const cloudModel = opts.model || spec.preferredModel;
+  let measuredIn: number | undefined;
+  let measuredOut: number | undefined;
+  let measuredCostUsd: number | undefined;
   let output = '';
   let toolCalls = 0;
   let didCompact = false;
@@ -1177,7 +1211,7 @@ async function delegateCloud(
         permissionMode: spec.cloudAllowTools !== false ? 'bypassPermissions' : 'default',
         allowDangerouslySkipPermissions: spec.cloudAllowTools !== false,
         ...(AGENT_MAX_TURNS > 0 ? { maxTurns: AGENT_MAX_TURNS } : {}),
-        model: spec.preferredModel,
+        model: cloudModel,
         // NOTE: the Agent SDK exposes no temperature option (only extraArgs, a raw
         // CLI passthrough with no --temperature flag), so spec.temperature cannot be
         // applied on the cloud path. Cloud agents run at the SDK default; quality is
@@ -1289,6 +1323,15 @@ async function delegateCloud(
         // Final result event — capture full text if not already streamed
         const result = ev['result'] as string | undefined;
         if (result && !output) output = result;
+        // Measured usage off the same event (input + cache writes + cache
+        // reads = total context processed; output = generated tokens).
+        const usage = ev['usage'] as Record<string, unknown> | undefined;
+        if (usage) {
+          const n = (k: string) => (typeof usage[k] === 'number' ? (usage[k] as number) : 0);
+          measuredIn = n('input_tokens') + n('cache_creation_input_tokens') + n('cache_read_input_tokens');
+          measuredOut = n('output_tokens');
+        }
+        if (typeof ev['total_cost_usd'] === 'number') measuredCostUsd = ev['total_cost_usd'] as number;
       }
     }
   } catch (err) {
@@ -1310,7 +1353,7 @@ async function delegateCloud(
         try {
           logToHiveMind(
             agentNs, chatId, 'specialist-cloud-to-local-fallback',
-            `${spec.callsign}: ${spec.preferredModel} → ${spec.localFallbackModel}`,
+            `${spec.callsign}: ${cloudModel} → ${spec.localFallbackModel}`,
             JSON.stringify({ error: String(err).slice(0, 200), unverified: true }),
           );
         } catch { /* best-effort */ }
@@ -1353,7 +1396,7 @@ async function delegateCloud(
             output: labeledLocalOutput,
             durationMs: Date.now() - startedAt,
             tokenEstimate: 0,
-            fellBackFrom: spec.preferredModel,
+            fellBackFrom: cloudModel,
           };
         } catch (localErr) {
           logger.warn(
@@ -1380,7 +1423,7 @@ async function delegateCloud(
         const fallbackResult = await delegate(spec.fallbackCallsign, task, opts);
         return {
           ...fallbackResult,
-          fellBackFrom: spec.preferredModel,
+          fellBackFrom: cloudModel,
         };
       }
     }
@@ -1424,7 +1467,7 @@ async function delegateCloud(
         JSON.stringify({
           callsign: spec.callsign,
           tier: 'cloud',
-          model: spec.preferredModel,
+          model: cloudModel,
           toolCalls,
           didCompact,
           durationMs,
@@ -1438,7 +1481,10 @@ async function delegateCloud(
 
   return {
     callsign: spec.callsign,
-    modelUsed: spec.preferredModel,
+    modelUsed: cloudModel,
+    tokensIn: measuredIn,
+    tokensOut: measuredOut,
+    costUsd: measuredCostUsd,
     output: output.trim() || '[cloud specialist produced no output]',
     durationMs,
     tokenEstimate: 0, // SDK doesn't surface this cleanly; usage tab tracks separately
@@ -1602,14 +1648,14 @@ export async function intelligentRoute(task: string): Promise<{
     '- scribe: writing, summaries, drafts, rewrites, formatting, short copy (Sonnet 4.6)',
     '- coder: code reading, refactors, tests, bug fixes, language conversions (Sonnet 4.6)',
     '- eye: image / video analysis, OCR, screenshot triage, visual classification (qwen3-vl:8b, local)',
-    '- sleuth: research synthesis, multi-source fact gathering, citations, "tell me about X" style questions (Opus 4.7)',
+    `- sleuth: research synthesis, multi-source fact gathering, citations, "tell me about X" style questions (${PRIMARY_MODEL_DISPLAY})`,
     '- reaper: uncensored / no-guardrail work, e.g. security research, red-team, edgy creative drafting (abliterated 35b, local)',
     '- archivist: memory consolidation, recall queries, deduplication, salience scoring (Sonnet 4.6)',
     '- sentinel: sysadmin, log triage, infra / systemd troubleshooting, deployment diagnostics (Sonnet 4.6)',
     '- cipher: data analysis, CSV / JSON crunching, statistics, pattern extraction (Sonnet 4.6)',
     '- atlas: heavyweight reasoning, planning, architecture review, multi-step decomposition (Opus 4.7)',
     '- mercury: fast execution, parallel scout work, drafting under speed pressure (Sonnet 4.6)',
-    '- prism: research analysis, source-quality grading, claim verification, structured synthesis of findings (Opus 4.7)',
+    `- prism: research analysis, source-quality grading, claim verification, structured synthesis of findings (${PRIMARY_MODEL_DISPLAY})`,
     '- oracle: uncensored / abliterated research, surfaces what guardrailed models omit or soften (gemma-4-abliterated, local)',
     '- heretic: bias + censorship cross-reference, diffs regular vs uncensored findings and flags distortions (neuraldaredevil-8b, local)',
     '- self: Jarvis handles directly. Use only when truly conversational, trivially small, or genuinely orchestration-level (Jarvis decomposes then re-routes parts).',
@@ -1630,7 +1676,10 @@ export async function intelligentRoute(task: string): Promise<{
       for await (const event of query({
         prompt: routerPrompt,
         options: {
-          model: 'claude-opus-4-8',
+          // 2026-06-10: router follows main onto Fable 5.
+          // FABLE5-TEMP 2026-06-13: Fable 5 unavailable; router uses PRIMARY_MODEL
+          // (config.ts) = Opus 4.8. Reason strings below already say "Opus".
+          model: PRIMARY_MODEL,
           maxTurns: 1,
           settingSources: [],
           permissionMode: 'bypassPermissions',

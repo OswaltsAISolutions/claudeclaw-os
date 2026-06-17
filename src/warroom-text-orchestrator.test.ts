@@ -8,6 +8,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 vi.mock('./config.js', () => ({
   PROJECT_ROOT: '/tmp/test-orchestrator',
   CLAUDECLAW_CONFIG: '/tmp/test-orchestrator/config',
+  PRIMARY_MODEL: 'claude-opus-4-8',
+  PRIMARY_MODEL_DISPLAY: 'Opus 4.8',
 }));
 
 vi.mock('./env.js', () => ({

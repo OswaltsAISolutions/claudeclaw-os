@@ -15,6 +15,7 @@ import {
   MAX_MESSAGE_LENGTH,
   activeBotToken,
   agentDefaultModel,
+  PRIMARY_MODEL,
   agentMcpAllowlist,
   agentSystemPrompt,
   TYPING_REFRESH_MS,
@@ -30,7 +31,16 @@ import {
   HOURLY_TOKEN_BUDGET,
   PROJECT_ROOT,
 } from './config.js';
-import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, logConversationTurn, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, saveCompactionEvent, getCompactionCount } from './db.js';
+import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, logConversationTurn, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, saveCompactionEvent, getCompactionCount, createLibraryItem, getLibraryItemByUrl } from './db.js';
+import { extractSocialUrls } from './library-shared.js';
+import { setLibraryNotifier } from './library-worker.js';
+import { setSweepNotifier } from './content-sweep.js';
+import { setVerifyNotifier } from './fact-checker.js';
+import { setRenderNotifier } from './render-worker.js';
+import { setEdgeNotifier } from './edge-scanner.js';
+import { setEdgePaperNotifier } from './edge-paper.js';
+import { setClientResearchNotifier } from './clients-research.js';
+import crypto from 'crypto';
 import { logger } from './logger.js';
 import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage } from './media.js';
 import { buildMemoryContext, createPinnedMemory, evaluateMemoryRelevance, logAssistantTurn, shouldNudgeMemory, MEMORY_NUDGE_TEXT } from './memory.js';
@@ -124,10 +134,17 @@ const voiceEnabledChats = new Set<string>();
 const chatModelOverride = new Map<string, string>();
 
 const AVAILABLE_MODELS: Record<string, string> = {
+  fable: 'claude-fable-5',
   opus: 'claude-opus-4-8',
   sonnet: 'claude-sonnet-4-6',
   haiku: 'claude-haiku-4-5',
 };
+// 2026-06-10: Jarvis main defaults to Fable 5 (Gabe-approved upgrade;
+// eval showed best reasoning on the money-critical cases, no added
+// refusals on his research lanes). /model opus flips back in one message.
+// FABLE5-TEMP 2026-06-13: Fable 5 unavailable; main's DEFAULT model now follows
+// config PRIMARY_MODEL (= Opus 4.8 for now). This label only drives the /model
+// command UX + display; the resolved default is PRIMARY_MODEL (see effectiveModel).
 const DEFAULT_MODEL_LABEL = 'opus';
 
 export function setMainModelOverride(model: string): void {
@@ -620,7 +637,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   const userModel = chatModelOverride.get(chatIdStr) ?? agentDefaultModel;
   const effectiveModel = (SMART_ROUTING_ENABLED && !userModel && classifyMessageComplexity(message) === 'simple')
     ? SMART_ROUTING_CHEAP_MODEL
-    : (userModel ?? 'claude-opus-4-8');
+    : (userModel ?? PRIMARY_MODEL);  // FABLE5-TEMP: default follows config PRIMARY_MODEL
 
   // Start typing immediately, then refresh on interval
   await sendTyping(ctx.api, chatId);
@@ -1437,6 +1454,181 @@ export function createBot(): Bot {
 
   // Text messages — and any slash commands not owned by this bot (skills, e.g. /todo /gmail)
   const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/memory', '/forget', '/pin', '/unpin', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/lock', '/status']);
+  // ── Content Library: share-to-Jarvis ───────────────────────────────
+  // Track the "Got it, ingesting..." ack per item so the worker can edit
+  // it into a final status when the pipeline finishes.
+  const libraryAcks = new Map<string, { chatId: string; messageId: number }>();
+
+  // ── Edge Scanner: Telegram alerts on big dislocations ───────────────
+  // Read-only measurement alerts; "edge" here is a signal to LOOK, not an
+  // instruction to trade (no venue is funded, and that needs Gabe's call).
+  setEdgeNotifier((opp, meta) => {
+    if (!ALLOWED_CHAT_ID) return;
+    const base = DASHBOARD_URL || '';
+    const link = base ? `\n${base.replace(/\/$/, '')}/edge` : '';
+    const pct = (x: number | null) => (x === null ? '?' : `${(x * 100).toFixed(1)}%`);
+    const kindLabel: Record<string, string> = {
+      negrisk_yes: 'Polymarket negRisk (buy-all-YES)',
+      negrisk_no: 'Polymarket negRisk (buy-all-NO)',
+      xvenue: 'Kalshi vs Polymarket dislocation',
+      kalshi_intra: 'Kalshi YES+NO < $1',
+      kalshi_spread: 'Kalshi wide spread (maker)',
+    };
+    void bot.api.sendMessage(
+      ALLOWED_CHAT_ID,
+      `📐 Edge Scanner: ${kindLabel[opp.kind] ?? opp.kind}${meta.isNew ? '' : ' (still open)'}\n` +
+      `${(opp.title ?? opp.ref).slice(0, 160)}\n` +
+      `Net edge ${pct(opp.net_edge)} after fee model (gross ${pct(opp.gross_edge)}). Depth unknown.\n` +
+      `Measurement only, nothing is funded.${link}`,
+    ).catch(() => { /* non-fatal */ });
+  });
+
+  // ── Edge paper trader: Telegram on every simulated open/close ───────
+  setEdgePaperNotifier((t, phase) => {
+    if (!ALLOWED_CHAT_ID) return;
+    const base = DASHBOARD_URL || '';
+    const link = base ? `\n${base.replace(/\/$/, '')}/edge` : '';
+    if (phase === 'open') {
+      void bot.api.sendMessage(
+        ALLOWED_CHAT_ID,
+        `🧪 Paper trade OPENED (fake money)\n${(t.title ?? t.kalshi_ticker).slice(0, 140)}\n` +
+        `${t.side.toUpperCase()} x${t.qty} @ ${t.entry_price.toFixed(2)} (fee ${t.entry_fee.toFixed(2)})` +
+        (t.entry_poly_fair !== null ? `, Polymarket fair ${t.entry_poly_fair.toFixed(2)}` : '') +
+        link,
+      ).catch(() => { /* non-fatal */ });
+    } else {
+      const pnl = t.realized_pnl ?? 0;
+      void bot.api.sendMessage(
+        ALLOWED_CHAT_ID,
+        `🧪 Paper trade ${t.exit_reason === 'settlement' ? `SETTLED (${(t.result ?? '?').toUpperCase()})` : 'CLOSED (gap converged)'}\n` +
+        `${(t.title ?? t.kalshi_ticker).slice(0, 140)}\n` +
+        `P&L ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} on ${t.side.toUpperCase()} x${t.qty} @ ${t.entry_price.toFixed(2)}${link}`,
+      ).catch(() => { /* non-fatal */ });
+    }
+  });
+
+  // Edit Bay render finished (or failed): one compact ping with the link.
+  setRenderNotifier((job) => {
+    if (!ALLOWED_CHAT_ID) return;
+    const base = DASHBOARD_URL || '';
+    const bayLink = base ? `\n${base.replace(/\/$/, '')}/editbay` : '';
+    void bot.api.sendMessage(
+      ALLOWED_CHAT_ID,
+      job.status === 'ready'
+        ? `🎬 Render ready (${job.id}). Preview and download in the Edit Bay.${bayLink}`
+        : `⚠️ Render ${job.id} failed: ${job.error ?? 'unknown'}. Retry from the Edit Bay.${bayLink}`,
+    ).catch(() => { /* non-fatal */ });
+  });
+
+  // Fact-check finished: ping with the verdict tally so Gabe knows whether
+  // the script is safe to greenlight without opening the dashboard.
+  setVerifyNotifier((draft, item, result) => {
+    if (!ALLOWED_CHAT_ID) return;
+    const base = DASHBOARD_URL || '';
+    const studioLink = base ? `\n${base.replace(/\/$/, '')}/studio` : '';
+    const s = result.summary;
+    const angle = item?.content_angle ? `"${item.content_angle.slice(0, 100)}"` : `draft ${draft.id}`;
+    const flagged = result.claims
+      .filter((c) => c.verdict === 'false' || c.verdict === 'disputed')
+      .map((c) => `${c.verdict === 'false' ? '❌' : '⚠️'} ${c.claim.slice(0, 90)}${c.correction ? ` -> ${c.correction.slice(0, 90)}` : ''}`)
+      .join('\n');
+    void bot.api.sendMessage(
+      ALLOWED_CHAT_ID,
+      `🧾 Facts checked on ${angle}\n✅ ${s.confirmed} confirmed · ❌ ${s.false} false · ⚠️ ${s.disputed} disputed · ❓ ${s.unverified} unverified${flagged ? `\n${flagged}` : ''}${studioLink}`,
+    ).catch(() => { /* non-fatal */ });
+  });
+
+  // Live-event sweep results: one compact summary per sweep that found
+  // something; strong picks (75+) flagged. Silent on empty sweeps.
+  setSweepNotifier((summary) => {
+    if (!ALLOWED_CHAT_ID || summary.added.length === 0) return;
+    const base = DASHBOARD_URL || '';
+    const studioLink = base ? `\n${base.replace(/\/$/, '')}/studio` : '';
+    const lines = summary.added
+      .sort((a, b) => b.score - a.score)
+      .map((a) => `${a.score >= 75 ? '🔥' : '•'} ${a.score} ${a.track === 'real_world' ? 'RW' : 'AI'}: ${a.angle ?? a.title}`)
+      .join('\n');
+    void bot.api.sendMessage(
+      ALLOWED_CHAT_ID,
+      `🛰️ Live-event sweep (${summary.trigger}): ${summary.added.length} new opportunit${summary.added.length === 1 ? 'y' : 'ies'}\n${lines}${studioLink}`,
+    ).catch(() => { /* non-fatal */ });
+  });
+
+  // ── AI agency: Telegram when a deep dive or pitch draft finishes ─────
+  setClientResearchNotifier((client, artifact, ok) => {
+    if (!ALLOWED_CHAT_ID) return;
+    const base = DASHBOARD_URL || '';
+    const link = base ? `\n${base.replace(/\/$/, '')}/clients` : '';
+    const kind = artifact.kind === 'deep_dive' ? 'Deep dive' : 'Pitch draft';
+    void bot.api.sendMessage(
+      ALLOWED_CHAT_ID,
+      ok
+        ? `💼 ${kind} ready: ${client.company}${link}`
+        : `💼 ${kind} FAILED for ${client.company}; open the card and retry.${link}`,
+    ).catch(() => { /* non-fatal */ });
+  });
+
+  setLibraryNotifier((item, phase, cat) => {
+    const base = DASHBOARD_URL || '';
+    const link = base ? `\n${base.replace(/\/$/, '')}/library` : '';
+
+    // A brand-new top-level umbrella is a notable event: announce it on its
+    // own, even for items that did not originate from a Telegram share.
+    if (phase === 'ready' && cat && cat.newUmbrellas.length > 0 && ALLOWED_CHAT_ID) {
+      const names = cat.newUmbrellas.map((u) => `"${u}"`).join(', ');
+      void bot.api.sendMessage(
+        ALLOWED_CHAT_ID,
+        `🆕 New top-level category created: ${names}\nNothing fit the existing ones, so Jarvis made it (from ${item.author_handle ?? item.platform}). Rename or merge it anytime in the Library.`,
+      ).catch(() => { /* non-fatal */ });
+    }
+
+    // Proactive content ping (locked decision 2026-06-10): a strong content
+    // opportunity gets its own message regardless of where the save came
+    // from, so Gabe hears about it without opening the Studio.
+    if (phase === 'ready' && cat && cat.intent === 'content' && cat.contentScore >= 75 && ALLOWED_CHAT_ID) {
+      const trackLabel = cat.track === 'real_world' ? 'Real-World (IG/X)' : 'AI (TikTok/YT)';
+      const studioLink = base ? `\n${base.replace(/\/$/, '')}/studio` : '';
+      void bot.api.sendMessage(
+        ALLOWED_CHAT_ID,
+        `🎬 Strong content opportunity (${cat.contentScore}/100, ${trackLabel})${cat.contentAngle ? `\n"${cat.contentAngle}"` : ''}\nFrom ${item.author_handle ?? item.platform}. Open the Studio to draft it.${studioLink}`,
+      ).catch(() => { /* non-fatal */ });
+    }
+
+    const ack = libraryAcks.get(item.id);
+    if (!ack) {
+      // No Telegram ack to edit (bookmark sync / dashboard paste). Still honor
+      // "auto-create + notify": announce newly created SUBcategories compactly.
+      if (phase === 'ready' && cat && cat.newSubcategories.length > 0 && ALLOWED_CHAT_ID) {
+        const lines = cat.newSubcategories.map((s) => `${s.umbrella} > ${s.subcategory}`).join('\n');
+        void bot.api.sendMessage(ALLOWED_CHAT_ID, `📁 New folder(s) created while filing a synced post:\n${lines}`).catch(() => { /* non-fatal */ });
+      }
+      return;
+    }
+    libraryAcks.delete(item.id);
+
+    if (phase !== 'ready') {
+      void bot.api.editMessageText(ack.chatId, ack.messageId,
+        `⚠️ Could not ingest that ${item.platform} link: ${item.error ?? item.status}. It's saved, hit Retry in the Library tab.${link}`,
+      ).catch(() => { /* ack may be old */ });
+      return;
+    }
+
+    // Folder path from the primary assignment (fall back to first).
+    let folderLine = '';
+    let newNote = '';
+    if (cat && cat.folders.length > 0) {
+      const primary = cat.folders.find((f) => f.primary) ?? cat.folders[0];
+      folderLine = `\n📁 ${primary.umbrella} > ${primary.subcategory}`;
+      const others = cat.folders.filter((f) => f !== primary);
+      if (others.length) folderLine += ` (+${others.length} more)`;
+      if (cat.newSubcategories.some((s) => s.subcategory === primary.subcategory)) newNote = ' (new folder)';
+    }
+    let tags = '';
+    try { tags = item.tags ? (JSON.parse(item.tags) as string[]).map((t) => `#${t}`).join(' ') : ''; } catch { /* ok */ }
+    const text = `✅ Saved${item.author_handle ? `: ${item.author_handle}` : ''} (${item.platform})${item.transcript ? ', transcribed' : ''}${folderLine}${newNote}${tags ? `\n${tags}` : ''}${link}`;
+    void bot.api.editMessageText(ack.chatId, ack.messageId, text).catch(() => { /* ack may be old */ });
+  });
+
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
     const chatIdStr = ctx.chat!.id.toString();
@@ -1464,6 +1656,43 @@ export function createBot(): Bot {
       return;
     }
     touchActivity();
+
+    // ── Content Library: detect shared X / Instagram post links ──────
+    // URL-only messages (or URL + a short note) are handled entirely here,
+    // no LLM turn. URLs inside longer questions are ingested AND the full
+    // message still goes to Jarvis.
+    const socialUrls = extractSocialUrls(text);
+    if (socialUrls.length > 0) {
+      const residue = text.replace(/https?:\/\/\S+/gi, '').trim();
+      const urlOnly = residue.length <= 80;
+      const lines: string[] = [];
+      for (const su of socialUrls) {
+        const existing = getLibraryItemByUrl(su.url);
+        if (existing) {
+          lines.push(`Already in your library (${existing.status}): ${su.url}`);
+          continue;
+        }
+        const id = crypto.randomBytes(4).toString('hex');
+        createLibraryItem(id, su.url, su.platform, {
+          source: 'telegram',
+          notes: urlOnly && residue ? residue : null,
+        });
+        lines.push(`Got it, ingesting ${su.platform === 'x' ? 'X post' : 'Instagram post'}...`);
+        if (urlOnly) {
+          // Worker edits this ack when the item is ready / fails.
+          try {
+            const ack = await ctx.reply(lines[lines.length - 1]);
+            libraryAcks.set(id, { chatId: chatIdStr, messageId: ack.message_id });
+            lines.pop(); // already sent as its own message
+          } catch { /* reply failed; worker notify just won't edit */ }
+        }
+      }
+      if (urlOnly) {
+        if (lines.length > 0) await ctx.reply(lines.join('\n'));
+        return; // fully handled, skip the LLM
+      }
+      // Longer message: let Jarvis see it, with a note that ingestion started.
+    }
 
     // ── WhatsApp state machine ──────────────────────────────────────
     const state = waState.get(chatIdStr);

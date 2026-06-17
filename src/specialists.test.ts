@@ -27,6 +27,8 @@ vi.mock('./config.js', () => ({
   DASHBOARD_TOKEN: 'test-token',
   PROJECT_ROOT: '/tmp/project',
   AGENT_MAX_TURNS: 24,
+  PRIMARY_MODEL: 'claude-opus-4-8',
+  PRIMARY_MODEL_DISPLAY: 'Opus 4.8',
 }));
 vi.mock('./logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -302,9 +304,9 @@ describe('routing: multi-domain detection + escalation to Jarvis', () => {
 // (tier + model per the 16GB-VRAM-aware plan) and that each role is reachable
 // by its own keywords without disturbing the existing single-domain routes.
 describe('research team: prism / oracle / heretic specialists', () => {
-  it('registers prism as a cloud analyst on Opus 4.7', () => {
+  it('registers prism as a cloud analyst on Opus 4.8 (Fable 5 temp-unavailable 2026-06-13)', () => {
     expect(SPECIALISTS.prism.tier).toBe('cloud');
-    expect(SPECIALISTS.prism.preferredModel).toBe('claude-opus-4-7');
+    expect(SPECIALISTS.prism.preferredModel).toBe('claude-opus-4-8');
     expect(SPECIALISTS.prism.capabilities).toContain('verification');
   });
 

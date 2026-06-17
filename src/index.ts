@@ -216,6 +216,41 @@ async function main(): Promise<void> {
   if (AGENT_ID === 'main') {
     startDashboard(bot.api);
 
+    // Content Library: seed the taxonomy (idempotent) then start the worker.
+    const { seedCategories } = await import('./db.js');
+    seedCategories();
+    const { startLibraryWorker } = await import('./library-worker.js');
+    startLibraryWorker();
+
+    // Nightly X bookmark sync (official API; no-op until account connected).
+    const { startXBookmarkSync } = await import('./x-bookmarks.js');
+    startXBookmarkSync();
+
+    // Content Engine P4: live-event sweeps (8:00 + 18:00 local) feeding the
+    // Studio with ranked opportunities from the live web, both lanes.
+    const { startContentSweep } = await import('./content-sweep.js');
+    startContentSweep();
+
+    // Fact-checker: a restart mid-verification must not strand 'running'.
+    const { recoverStuckVerifications } = await import('./db.js');
+    const stuckVerifications = recoverStuckVerifications();
+    if (stuckVerifications > 0) {
+      logger.warn({ count: stuckVerifications }, 'Reset fact-check runs interrupted by restart');
+    }
+
+    // Edit Bay: render worker (whisper words + Remotion, serial queue).
+    const { startRenderWorker } = await import('./render-worker.js');
+    startRenderWorker();
+
+    // Edge Scanner: read-only Kalshi/Polymarket dislocation measurement
+    // (2026-06-10 money-systems slice). Public APIs only, no keys, no orders.
+    const { startEdgeScanner } = await import('./edge-scanner.js');
+    startEdgeScanner();
+
+    // AI agency: background deep-dive / pitch research jobs (Clients room).
+    const { startClientResearchWorker } = await import('./clients-research.js');
+    startClientResearchWorker();
+
     // Phase 3 (2026-05-21): notify on boot about messages clobbered by a
     // mid-task SIGTERM that never made it into conversation_log. Wrapped in
     // a 10s race so a stuck recovery never blocks the rest of startup.

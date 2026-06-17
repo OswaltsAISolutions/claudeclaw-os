@@ -1,7 +1,10 @@
+import crypto from 'node:crypto';
+
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 
-import { logToHiveMind } from './db.js';
+import { logToHiveMind, createPsyopScore, updatePsyopScore } from './db.js';
+import { scorePsyop } from './psyop-scorer.js';
 import { logger } from './logger.js';
 import {
   delegate,
@@ -220,9 +223,53 @@ export function createTeamMcpServer(chatId: string) {
     },
   );
 
+  const scorePsyopTool = tool(
+    'score_psyop',
+    [
+      'Score a claim, article, headline, or event against the NCI Engineered Reality Scoring System (Chase Hughes\' 20-item psyop-detection test) to gauge how probably it is an engineered narrative.',
+      'A local uncensored model drafts the 20 scores, then a cloud model verifies them. Returns the per-category breakdown, total (20-100), and likelihood band.',
+      'Use this when Gabe asks how likely something is a psyop, or to vet a narrative before he acts on or publishes it.',
+      'IMPORTANT: it scores manipulation FORM, not truth. A high score means the narrative is engineered, not that its claim is false. Always relay that caveat.',
+      'The result is also saved to the Psyop Scoring room so Gabe can review it.',
+    ].join(' '),
+    {
+      subject: z.string().min(1).describe('A short label for what is being scored (e.g. "WHO pandemic-treaty rollout" or the headline).'),
+      text: z.string().min(20).describe('The actual claim/article/material to score. Paste the substance, not a summary; the score is only as good as what it sees.'),
+    },
+    async (args): Promise<CallToolText> => {
+      const { subject, text } = args;
+      logger.info({ subject: subject.slice(0, 80) }, '[team] score_psyop');
+      const id = crypto.randomBytes(4).toString('hex');
+      try {
+        createPsyopScore({ id, subject: subject.slice(0, 200), inputText: text.slice(0, 20000) });
+        const { result, localRaw } = await scorePsyop(subject.slice(0, 200), text, { refId: id });
+        updatePsyopScore(id, {
+          status: 'ready', total: result.total, band: result.band,
+          local_json: localRaw.slice(0, 20000) || null, final_json: JSON.stringify(result),
+          model_local: result.localModel, model_verify: result.verifyModel, error: null,
+        });
+        const top = [...result.items].sort((a, b) => b.score - a.score).slice(0, 6)
+          .map((i) => `  ${i.category}: ${i.score}/5 — ${i.evidence}`).join('\n');
+        const body = [
+          `NCI psyop score for "${subject}": ${result.total}/100 — ${result.bandLabel}`,
+          result.truthAgendaNote ? `Note: ${result.truthAgendaNote}` : '',
+          `Top-scoring patterns:\n${top}`,
+          `(local ${result.localModel ?? 'n/a'} -> verified ${result.verifyModel ?? 'n/a'})`,
+          result.disclaimer,
+        ].filter(Boolean).join('\n\n');
+        return asText(body);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        try { updatePsyopScore(id, { status: 'failed', error: msg.slice(0, 300) }); } catch { /* row may not exist */ }
+        logger.warn({ err: msg }, '[team] score_psyop failed');
+        return asText(`Could not score "${subject}": ${msg}`, true);
+      }
+    },
+  );
+
   return createSdkMcpServer({
     name: 'team',
     version: '1.0.0',
-    tools: [delegateTool, delegateParallelTool, rosterTool],
+    tools: [delegateTool, delegateParallelTool, rosterTool, scorePsyopTool],
   });
 }

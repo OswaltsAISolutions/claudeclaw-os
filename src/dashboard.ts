@@ -6,7 +6,7 @@ import { serve } from '@hono/node-server';
 import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
-import { AGENT_ID, ALLOWED_CHAT_ID, DASHBOARD_PORT, DASHBOARD_TOKEN, DASHBOARD_URL, PROJECT_ROOT, STORE_DIR, WHATSAPP_ENABLED, SLACK_USER_TOKEN, CONTEXT_LIMIT, agentDefaultModel, CLAUDECLAW_CONFIG } from './config.js';
+import { AGENT_ID, ALLOWED_CHAT_ID, DASHBOARD_PORT, DASHBOARD_TOKEN, DASHBOARD_URL, PROJECT_ROOT, STORE_DIR, WHATSAPP_ENABLED, SLACK_USER_TOKEN, CONTEXT_LIMIT, agentDefaultModel, CLAUDECLAW_CONFIG, PRIMARY_MODEL } from './config.js';
 import crypto from 'crypto';
 import {
   getAllScheduledTasks,
@@ -78,7 +78,67 @@ import {
   createProjectItem,
   updateProjectItem,
   deleteProjectItem,
+  createLibraryItem,
+  getLibraryItem,
+  getLibraryItemByUrl,
+  listLibraryItems,
+  updateLibraryItem,
+  deleteLibraryItem,
+  getContentDraft,
+  listContentDrafts,
+  updateContentDraft,
+  deleteContentDraft,
+  createRenderJob,
+  getRenderJob,
+  listRenderJobs,
+  updateRenderJob,
+  deleteRenderJob,
+  createEditProject,
+  getEditProject,
+  updateEditProject,
+  listEditProjects,
+  deleteEditProject,
+  createPsyopScore,
+  getPsyopScore,
+  updatePsyopScore,
+  listPsyopScores,
+  deletePsyopScore,
+  libraryStats,
+  deleteSocialAccount,
+  listCategoryTree,
+  getCategory,
+  ensureCategory,
+  renameCategory,
+  mergeCategories,
+  deleteCategory,
+  getItemCategories,
+  assignItemCategory,
+  unassignItemCategory,
+  setPrimaryCategory,
+  findUmbrellaByName,
+  listEdgePairs,
+  getEdgePair,
+  updateEdgePair,
+  listEdgeOpportunities,
+  listEdgeStats,
+  edgeSummaryCounts,
+  listPaperTrades,
+  CLIENT_STAGES,
+  createClient,
+  getClient,
+  listClients,
+  updateClient,
+  deleteClient,
+  createClientArtifact,
+  listClientArtifacts,
+  deleteClientArtifact,
 } from './db.js';
+import { getEdgeScannerState, triggerEdgeScan } from './edge-scanner.js';
+import { paperSummary } from './edge-paper.js';
+import { generateServiceTexts } from './clients-demo.js';
+import { openClientFolder } from './clients-export.js';
+import { canonicalizeSocialUrl } from './library-shared.js';
+import { buildAuthUrl, completeAuth, syncBookmarks, xSyncStatus, xConfigured } from './x-bookmarks.js';
 import { computeNextRun } from './scheduler.js';
 import { generateContent, parseJsonResponse } from './gemini.js';
 import { getSecurityStatus } from './security.js';
@@ -1900,6 +1960,1017 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     return c.json({ ok: true, item: getProjectItem(itemId), task_id: taskId }, 201);
   });
 
+  // ── Content Library (X / Instagram saved posts) ─────────────────────
+  // Items are enqueued here or via the Telegram share hook; the ingestion
+  // worker (src/library-worker.ts) does metadata/media/transcript/tags.
+
+  const LIBRARY_MEDIA_DIR = path.join(STORE_DIR, 'library');
+
+  // ── X bookmark sync (official OAuth 2.0 PKCE) ──────────────────────
+
+  app.get('/api/social/x/status', (c) => c.json(xSyncStatus()));
+
+  app.get('/api/social/x/auth', (c) => {
+    if (!xConfigured()) return c.json({ error: 'X_CLIENT_ID not set in .env (create an app in the X Developer Console first)' }, 400);
+    try {
+      const { url } = buildAuthUrl();
+      return c.json({ url });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.post('/api/social/x/sync', async (c) => {
+    const result = await syncBookmarks();
+    return c.json(result, result.ok ? 200 : 502);
+  });
+
+  app.post('/api/social/x/disconnect', (c) => {
+    return c.json({ ok: deleteSocialAccount('x') });
+  });
+
+  // OAuth callback. X redirects the BROWSER here without our dashboard
+  // token, so this path deliberately lives OUTSIDE the /api/* token gate.
+  // It is only useful mid-flow with a valid one-time `state` (CSRF-bound
+  // to the in-memory PKCE verifier) and stores nothing from the query
+  // beyond the code exchange.
+  app.get('/oauth/x/callback', async (c) => {
+    const code = c.req.query('code');
+    const state = c.req.query('state');
+    const err = c.req.query('error');
+    if (err) return c.html(`<html><body style="font-family:system-ui;background:#0b0f14;color:#e6e6e6;display:grid;place-items:center;height:100vh"><div>X authorization was denied (${err}). You can close this tab.</div></body></html>`);
+    if (!code || !state) return c.text('missing code/state', 400);
+    try {
+      const { handle } = await completeAuth(code, state);
+      // Kick an immediate first sync in the background so the test
+      // bookmarks appear without waiting for 2:30am.
+      void syncBookmarks().catch(() => { /* surfaced via status */ });
+      return c.html(`<html><body style="font-family:system-ui;background:#0b0f14;color:#e6e6e6;display:grid;place-items:center;height:100vh"><div>✅ X connected${handle ? ` as @${handle}` : ''}. First bookmark sync is running. You can close this tab and return to Mission Control.</div></body></html>`);
+    } catch (e) {
+      return c.html(`<html><body style="font-family:system-ui;background:#0b0f14;color:#e6e6e6;display:grid;place-items:center;height:100vh"><div>⚠️ Connect failed: ${String(e).slice(0, 200)}. Close this tab and try again from the Library page.</div></body></html>`);
+    }
+  });
+
+  // ── Instagram DYI export import ─────────────────────────────────────
+  // Meta's "Export your information" JSON. We do not schema-walk Meta's
+  // ever-shifting structure: extract every IG post URL via regex,
+  // canonicalize, dedupe, and enqueue through the normal worker.
+  app.post('/api/library/import/ig-export', async (c) => {
+    let raw = '';
+    const ctype = c.req.header('content-type') || '';
+    if (ctype.includes('multipart/form-data')) {
+      const body = await c.req.parseBody();
+      const file = body['file'];
+      if (!(file instanceof File)) return c.json({ error: 'multipart field "file" required' }, 400);
+      if (file.size > 50 * 1024 * 1024) return c.json({ error: 'file too large (50MB max)' }, 400);
+      raw = await file.text();
+    } else {
+      raw = await c.req.text();
+    }
+    if (!raw.trim()) return c.json({ error: 'empty upload' }, 400);
+
+    const found = raw.match(/https:\\?\/\\?\/(?:www\.)?instagram\.com\\?\/(?:p|reel|reels|tv)\\?\/[A-Za-z0-9_-]+/g) ?? [];
+    const urls = new Set<string>();
+    for (const m of found) {
+      const canon = canonicalizeSocialUrl(m.replace(/\\\//g, '/'));
+      if (canon) urls.add(canon.url);
+    }
+    let added = 0;
+    let skipped = 0;
+    for (const url of urls) {
+      if (getLibraryItemByUrl(url)) { skipped++; continue; }
+      const id = crypto.randomBytes(4).toString('hex');
+      createLibraryItem(id, url, 'instagram', { source: 'dyi_export' });
+      added++;
+    }
+    setDashboardSetting('ig_export_last_import', String(Math.floor(Date.now() / 1000)));
+    return c.json({ ok: true, found: urls.size, added, skipped });
+  });
+
+  app.get('/api/library', (c) => {
+    const { items, total } = listLibraryItems({
+      platform: c.req.query('platform') || undefined,
+      status: c.req.query('status') || undefined,
+      tag: c.req.query('tag') || undefined,
+      q: c.req.query('q') || undefined,
+      categoryId: c.req.query('category') || undefined,
+      uncategorized: c.req.query('uncategorized') === '1',
+      intent: c.req.query('intent') || undefined,
+      track: c.req.query('track') || undefined,
+      contentPlatform: c.req.query('content_platform') || undefined,
+      minScore: c.req.query('min_score') ? parseInt(c.req.query('min_score')!, 10) : undefined,
+      sort: c.req.query('sort') === 'score' ? 'score' : undefined,
+      limit: Math.min(parseInt(c.req.query('limit') || '50', 10) || 50, 200),
+      offset: parseInt(c.req.query('offset') || '0', 10) || 0,
+    });
+    // Attach folder labels so cards can show where each item lives.
+    const withCats = items.map((it) => ({ ...it, categories: getItemCategories(it.id) }));
+    return c.json({ items: withCats, total });
+  });
+
+  // Manual live-event sweep (the scheduled ones run 8:00/18:00 local).
+  // Long call (~1-2 min: 12 searches + 2 judge passes); the Studio button awaits it.
+  app.post('/api/library/sweep', async (c) => {
+    const { runContentSweep } = await import('./content-sweep.js');
+    const summary = await runContentSweep('manual');
+    return c.json(summary, summary.ok ? 200 : 502);
+  });
+
+  // One-shot story-cluster pass over existing content items (oldest first so
+  // the earliest take anchors each story). New items cluster automatically.
+  app.post('/api/library/cluster-backfill', async (c) => {
+    const { clusterContentItem } = await import('./content-cluster.js');
+    const all = listLibraryItems({ intent: 'content', limit: 200 }).items
+      .filter((i) => !i.cluster_id)
+      .sort((a, b) => a.created_at - b.created_at);
+    const clustered: Array<{ id: string; cluster: string }> = [];
+    for (const it of all) {
+      const cluster = await clusterContentItem(it.id);
+      if (cluster) clustered.push({ id: it.id, cluster });
+    }
+    return c.json({ checked: all.length, clustered });
+  });
+
+  // Content Studio: only items the gate marked as content opportunities, ranked by score.
+  app.get('/api/library/studio', (c) => {
+    const { items, total } = listLibraryItems({
+      intent: 'content',
+      track: c.req.query('track') || undefined,
+      contentPlatform: c.req.query('platform') || undefined,
+      minScore: c.req.query('min_score') ? parseInt(c.req.query('min_score')!, 10) : undefined,
+      status: 'ready',
+      sort: 'score',
+      limit: Math.min(parseInt(c.req.query('limit') || '100', 10) || 100, 200),
+      offset: parseInt(c.req.query('offset') || '0', 10) || 0,
+    });
+    const withCats = items.map((it) => ({ ...it, categories: getItemCategories(it.id) }));
+    return c.json({ items: withCats, total });
+  });
+
+  // ── Library taxonomy (umbrellas + subcategories) ───────────────────
+
+  app.get('/api/library/categories', (c) => c.json({ tree: listCategoryTree() }));
+
+  app.post('/api/library/categories', async (c) => {
+    let body: { kind?: string; parent_id?: string; name?: string; description?: string };
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    const name = body?.name?.trim();
+    if (!name) return c.json({ error: 'name required' }, 400);
+    const kind = body?.kind === 'umbrella' ? 'umbrella' : 'subcategory';
+    if (kind === 'subcategory' && (!body.parent_id || !getCategory(body.parent_id))) return c.json({ error: 'valid parent_id required for a subcategory' }, 400);
+    const { id, created } = ensureCategory(kind, kind === 'umbrella' ? null : body.parent_id!, name, { description: body?.description, createdBy: 'user' });
+    return c.json({ id, created }, created ? 201 : 200);
+  });
+
+  app.patch('/api/library/categories/:id', async (c) => {
+    const id = c.req.param('id');
+    if (!getCategory(id)) return c.json({ error: 'Not found' }, 404);
+    let body: { name?: string };
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    if (!body?.name?.trim()) return c.json({ error: 'name required' }, 400);
+    const ok = renameCategory(id, body.name.trim());
+    return c.json({ ok }, ok ? 200 : 409);
+  });
+
+  app.post('/api/library/categories/:id/merge', async (c) => {
+    const fromId = c.req.param('id');
+    let body: { into?: string };
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    if (!body?.into) return c.json({ error: 'into (target category id) required' }, 400);
+    return c.json({ ok: mergeCategories(fromId, body.into) });
+  });
+
+  app.delete('/api/library/categories/:id', (c) => c.json({ ok: deleteCategory(c.req.param('id')) }));
+
+  // Manual (re)assignment of an item's folders.
+  app.post('/api/library/:id/categories', async (c) => {
+    const item = getLibraryItem(c.req.param('id'));
+    if (!item) return c.json({ error: 'Not found' }, 404);
+    let body: { action?: string; category_id?: string; umbrella?: string; subcategory?: string; is_primary?: boolean };
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+
+    if (body.action === 'unassign' && body.category_id) {
+      return c.json({ ok: unassignItemCategory(item.id, body.category_id), categories: getItemCategories(item.id) });
+    }
+    if (body.action === 'set_primary' && body.category_id) {
+      setPrimaryCategory(item.id, body.category_id);
+      return c.json({ ok: true, categories: getItemCategories(item.id) });
+    }
+    // assign: by existing category_id, or by umbrella+subcategory names (creating if needed).
+    let categoryId = body.category_id;
+    if (!categoryId && body.umbrella && body.subcategory) {
+      const umb = findUmbrellaByName(body.umbrella) ?? { id: ensureCategory('umbrella', null, body.umbrella, { createdBy: 'user' }).id };
+      categoryId = ensureCategory('subcategory', umb.id, body.subcategory, { createdBy: 'user' }).id;
+    }
+    if (!categoryId || !getCategory(categoryId)) return c.json({ error: 'category_id or umbrella+subcategory required' }, 400);
+    assignItemCategory(item.id, categoryId, !!body.is_primary);
+    return c.json({ ok: true, categories: getItemCategories(item.id) });
+  });
+
+  app.get('/api/library/stats', (c) => {
+    let diskBytes = 0;
+    try {
+      if (fs.existsSync(LIBRARY_MEDIA_DIR)) {
+        for (const dir of fs.readdirSync(LIBRARY_MEDIA_DIR)) {
+          const d = path.join(LIBRARY_MEDIA_DIR, dir);
+          try {
+            for (const f of fs.readdirSync(d)) diskBytes += fs.statSync(path.join(d, f)).size;
+          } catch { /* skip unreadable */ }
+        }
+      }
+    } catch { /* stats are best-effort */ }
+    return c.json({ ...libraryStats(), disk_bytes: diskBytes });
+  });
+
+  app.post('/api/library/ingest', async (c) => {
+    let body: { url?: string; source?: string; notes?: string };
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    const raw = body?.url?.trim();
+    if (!raw) return c.json({ error: 'url required' }, 400);
+    const canon = canonicalizeSocialUrl(raw);
+    if (!canon) return c.json({ error: 'not an ingestible X / Instagram post or arXiv paper URL' }, 400);
+    const existing = getLibraryItemByUrl(canon.url);
+    if (existing) return c.json({ error: 'already in library', item: existing }, 409);
+    const id = crypto.randomBytes(4).toString('hex');
+    createLibraryItem(id, canon.url, canon.platform, {
+      source: body?.source === 'dashboard' || body?.source === 'bookmark_sync' || body?.source === 'dyi_export' ? body.source : 'dashboard',
+      notes: body?.notes?.slice(0, 2000) ?? null,
+    });
+    return c.json({ item: getLibraryItem(id) }, 201);
+  });
+
+  app.get('/api/library/:id', (c) => {
+    const item = getLibraryItem(c.req.param('id'));
+    if (!item) return c.json({ error: 'Not found' }, 404);
+    return c.json({ item });
+  });
+
+  app.post('/api/library/:id/retry', (c) => {
+    const item = getLibraryItem(c.req.param('id'));
+    if (!item) return c.json({ error: 'Not found' }, 404);
+    if (!item.status.startsWith('failed')) return c.json({ error: 'item is not in a failed state' }, 400);
+    updateLibraryItem(item.id, { status: 'queued', error: null, retry_count: item.retry_count + 1 });
+    return c.json({ item: getLibraryItem(item.id) });
+  });
+
+  // Re-run the categorizer on an already-ingested item (no re-download).
+  // Used to backfill items saved before categorization existed, or to
+  // re-file after taxonomy edits. Existing folder links are left intact;
+  // the categorizer adds/updates assignments.
+  app.post('/api/library/:id/recategorize', async (c) => {
+    const item = getLibraryItem(c.req.param('id'));
+    if (!item) return c.json({ error: 'Not found' }, 404);
+    const { categorizeItem } = await import('./library-categorizer.js');
+    const cat = await categorizeItem(item);
+    return c.json({
+      ok: true, model: cat.modelUsed, folders: cat.folders,
+      newUmbrellas: cat.newUmbrellas, newSubcategories: cat.newSubcategories,
+      intent: cat.intent, track: cat.track, platforms: cat.platforms,
+      contentScore: cat.contentScore, contentAngle: cat.contentAngle,
+    });
+  });
+
+  app.patch('/api/library/:id', async (c) => {
+    const item = getLibraryItem(c.req.param('id'));
+    if (!item) return c.json({ error: 'Not found' }, 404);
+    let body: { tags?: unknown; notes?: string; project_id?: string | null; caption?: string };
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    const patch: Parameters<typeof updateLibraryItem>[1] = {};
+    if (Array.isArray(body.tags)) patch.tags = JSON.stringify(body.tags.filter((t) => typeof t === 'string').slice(0, 12));
+    if (typeof body.notes === 'string') patch.notes = body.notes.slice(0, 2000);
+    if (typeof body.caption === 'string') patch.caption = body.caption.slice(0, 10000);
+    if (typeof (body as Record<string, unknown>).author_handle === 'string') patch.author_handle = String((body as Record<string, unknown>).author_handle).slice(0, 100);
+    if (typeof (body as Record<string, unknown>).author_name === 'string') patch.author_name = String((body as Record<string, unknown>).author_name).slice(0, 200);
+    if (body.project_id !== undefined) patch.project_id = body.project_id === null ? null : (getProject(String(body.project_id)) ? String(body.project_id) : item.project_id);
+    updateLibraryItem(item.id, patch);
+    return c.json({ item: getLibraryItem(item.id) });
+  });
+
+  // ── Content Engine staged drafting (brief -> greenlight -> script) ──
+
+  app.get('/api/library/:id/drafts', (c) => {
+    const item = getLibraryItem(c.req.param('id'));
+    if (!item) return c.json({ error: 'Not found' }, 404);
+    return c.json({ drafts: listContentDrafts(item.id) });
+  });
+
+  app.post('/api/library/:id/draft-brief', async (c) => {
+    const item = getLibraryItem(c.req.param('id'));
+    if (!item) return c.json({ error: 'Not found' }, 404);
+    if (item.intent !== 'content') return c.json({ error: 'item is not flagged as content (recategorize or change its intent first)' }, 400);
+    let body: { platform?: string } = {};
+    try { body = await c.req.json(); } catch { /* platform optional */ }
+    const itemPlatforms: string[] = (() => {
+      try { return item.platforms ? JSON.parse(item.platforms) : []; } catch { return []; }
+    })();
+    const fallback = item.track === 'real_world' ? 'instagram' : 'tiktok';
+    const platform = ['tiktok', 'youtube', 'instagram', 'x'].includes(body.platform ?? '')
+      ? body.platform!
+      : (itemPlatforms[0] ?? fallback);
+    const { generateBrief } = await import('./content-drafter.js');
+    const draft = await generateBrief(item, platform);
+    // Gabe's rule: scripts are only written from VERIFIED briefs. Kick the
+    // fact-check immediately so by the time he reviews the brief the
+    // verdicts are in (or arriving) — no manual step, no unverified script.
+    if (draft.status === 'brief' && draft.brief) {
+      try {
+        const parsed = JSON.parse(draft.brief) as { key_facts?: Array<{ needs_verification?: boolean }> };
+        if ((parsed.key_facts ?? []).some((f) => f?.needs_verification)) {
+          const { verifyDraft } = await import('./fact-checker.js');
+          void verifyDraft(draft.id);
+        }
+      } catch { /* unreadable brief -> nothing to verify */ }
+    }
+    return c.json({ draft: getContentDraft(draft.id) ?? draft }, draft.status === 'failed' ? 502 : 201);
+  });
+
+  app.post('/api/library/drafts/:draftId/greenlight', async (c) => {
+    const draft = getContentDraft(c.req.param('draftId'));
+    if (!draft) return c.json({ error: 'Not found' }, 404);
+    // 'greenlit' is retryable: the status is set before the model call, so a
+    // crash mid-generation would otherwise strand the draft permanently.
+    if (!['brief', 'failed', 'greenlit'].includes(draft.status)) return c.json({ error: `draft is ${draft.status}, only a brief can be greenlit` }, 400);
+    if (!draft.brief) return c.json({ error: 'draft has no brief to script from' }, 400);
+    // Hard gate (Gabe's rule): a script is only ever written from a VERIFIED
+    // brief. If claims are flagged, the fact-check must have completed.
+    let flaggedClaims = 0;
+    try {
+      const parsed = JSON.parse(draft.brief) as { key_facts?: Array<{ needs_verification?: boolean }> };
+      flaggedClaims = (parsed.key_facts ?? []).filter((f) => f?.needs_verification).length;
+    } catch { /* unreadable brief treated as unflagged; scripting will fail on its own */ }
+    if (flaggedClaims > 0 && draft.verification_status !== 'done') {
+      return c.json({
+        error: draft.verification_status === 'running'
+          ? 'fact-check still running — the script unlocks when it finishes'
+          : 'facts not verified yet — run the fact-check first',
+      }, 409);
+    }
+    const item = getLibraryItem(draft.item_id);
+    if (!item) return c.json({ error: 'source item is gone' }, 410);
+    const { generateScript } = await import('./content-drafter.js');
+    const updated = await generateScript(draft, item);
+    return c.json({ draft: updated }, updated.status === 'failed' ? 502 : 200);
+  });
+
+  // Fire-and-forget fact-check on a brief's VERIFY-flagged claims.
+  // Returns 202 immediately; the Studio polls drafts and watches
+  // verification_status running -> done|failed.
+  app.post('/api/library/drafts/:draftId/verify', async (c) => {
+    const draft = getContentDraft(c.req.param('draftId'));
+    if (!draft) return c.json({ error: 'Not found' }, 404);
+    if (!draft.brief) return c.json({ error: 'draft has no brief to verify' }, 400);
+    if (draft.verification_status === 'running') return c.json({ error: 'verification already running' }, 409);
+    const { verifyDraft } = await import('./fact-checker.js');
+    // verifyDraft sets verification_status synchronously before its first
+    // await ('running', or 'done' when nothing is flagged) — do not write it
+    // here too or a fast completion would be clobbered back to 'running'.
+    void verifyDraft(draft.id);
+    return c.json({ ok: true, draft: getContentDraft(draft.id) }, 202);
+  });
+
+  // Single draft (the teleprompter page loads by draft id, no item context).
+  app.get('/api/library/drafts/:draftId', (c) => {
+    const draft = getContentDraft(c.req.param('draftId'));
+    if (!draft) return c.json({ error: 'Not found' }, 404);
+    const item = getLibraryItem(draft.item_id);
+    return c.json({ draft, item_angle: item?.content_angle ?? null });
+  });
+
+  app.post('/api/library/drafts/:draftId/reject', (c) => {
+    const draft = getContentDraft(c.req.param('draftId'));
+    if (!draft) return c.json({ error: 'Not found' }, 404);
+    updateContentDraft(draft.id, { status: 'rejected' });
+    return c.json({ draft: getContentDraft(draft.id) });
+  });
+
+  app.delete('/api/library/drafts/:draftId', (c) => {
+    return c.json({ ok: deleteContentDraft(c.req.param('draftId')) });
+  });
+
+  app.delete('/api/library/:id', (c) => {
+    const item = getLibraryItem(c.req.param('id'));
+    if (!item) return c.json({ error: 'Not found' }, 404);
+    const dir = path.join(LIBRARY_MEDIA_DIR, item.id);
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* dir may not exist */ }
+    return c.json({ ok: deleteLibraryItem(item.id) });
+  });
+
+  // Media files (video/thumbnail). Token-gated by the /api/* middleware;
+  // path traversal blocked by resolving inside the item's own directory.
+  app.get('/api/library/:id/media/:file', (c) => {
+    const item = getLibraryItem(c.req.param('id'));
+    if (!item) return c.json({ error: 'Not found' }, 404);
+    const dir = path.join(LIBRARY_MEDIA_DIR, item.id);
+    const file = path.normalize(c.req.param('file'));
+    if (file.includes('..') || file.includes('/') || file.includes('\\')) return c.json({ error: 'bad filename' }, 400);
+    const full = path.join(dir, file);
+    if (!full.startsWith(dir) || !fs.existsSync(full)) return c.json({ error: 'Not found' }, 404);
+    const ext = path.extname(full).toLowerCase();
+    const type = ext === '.mp4' ? 'video/mp4' : ext === '.webm' ? 'video/webm' : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : ext === '.png' ? 'image/png' : ext === '.mp3' ? 'audio/mpeg' : 'application/octet-stream';
+    const stat = fs.statSync(full);
+    // Range support so <video> seeking works.
+    const range = c.req.header('range');
+    if (range) {
+      const m = range.match(/bytes=(\d+)-(\d*)/);
+      if (m) {
+        const start = parseInt(m[1], 10);
+        if (start >= stat.size) return c.json({ error: 'range not satisfiable' }, 416);
+        const end = Math.min(m[2] ? parseInt(m[2], 10) : stat.size - 1, stat.size - 1);
+        const stream = fs.createReadStream(full, { start, end });
+        return new Response(stream as unknown as ReadableStream, {
+          status: 206,
+          headers: {
+            'Content-Type': type,
+            'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': String(end - start + 1),
+          },
+        });
+      }
+    }
+    return new Response(fs.createReadStream(full) as unknown as ReadableStream, {
+      headers: { 'Content-Type': type, 'Content-Length': String(stat.size), 'Accept-Ranges': 'bytes' },
+    });
+  });
+
+  // ── Edit Bay renders (E1: word-synced caption clips) ─────────────────
+
+  app.post('/api/renders', async (c) => {
+    let body: { item_id?: string; aspect?: string; accent?: string } = {};
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    const item = body.item_id ? getLibraryItem(body.item_id) : null;
+    if (!item) return c.json({ error: 'item_id required' }, 400);
+    if (item.media_type !== 'video' || !item.media_file) return c.json({ error: 'item has no video media to render' }, 400);
+    const id = crypto.randomBytes(4).toString('hex');
+    const job = createRenderJob(id, item.id, 'caption_clip', {
+      aspect: body.aspect === '16:9' ? '16:9' : '9:16',
+      accent: typeof body.accent === 'string' ? body.accent.slice(0, 16) : '#FFD400',
+    });
+    const { kickRenderWorker } = await import('./render-worker.js');
+    kickRenderWorker();
+    return c.json({ job }, 201);
+  });
+
+  // ── Edit Projects (faceless workbench: Gabe drives every video) ──────
+
+  app.get('/api/edit-projects', (c) => {
+    const projects = listEditProjects(c.req.query('archived') === '1').map((p) => ({
+      ...p,
+      job: p.render_job_id ? getRenderJob(p.render_job_id) ?? null : null,
+    }));
+    return c.json({ projects });
+  });
+
+  app.post('/api/edit-projects', async (c) => {
+    let body: { title?: string } = {};
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    if (!body.title?.trim()) return c.json({ error: 'title required' }, 400);
+    const id = crypto.randomBytes(4).toString('hex');
+    return c.json({ project: createEditProject(id, body.title.trim().slice(0, 200)) }, 201);
+  });
+
+  app.get('/api/edit-projects/:id', (c) => {
+    const p = getEditProject(c.req.param('id'));
+    if (!p) return c.json({ error: 'Not found' }, 404);
+    const itemIds: string[] = (() => { try { return p.item_ids ? JSON.parse(p.item_ids) : []; } catch { return []; } })();
+    const items = itemIds.map((id) => getLibraryItem(id)).filter(Boolean).map((it) => ({
+      id: it!.id, label: (it!.content_angle || it!.caption || it!.url).split('\n')[0].slice(0, 90),
+      duration_s: it!.duration_s, media_type: it!.media_type,
+    }));
+    return c.json({ project: p, items, job: p.render_job_id ? getRenderJob(p.render_job_id) ?? null : null });
+  });
+
+  app.patch('/api/edit-projects/:id', async (c) => {
+    const p = getEditProject(c.req.param('id'));
+    if (!p) return c.json({ error: 'Not found' }, 404);
+    let body: { title?: string; status?: string; item_ids?: string[]; idea_notes?: string; script?: string; brief?: string; aspect?: string } = {};
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    const patch: Parameters<typeof updateEditProject>[1] = {};
+    if (typeof body.title === 'string' && body.title.trim()) patch.title = body.title.trim().slice(0, 200);
+    if (typeof body.status === 'string' && ['idea', 'approved', 'rendering', 'done', 'archived'].includes(body.status)) patch.status = body.status;
+    if (Array.isArray(body.item_ids)) patch.item_ids = JSON.stringify(body.item_ids.filter((x) => typeof x === 'string').slice(0, 8));
+    if (typeof body.idea_notes === 'string') patch.idea_notes = body.idea_notes.slice(0, 8000);
+    if (typeof body.script === 'string') patch.script = body.script.slice(0, 12000);
+    if (typeof body.brief === 'string') patch.brief = body.brief.slice(0, 2000);
+    if (body.aspect === '9:16' || body.aspect === '16:9' || body.aspect === '1:1') patch.aspect = body.aspect;
+    updateEditProject(p.id, patch);
+    return c.json({ project: getEditProject(p.id) });
+  });
+
+  app.delete('/api/edit-projects/:id', (c) => {
+    const p = getEditProject(c.req.param('id'));
+    if (!p) return c.json({ error: 'Not found' }, 404);
+    try { fs.rmSync(path.join(STORE_DIR, 'edit-projects', p.id), { recursive: true, force: true }); } catch { /* dir */ }
+    return c.json({ ok: deleteEditProject(p.id) });
+  });
+
+  // Label the script's claims (faceless rule: INFORM, never block).
+  // Fire-and-forget — sleuth checks take minutes; the UI polls script_labels.
+  app.post('/api/edit-projects/:id/label', async (c) => {
+    const p = getEditProject(c.req.param('id'));
+    if (!p) return c.json({ error: 'Not found' }, 404);
+    if (!p.script?.trim()) return c.json({ error: 'no script to label yet' }, 400);
+    let existing: { status?: string } = {};
+    try { existing = p.script_labels ? JSON.parse(p.script_labels) : {}; } catch { /* fresh */ }
+    if (existing.status === 'running') return c.json({ error: 'labeling already running' }, 409);
+    updateEditProject(p.id, { script_labels: JSON.stringify({ status: 'running' }) });
+    void (async () => {
+      try {
+        const { labelText } = await import('./fact-checker.js');
+        const claims = await labelText(p.script!, p.title);
+        updateEditProject(p.id, { script_labels: JSON.stringify({ status: 'done', claims }) });
+      } catch (err) {
+        updateEditProject(p.id, { script_labels: JSON.stringify({ status: 'failed', error: String(err).slice(0, 200) }) });
+      }
+    })();
+    return c.json({ ok: true }, 202);
+  });
+
+  // Voiceover upload: Gabe's own read for the video.
+  app.post('/api/edit-projects/:id/voiceover', async (c) => {
+    const p = getEditProject(c.req.param('id'));
+    if (!p) return c.json({ error: 'Not found' }, 404);
+    const body = await c.req.parseBody();
+    const file = body['file'];
+    if (!(file instanceof File)) return c.json({ error: 'multipart field "file" required (audio)' }, 400);
+    if (file.size > 100 * 1024 * 1024) return c.json({ error: 'file too large (100MB max)' }, 400);
+    const ext = (path.extname(file.name || '').toLowerCase() || '.mp3').replace(/[^.a-z0-9]/g, '') || '.mp3';
+    const dir = path.join(STORE_DIR, 'edit-projects', p.id);
+    fs.mkdirSync(dir, { recursive: true });
+    const dest = path.join(dir, `voiceover${ext}`);
+    fs.writeFileSync(dest, Buffer.from(await file.arrayBuffer()));
+    updateEditProject(p.id, { voiceover_file: path.relative(PROJECT_ROOT, dest) });
+    return c.json({ project: getEditProject(p.id) });
+  });
+
+  // Render the project: composes the Director brief from Gabe's direction +
+  // script context; voiceover (if uploaded) drives timing and captions.
+  app.post('/api/edit-projects/:id/render', async (c) => {
+    const p = getEditProject(c.req.param('id'));
+    if (!p) return c.json({ error: 'Not found' }, 404);
+    const itemIds: string[] = (() => { try { return p.item_ids ? JSON.parse(p.item_ids) : []; } catch { return []; } })();
+    if (itemIds.length === 0) return c.json({ error: 'pick at least one source clip first' }, 400);
+    if (!p.brief?.trim() && !p.idea_notes?.trim()) return c.json({ error: 'add render direction (brief) or idea notes first' }, 400);
+    const brief = [
+      p.brief?.trim() ?? '',
+      p.idea_notes?.trim() ? `The message this video must convey: ${p.idea_notes.trim().slice(0, 600)}` : '',
+      !p.voiceover_file && p.script?.trim() ? `Script/framing for reference (no TTS unless explicitly allowed): ${p.script.trim().slice(0, 800)}` : '',
+    ].filter(Boolean).join('\n');
+    const jobId = crypto.randomBytes(4).toString('hex');
+    createRenderJob(jobId, itemIds[0], 'timeline', {
+      item_ids: itemIds,
+      brief,
+      aspect: p.aspect,
+      voiceover_file: p.voiceover_file ?? undefined,
+      allow_narration: false, // faceless default: his voice or source audio; TTS only by explicit brief later
+      captions: true,
+    });
+    updateEditProject(p.id, { render_job_id: jobId, status: 'rendering' });
+    const { kickRenderWorker } = await import('./render-worker.js');
+    kickRenderWorker();
+    return c.json({ project: getEditProject(p.id), job_id: jobId }, 201);
+  });
+
+  // ── Psyop Scoring (NCI Engineered Reality Scoring System) ────────────
+  // Chase Hughes' 20-item psyop-probability test. Local abliterated model
+  // drafts (free, uncensored), cloud verifies. Fire-and-forget like a dive:
+  // POST creates a row + kicks the async score, the UI polls. Scores
+  // manipulation FORM, not truth. See docs/RESUME-psyop.md + docs/psyop-nci/.
+
+  app.get('/api/psyop/scores', (c) => {
+    return c.json({ scores: listPsyopScores(parseInt(c.req.query('limit') || '50', 10) || 50) });
+  });
+
+  app.get('/api/psyop/scores/:id', (c) => {
+    const s = getPsyopScore(c.req.param('id'));
+    if (!s) return c.json({ error: 'Not found' }, 404);
+    return c.json({ score: s });
+  });
+
+  app.delete('/api/psyop/scores/:id', (c) => {
+    const s = getPsyopScore(c.req.param('id'));
+    if (!s) return c.json({ error: 'Not found' }, 404);
+    return c.json({ ok: deletePsyopScore(s.id) });
+  });
+
+  app.post('/api/psyop/score', async (c) => {
+    let body: { subject?: string; text?: string; source_url?: string } = {};
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    const subject = (body.subject ?? '').trim().slice(0, 200);
+    const text = (body.text ?? '').trim();
+    if (!subject) return c.json({ error: 'subject required (a short label for what you are scoring)' }, 400);
+    if (text.length < 20) return c.json({ error: 'text required (paste the claim/article/material to score, >= 20 chars)' }, 400);
+    const sourceUrl = typeof body.source_url === 'string' && body.source_url.trim() ? body.source_url.trim().slice(0, 1000) : null;
+
+    const id = crypto.randomBytes(4).toString('hex');
+    createPsyopScore({ id, subject, inputText: text.slice(0, 20000), sourceUrl });
+
+    // Fire-and-forget (local pass + cloud verify ~1-2 min); UI polls the row.
+    void (async () => {
+      try {
+        const { scorePsyop } = await import('./psyop-scorer.js');
+        const { result, localRaw } = await scorePsyop(subject, text, { refId: id });
+        updatePsyopScore(id, {
+          status: 'ready',
+          total: result.total,
+          band: result.band,
+          local_json: localRaw.slice(0, 20000) || null,
+          final_json: JSON.stringify(result),
+          model_local: result.localModel,
+          model_verify: result.verifyModel,
+          error: null,
+        });
+      } catch (err) {
+        updatePsyopScore(id, { status: 'failed', error: String(err).slice(0, 300) });
+      }
+    })();
+
+    return c.json({ score: getPsyopScore(id) }, 202);
+  });
+
+  // Directed/collage/faceless edits: the Director analyzes the sources, writes
+  // a validated plan, the worker renders it, the QC inspector reviews frames.
+  app.post('/api/renders/timeline', async (c) => {
+    let body: { item_ids?: string[]; brief?: string; aspect?: string; target_s?: number; allow_narration?: boolean } = {};
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    const ids = Array.isArray(body.item_ids) ? body.item_ids.filter((x) => typeof x === 'string').slice(0, 8) : [];
+    if (ids.length === 0) return c.json({ error: 'item_ids required (1-8 library video items)' }, 400);
+    if (!body.brief?.trim()) return c.json({ error: 'brief required — tell the editor what to make' }, 400);
+    for (const id of ids) {
+      const it = getLibraryItem(id);
+      if (!it) return c.json({ error: `item ${id} not found` }, 400);
+      if (it.media_type !== 'video' || !it.media_file) return c.json({ error: `item ${id} has no video media` }, 400);
+    }
+    const id = crypto.randomBytes(4).toString('hex');
+    const job = createRenderJob(id, ids[0], 'timeline', {
+      item_ids: ids,
+      brief: body.brief.trim().slice(0, 2000),
+      aspect: body.aspect === '16:9' ? '16:9' : body.aspect === '1:1' ? '1:1' : '9:16',
+      target_s: typeof body.target_s === 'number' ? Math.max(8, Math.min(180, body.target_s)) : undefined,
+      allow_narration: body.allow_narration !== false,
+    });
+    const { kickRenderWorker } = await import('./render-worker.js');
+    kickRenderWorker();
+    return c.json({ job }, 201);
+  });
+
+  app.get('/api/renders', (c) => {
+    const jobs = listRenderJobs(Math.min(parseInt(c.req.query('limit') || '50', 10) || 50, 200)).map((j) => {
+      const item = j.item_id ? getLibraryItem(j.item_id) : null;
+      let brief: string | null = null;
+      try { brief = j.kind === 'timeline' && j.spec ? (JSON.parse(j.spec).brief ?? null) : null; } catch { /* spec */ }
+      return {
+        ...j,
+        item_label: brief?.slice(0, 90) ?? (item ? (item.content_angle || item.caption || item.url).split('\n')[0].slice(0, 90) : null),
+        item_author: item?.author_handle ?? item?.author_name ?? null,
+      };
+    });
+    return c.json({ jobs });
+  });
+
+  app.post('/api/renders/:id/retry', async (c) => {
+    const job = getRenderJob(c.req.param('id'));
+    if (!job) return c.json({ error: 'Not found' }, 404);
+    if (job.status !== 'failed' && job.status !== 'qc_failed') return c.json({ error: `job is ${job.status}` }, 400);
+    updateRenderJob(job.id, { status: 'queued', error: null });
+    const { kickRenderWorker } = await import('./render-worker.js');
+    kickRenderWorker();
+    return c.json({ job: getRenderJob(job.id) });
+  });
+
+  app.delete('/api/renders/:id', (c) => {
+    const job = getRenderJob(c.req.param('id'));
+    if (!job) return c.json({ error: 'Not found' }, 404);
+    // Deleting mid-render would orphan the in-flight chrome's output dir.
+    if (['queued', 'preparing', 'rendering'].includes(job.status)) return c.json({ error: `job is ${job.status}; wait for it to finish or fail` }, 409);
+    try { fs.rmSync(path.join(STORE_DIR, 'renders', job.id), { recursive: true, force: true }); } catch { /* dir may not exist */ }
+    return c.json({ ok: deleteRenderJob(job.id) });
+  });
+
+  app.get('/api/renders/:id/output', (c) => {
+    const job = getRenderJob(c.req.param('id'));
+    // qc_failed keeps its output so Gabe can inspect WHY the gate refused it.
+    if (!job || !['ready', 'qc_failed'].includes(job.status) || !job.output_file) return c.json({ error: 'Not found' }, 404);
+    const rendersRoot = path.join(STORE_DIR, 'renders');
+    const full = path.resolve(PROJECT_ROOT, job.output_file);
+    if (!full.startsWith(rendersRoot + path.sep) || !fs.existsSync(full)) return c.json({ error: 'Not found' }, 404);
+    const stat = fs.statSync(full);
+    const range = c.req.header('range');
+    if (range) {
+      const m = range.match(/bytes=(\d+)-(\d*)/);
+      if (m) {
+        const start = parseInt(m[1], 10);
+        if (start >= stat.size) return c.json({ error: 'range not satisfiable' }, 416);
+        const end = Math.min(m[2] ? parseInt(m[2], 10) : stat.size - 1, stat.size - 1);
+        const stream = fs.createReadStream(full, { start, end });
+        return new Response(stream as unknown as ReadableStream, {
+          status: 206,
+          headers: {
+            'Content-Type': 'video/mp4',
+            'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': String(end - start + 1),
+          },
+        });
+      }
+    }
+    return new Response(fs.createReadStream(full) as unknown as ReadableStream, {
+      headers: { 'Content-Type': 'video/mp4', 'Content-Length': String(stat.size), 'Accept-Ranges': 'bytes' },
+    });
+  });
+
+  // Fire a dual-track research run on a saved post. Reuses the project
+  // research flow; items not linked to a project go to a lazily created
+  // "Content Library" project so the report lands somewhere visible.
+  app.post('/api/library/:id/research', async (c) => {
+    const item = getLibraryItem(c.req.param('id'));
+    if (!item) return c.json({ error: 'Not found' }, 404);
+    let body: { query?: string };
+    try { body = await c.req.json(); } catch { body = {}; }
+
+    let projectId = item.project_id;
+    if (!projectId || !getProject(projectId)) {
+      const existing = listProjects(true).find((p) => p.name === 'Content Library');
+      if (existing) {
+        projectId = existing.id;
+      } else {
+        projectId = crypto.randomBytes(4).toString('hex');
+        createProject(projectId, 'Content Library', 'Research runs fired from saved X / Instagram posts.', '', 'violet', 'dashboard');
+      }
+    }
+
+    const captionPart = item.caption ? `Caption: ${item.caption.slice(0, 1200)}` : '';
+    const transcriptPart = item.transcript ? `Transcript of the video: ${item.transcript.slice(0, 8000)}` : '';
+    const notePart = item.notes ? `Gabe's note when saving it: ${item.notes}` : '';
+    const userQuery = body?.query?.trim();
+    const query = [
+      `Investigate the claims and ideas in this saved ${item.platform === 'x' ? 'X' : 'Instagram'} post${item.author_handle ? ` by ${item.author_handle}` : ''} (${item.url}).`,
+      notePart, captionPart, transcriptPart,
+      userQuery ? `Specific focus: ${userQuery}` : 'Verify the core claims, find primary sources, and surface what mainstream coverage omits.',
+    ].filter(Boolean).join('\n\n');
+
+    const title = (userQuery || item.caption || `${item.platform} post by ${item.author_handle ?? 'unknown'}`).slice(0, 300);
+    const itemId = crypto.randomBytes(4).toString('hex');
+    createProjectItem(itemId, projectId, 'research', {
+      category: 'analysis', title,
+      content: 'Researching with Jarvis and the team...',
+      url: item.url,
+      status: 'running', source: 'Content Library', createdBy: 'dashboard',
+    });
+
+    const project = getProject(projectId)!;
+    const prompt = [
+      `You are researching for the project "${project.name}".`,
+      project.instructions ? `Project context: ${project.instructions}` : '',
+      '',
+      'Use the dual-track research recipe: in parallel, sleuth (regular, cloud) and oracle (uncensored, abliterated) research the question; then prism analyzes the regular findings while heretic cross-references regular vs uncensored for bias, censorship, or false information. Only if a HIGH-risk discrepancy would materially change the conclusion, you may escalate that single point to reaper for a deeper uncensored check (reaper is the slow local 35b, so use it sparingly, not by default). Produce one synthesized report and end with a clear "Censorship / Bias Delta" section.',
+      '',
+      `Research question:\n${query}`,
+    ].filter(Boolean).join('\n');
+
+    const taskId = crypto.randomBytes(4).toString('hex');
+    createMissionTask(taskId, ('Research: ' + title).slice(0, 200), prompt, 'main', 'workspace', 5, projectId, itemId);
+    touchProject(projectId);
+
+    // Remember the linkage on the library item so the UI can deep-link the report.
+    let analysis: Record<string, unknown> = {};
+    try { analysis = item.analysis ? JSON.parse(item.analysis) : {}; } catch { /* fresh */ }
+    analysis.research_item_id = itemId;
+    analysis.research_project_id = projectId;
+    updateLibraryItem(item.id, { analysis: JSON.stringify(analysis), project_id: projectId });
+
+    return c.json({ ok: true, research_item: getProjectItem(itemId), task_id: taskId }, 201);
+  });
+
+  // ── Edge Scanner (read-only prediction-market measurement) ─────────
+
+  app.get('/api/edge/summary', (c) => {
+    return c.json({
+      state: getEdgeScannerState(),
+      counts: edgeSummaryCounts(),
+    });
+  });
+
+  app.get('/api/edge/opportunities', (c) => {
+    const { rows, total } = listEdgeOpportunities({
+      status: c.req.query('status') || undefined,
+      kind: c.req.query('kind') || undefined,
+      limit: Math.min(parseInt(c.req.query('limit') || '100', 10) || 100, 500),
+      offset: parseInt(c.req.query('offset') || '0', 10) || 0,
+    });
+    // detail is stored as JSON text; parse for the UI, tolerate junk.
+    const parsed = rows.map((r) => {
+      let detail: unknown = null;
+      try { detail = r.detail ? JSON.parse(r.detail) : null; } catch { detail = r.detail; }
+      return { ...r, detail };
+    });
+    return c.json({ rows: parsed, total });
+  });
+
+  app.get('/api/edge/pairs', (c) => {
+    return c.json({ pairs: listEdgePairs({ status: c.req.query('status') || undefined, limit: 500 }) });
+  });
+
+  app.patch('/api/edge/pairs/:id', async (c) => {
+    const pair = getEdgePair(c.req.param('id'));
+    if (!pair) return c.json({ error: 'Not found' }, 404);
+    let body: { status?: string; invert?: boolean };
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    if (body.status && !['candidate', 'confirmed', 'rejected'].includes(body.status)) {
+      return c.json({ error: 'bad status' }, 400);
+    }
+    const ok = updateEdgePair(pair.id, {
+      status: body.status,
+      invert: body.invert === undefined ? undefined : body.invert ? 1 : 0,
+    });
+    return c.json({ ok, pair: getEdgePair(pair.id) });
+  });
+
+  app.get('/api/edge/stats', (c) => {
+    const hours = Math.min(parseInt(c.req.query('hours') || '72', 10) || 72, 24 * 14);
+    return c.json({ stats: listEdgeStats(hours) });
+  });
+
+  app.post('/api/edge/scan', async (c) => {
+    const res = await triggerEdgeScan();
+    return c.json(res, res.started ? 202 : 409);
+  });
+
+  app.get('/api/edge/paper', (c) => {
+    return c.json({
+      summary: paperSummary(),
+      trades: listPaperTrades({ status: c.req.query('status') || undefined, limit: 150 }),
+    });
+  });
+
+  // ── AI agency: client pipeline + demo generators ────────────────────
+
+  app.get('/api/clients', (c) => {
+    return c.json({ clients: listClients(c.req.query('stage') || undefined) });
+  });
+
+  app.post('/api/clients', async (c) => {
+    let body: { company?: string; contact_name?: string; contact_role?: string; contact_info?: string; industry?: string; location?: string; stage?: string; pain_points?: string; notes?: string };
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    if (!body.company?.trim()) return c.json({ error: 'company required' }, 400);
+    if (body.stage && !(CLIENT_STAGES as readonly string[]).includes(body.stage)) return c.json({ error: 'bad stage' }, 400);
+    const client = createClient({
+      company: body.company.trim(),
+      contactName: body.contact_name ?? null,
+      contactRole: body.contact_role ?? null,
+      contactInfo: body.contact_info ?? null,
+      industry: body.industry ?? null,
+      location: body.location ?? null,
+      stage: body.stage,
+      painPoints: body.pain_points ?? null,
+      notes: body.notes ?? null,
+    });
+    return c.json({ client }, 201);
+  });
+
+  app.get('/api/clients/:id', (c) => {
+    const client = getClient(c.req.param('id'));
+    if (!client) return c.json({ error: 'Not found' }, 404);
+    return c.json({ client, artifacts: listClientArtifacts(client.id) });
+  });
+
+  app.patch('/api/clients/:id', async (c) => {
+    const client = getClient(c.req.param('id'));
+    if (!client) return c.json({ error: 'Not found' }, 404);
+    let body: Record<string, unknown>;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    if (typeof body.stage === 'string' && !(CLIENT_STAGES as readonly string[]).includes(body.stage)) {
+      return c.json({ error: 'bad stage' }, 400);
+    }
+    const ok = updateClient(client.id, body as Parameters<typeof updateClient>[1]);
+    return c.json({ ok, client: getClient(client.id) });
+  });
+
+  app.delete('/api/clients/:id', (c) => {
+    return c.json({ ok: deleteClient(c.req.param('id')) });
+  });
+
+  app.delete('/api/clients/:id/artifacts/:artifactId', (c) => {
+    return c.json({ ok: deleteClientArtifact(c.req.param('artifactId')) });
+  });
+
+  // Outreach tracking: log a touch (Gabe reached out, or they replied).
+  // History = client_artifacts kind='outreach'; at-a-glance state = columns.
+  app.post('/api/clients/:id/touch', async (c) => {
+    const client = getClient(c.req.param('id'));
+    if (!client) return c.json({ error: 'Not found' }, 404);
+    let body: { direction?: string; channel?: string; note?: string; next_touch_at?: number | null };
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    if (body.direction !== 'out' && body.direction !== 'reply') {
+      return c.json({ error: "direction must be 'out' or 'reply'" }, 400);
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const channel = (body.channel ?? '').trim() || 'other';
+    const verb = body.direction === 'out' ? 'reached out' : 'they replied';
+    createClientArtifact(client.id, 'outreach', `Outreach: ${verb} via ${channel}`,
+      JSON.stringify({ direction: body.direction, channel, note: body.note?.trim() || null, at: now }));
+    const patch: Record<string, unknown> = { last_touch_at: now };
+    if (body.direction === 'out') {
+      if (!client.contacted_at) patch.contacted_at = now;
+      if (client.stage === 'lead') patch.stage = 'contacted';
+    } else {
+      patch.replied_at = now;
+    }
+    if ('next_touch_at' in body) patch.next_touch_at = body.next_touch_at ?? null;
+    updateClient(client.id, patch as Parameters<typeof updateClient>[1]);
+    return c.json({ ok: true, client: getClient(client.id) });
+  });
+
+  // Two-step research flow (Gabe's spec): deep dive on his click, full pitch
+  // only after his explicit green light. Jobs run in the background worker.
+  const activeResearchJob = (clientId: string, kind: string) =>
+    listClientArtifacts(clientId).find((a) =>
+      a.kind === kind && /"status":"(queued|running)"/.test(a.content ?? ''));
+
+  app.post('/api/clients/:id/deepdive', async (c) => {
+    const client = getClient(c.req.param('id'));
+    if (!client) return c.json({ error: 'Not found' }, 404);
+    if (activeResearchJob(client.id, 'deep_dive')) return c.json({ error: 'deep dive already in progress' }, 409);
+    // Optional {"depth":"max"} keeps the heavy cloud legs on the specialists'
+    // default Fable 5 instead of the bulk-dive Opus downshift (Good Nature
+    // gets max depth automatically regardless; see clients-research.ts).
+    let body: { depth?: string } = {};
+    try { body = await c.req.json(); } catch { /* no body = standard depth */ }
+    const artifact = createClientArtifact(client.id, 'deep_dive', `Deep dive: ${client.company} (running)`,
+      JSON.stringify({
+        status: 'queued',
+        requested_at: Math.floor(Date.now() / 1000),
+        ...(body.depth === 'max' ? { depth: 'max' } : {}),
+      }));
+    return c.json({ artifact }, 202);
+  });
+
+  app.post('/api/clients/:id/pitch', (c) => {
+    const client = getClient(c.req.param('id'));
+    if (!client) return c.json({ error: 'Not found' }, 404);
+    if (activeResearchJob(client.id, 'full_pitch')) return c.json({ error: 'pitch draft already in progress' }, 409);
+    const hasDive = listClientArtifacts(client.id).some((a) =>
+      a.kind === 'deep_dive' && /"status":"ready"/.test(a.content ?? ''));
+    if (!hasDive) return c.json({ error: 'run the deep dive first; the pitch is grounded in it' }, 412);
+    const artifact = createClientArtifact(client.id, 'full_pitch', `Pitch draft: ${client.company} (running)`,
+      JSON.stringify({ status: 'queued', requested_at: Math.floor(Date.now() / 1000) }));
+    return c.json({ artifact }, 202);
+  });
+
+  app.post('/api/clients/:id/demosite', (c) => {
+    const client = getClient(c.req.param('id'));
+    if (!client) return c.json({ error: 'Not found' }, 404);
+    if (activeResearchJob(client.id, 'demo_site')) return c.json({ error: 'demo site already in progress' }, 409);
+    const hasDive = listClientArtifacts(client.id).some((a) =>
+      a.kind === 'deep_dive' && /"status":"ready"/.test(a.content ?? ''));
+    if (!hasDive) return c.json({ error: 'run the deep dive first; the demo site is built from it' }, 412);
+    const artifact = createClientArtifact(client.id, 'demo_site', `Demo site: ${client.company} (building)`,
+      JSON.stringify({ status: 'queued', requested_at: Math.floor(Date.now() / 1000) }));
+    return c.json({ artifact }, 202);
+  });
+
+  // Open the company's Desktop docs folder in Windows Explorer (WSL interop);
+  // returns the Windows path either way so the UI can offer copy-paste.
+  app.post('/api/clients/:id/open-folder', async (c) => {
+    const client = getClient(c.req.param('id'));
+    if (!client) return c.json({ error: 'Not found' }, 404);
+    return c.json(await openClientFolder(client.company));
+  });
+
+  // Serve a generated demo site as a real page (opens in a browser tab).
+  app.get('/api/clients/:id/artifacts/:artifactId/site', (c) => {
+    const a = listClientArtifacts(c.req.param('id')).find((x) => x.id === c.req.param('artifactId'));
+    if (!a || a.kind !== 'demo_site') return c.json({ error: 'Not found' }, 404);
+    let html = '';
+    try { html = JSON.parse(a.content ?? '{}').html ?? ''; } catch { /* malformed */ }
+    if (!html) return c.json({ error: 'demo site not ready' }, 409);
+    return c.html(html);
+  });
+
+  // Demo generator: paste a route sheet, get per-customer service texts.
+  // mode day_before (default) = the Good Nature problem: tomorrow's notice
+  // including the planned service; after_service = completion recap.
+  app.post('/api/clients/:id/demo/service-texts', async (c) => {
+    const client = getClient(c.req.param('id'));
+    if (!client) return c.json({ error: 'Not found' }, 404);
+    let body: { sheet?: string; business_name?: string; mode?: string; visit_day?: string };
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+    if (!body.sheet?.trim()) return c.json({ error: 'sheet required (paste route-sheet rows)' }, 400);
+    const mode = body.mode === 'after_service' ? 'after_service' : 'day_before';
+    try {
+      const result = await generateServiceTexts(
+        client.id,
+        body.business_name?.trim() || client.company,
+        body.sheet,
+        mode,
+        body.visit_day?.trim() || 'tomorrow',
+      );
+      return c.json(result, 201);
+    } catch (err) {
+      return c.json({ error: String(err instanceof Error ? err.message : err).slice(0, 300) }, 422);
+    }
+  });
+
   // ── Live Meetings (Pika meet-cli wrapper) ──────────────────────────
   // Three endpoints that shell out to dist/meet-cli.js. Actual join/leave
   // logic lives there so Telegram triggers and the dashboard go through
@@ -2112,7 +3183,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       turns,
       compactions,
       sessionAge,
-      model: agentDefaultModel || 'claude-opus-4-8',
+      model: agentDefaultModel || PRIMARY_MODEL,  // FABLE5-TEMP: follows config PRIMARY_MODEL (Opus 4.8 while Fable 5 down)
       telegramConnected: getTelegramConnected(),
       waConnected: WHATSAPP_ENABLED,
       slackConnected: !!SLACK_USER_TOKEN,
@@ -2178,7 +3249,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
           id,
           name: config.name,
           description: config.description,
-          model: mainOverride ?? config.model ?? 'claude-opus-4-8',
+          model: mainOverride ?? config.model ?? PRIMARY_MODEL,  // FABLE5-TEMP: follows config PRIMARY_MODEL
           running,
           todayTurns: stats.todayTurns,
           todayCost: stats.todayCost,
@@ -2203,7 +3274,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     }
     const mainStats = getAgentTokenStats('main');
     const allAgents = [
-      { id: 'main', name: 'Main', description: 'Primary ClaudeClaw bot', model: getMainModelOverride() ?? 'claude-opus-4-8', running: mainRunning, todayTurns: mainStats.todayTurns, todayCost: mainStats.todayCost, avatar_etag: avatarEtagForId('main') },
+      { id: 'main', name: 'Main', description: 'Primary ClaudeClaw bot', model: getMainModelOverride() ?? PRIMARY_MODEL, running: mainRunning, todayTurns: mainStats.todayTurns, todayCost: mainStats.todayCost, avatar_etag: avatarEtagForId('main') },  // FABLE5-TEMP 2026-06-13 (revert to claude-fable-5)
       ...agents,
     ];
 
@@ -2243,7 +3314,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const model = body?.model?.trim();
     if (!model) return c.json({ error: 'model required' }, 400);
 
-    const validModels = ['claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
+    const validModels = ['claude-fable-5', 'claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
     if (!validModels.includes(model)) return c.json({ error: `Invalid model` }, 400);
 
     const agentIds = listAgentIds();
@@ -2268,7 +3339,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const model = body?.model?.trim();
     if (!model) return c.json({ error: 'model required' }, 400);
 
-    const validModels = ['claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
+    const validModels = ['claude-fable-5', 'claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
     if (!validModels.includes(model)) return c.json({ error: `Invalid model. Valid: ${validModels.join(', ')}` }, 400);
 
     try {

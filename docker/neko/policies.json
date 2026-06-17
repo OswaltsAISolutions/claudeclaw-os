@@ -1,0 +1,7 @@
+{
+  "DefaultCookiesSetting": 1,
+  "RestoreOnStartup": 4,
+  "RestoreOnStartupURLs": ["https://x.com/home"],
+  "BookmarkBarEnabled": true,
+  "PasswordManagerEnabled": true
+}

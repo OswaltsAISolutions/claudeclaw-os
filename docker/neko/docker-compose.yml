@@ -1,0 +1,29 @@
+# Self-hosted streamed Chromium (neko) for the Mission Control "Feeds" tab.
+# X and Instagram block being iframed directly, but we CAN iframe our own
+# Chromium that is logged into them. Gabe logs in once over WebRTC; the
+# profile volume persists the session across restarts.
+#
+# Start:  cd docker/neko && docker compose up -d
+# Login:  open http://127.0.0.1:8081 (admin pw), sign into X + IG once.
+# Passwords come from docker/neko/.env (gitignored).
+services:
+  neko:
+    image: ghcr.io/m1k1o/neko/chromium:3.1
+    container_name: claudeclaw-neko
+    restart: unless-stopped
+    shm_size: "2gb"
+    cap_add:
+      - SYS_ADMIN
+    ports:
+      - "127.0.0.1:8081:8080"        # web UI (localhost only)
+      - "127.0.0.1:9223:9223"        # CDP for Jarvis (localhost only, optional)
+      - "52000-52100:52000-52100/udp" # WebRTC media
+    environment:
+      NEKO_DESKTOP_SCREEN: "1280x720@30"
+      NEKO_MEMBER_MULTIUSER_USER_PASSWORD: ${NEKO_USER_PW}
+      NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD: ${NEKO_ADMIN_PW}
+      NEKO_WEBRTC_EPR: "52000-52100"
+      NEKO_WEBRTC_ICELITE: "true"
+    volumes:
+      - ./profile:/home/neko/.config/chromium
+      - ./policies.json:/etc/chromium/policies/managed/policies.json:ro

@@ -136,3 +136,14 @@ agents/*/.claude/claudex/
 # Dot-prefixed scratch under scripts/ — throwaway verify/diag/probe/deploy
 # helpers from autonomous sessions. Canonical scripts are never dot-prefixed.
 /scripts/.*
+
+# neko streamed-browser secrets + chrome profile
+docker/neko/.env
+docker/neko/profile/
+
+# Edit Bay render staging (worker-managed temp files)
+video/public/
+video/props-*.json
+
+# Timestamped .env backups (secrets) - never commit
+.env.bak*

@@ -274,6 +274,310 @@ function createSchema(database: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_project_items_project
       ON project_items(project_id, kind, sort_order ASC, created_at DESC);
 
+    CREATE TABLE IF NOT EXISTS library_items (
+      id                   TEXT PRIMARY KEY,
+      url                  TEXT NOT NULL UNIQUE,        -- canonicalized
+      platform             TEXT NOT NULL,               -- 'x' | 'instagram'
+      source               TEXT NOT NULL DEFAULT 'telegram', -- telegram|dashboard|bookmark_sync|dyi_export
+      author_name          TEXT,
+      author_handle        TEXT,
+      caption              TEXT,
+      posted_at            INTEGER,
+      duration_s           REAL,
+      media_type           TEXT,                        -- video|photo|carousel|text
+      media_dir            TEXT,                        -- store/library/<id>/
+      media_file           TEXT,                        -- main media filename within media_dir
+      thumbnail_path       TEXT,
+      oembed_html          TEXT,                        -- cached publish.twitter.com embed (X only)
+      like_count           INTEGER,
+      repost_count         INTEGER,
+      comment_count        INTEGER,
+      transcript           TEXT,
+      transcript_segments  TEXT,                        -- JSON [{start,end,text}]
+      tags                 TEXT,                        -- JSON string[]
+      notes                TEXT,                        -- user note from share message
+      analysis             TEXT,                        -- JSON {content_type,hook_summary,research_leads,research_item_id}
+      project_id           TEXT,
+      status               TEXT NOT NULL DEFAULT 'queued',
+      -- queued|fetching_meta|downloading|transcribing|tagging|ready
+      -- |failed_auth|failed_gone|failed_extract|failed_transcribe
+      error                TEXT,
+      retry_count          INTEGER NOT NULL DEFAULT 0,
+      raw_metadata         TEXT,                        -- full yt-dlp/gallery-dl JSON
+      created_at           INTEGER NOT NULL,
+      updated_at           INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_library_items_feed
+      ON library_items(platform, status, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_library_items_status
+      ON library_items(status);
+
+    -- Content Library taxonomy: two levels (umbrella -> subcategory),
+    -- many-to-many to items so one stored file can live in many folders.
+    CREATE TABLE IF NOT EXISTS categories (
+      id          TEXT PRIMARY KEY,
+      kind        TEXT NOT NULL,            -- 'umbrella' | 'subcategory'
+      parent_id   TEXT,                     -- null for umbrella; umbrella id for subcategory
+      name        TEXT NOT NULL,
+      slug        TEXT NOT NULL,            -- normalized for matching/dedup
+      description TEXT,                     -- helps the categorizer route + avoid dupes
+      created_by  TEXT NOT NULL DEFAULT 'seed', -- seed | jarvis | user
+      sort_order  INTEGER NOT NULL DEFAULT 0,
+      created_at  INTEGER NOT NULL,
+      updated_at  INTEGER NOT NULL
+    );
+    -- Unique within scope: umbrellas unique by slug (parent_id IS NULL via the
+    -- COALESCE), subcategories unique by (parent, slug).
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_categories_scope_slug
+      ON categories(COALESCE(parent_id, ''), slug);
+    CREATE INDEX IF NOT EXISTS idx_categories_parent ON categories(parent_id, sort_order);
+
+    CREATE TABLE IF NOT EXISTS library_item_categories (
+      item_id     TEXT NOT NULL,
+      category_id TEXT NOT NULL,            -- the SUBcategory id (umbrella via its parent)
+      is_primary  INTEGER NOT NULL DEFAULT 0,
+      confidence  REAL,
+      created_at  INTEGER NOT NULL,
+      PRIMARY KEY (item_id, category_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_lic_category ON library_item_categories(category_id);
+    CREATE INDEX IF NOT EXISTS idx_lic_item ON library_item_categories(item_id);
+
+    -- Content Engine staged drafting (2026-06-10): brief first, script only
+    -- after Gabe greenlights. One item can accumulate several drafts
+    -- (different platforms / retakes); newest wins in the UI.
+    CREATE TABLE IF NOT EXISTS content_drafts (
+      id          TEXT PRIMARY KEY,
+      item_id     TEXT NOT NULL,
+      track       TEXT NOT NULL,             -- 'ai' | 'real_world'
+      platform    TEXT NOT NULL,             -- tiktok|youtube|instagram|x
+      status      TEXT NOT NULL DEFAULT 'brief', -- brief|greenlit|scripted|rejected|failed
+      brief       TEXT,                      -- JSON {hook,angle,beats[],key_facts[],why_now,format_notes}
+      script      TEXT,                      -- full script text once scripted
+      model_used  TEXT,
+      error       TEXT,
+      verification        TEXT,              -- JSON {claims:[{claim,verdict,sources,...}],summary} from the fact-checker
+      verification_status TEXT,              -- none|running|done|failed
+      publish_kit         TEXT,              -- JSON {title,caption,hashtags[],thumbnail_text} for upload time
+      created_at  INTEGER NOT NULL,
+      updated_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_content_drafts_item ON content_drafts(item_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_content_drafts_status ON content_drafts(status, updated_at DESC);
+
+    -- Edit Bay render jobs (E1 2026-06-10): the render worker turns library
+    -- videos (and later raw anchor takes / faceless assemblies) into finished
+    -- clips via whisper word timing + Remotion.
+    CREATE TABLE IF NOT EXISTS render_jobs (
+      id          TEXT PRIMARY KEY,
+      item_id     TEXT,                      -- library item the render is based on
+      kind        TEXT NOT NULL,             -- 'caption_clip' (E1) | future kinds
+      status      TEXT NOT NULL DEFAULT 'queued', -- queued|preparing|rendering|ready|failed
+      spec        TEXT,                      -- JSON {aspect,accent,...}
+      output_file TEXT,                      -- absolute-relative store/renders/<id>/out.mp4
+      error       TEXT,
+      created_at  INTEGER NOT NULL,
+      updated_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_render_jobs_status ON render_jobs(status, created_at);
+
+    -- Edit Projects (faceless workbench 2026-06-11): Gabe drives every video.
+    -- A project = picked source clips + idea/message + script (labeled, never
+    -- gated) + render direction + optional his-voice voiceover.
+    CREATE TABLE IF NOT EXISTS edit_projects (
+      id            TEXT PRIMARY KEY,
+      title         TEXT NOT NULL,
+      status        TEXT NOT NULL DEFAULT 'idea', -- idea|approved|rendering|done|archived
+      item_ids      TEXT,                  -- JSON string[] of library item ids
+      idea_notes    TEXT,                  -- the message/idea worked out with Jarvis
+      script        TEXT,                  -- script/overview text (voiceover or framing)
+      script_labels TEXT,                  -- JSON claim verdicts (informational only)
+      brief         TEXT,                  -- render direction for the Director
+      aspect        TEXT NOT NULL DEFAULT '9:16',
+      voiceover_file TEXT,                 -- store/edit-projects/<id>/<file>
+      render_job_id TEXT,                  -- latest render job
+      created_at    INTEGER NOT NULL,
+      updated_at    INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_edit_projects_status ON edit_projects(status, updated_at DESC);
+
+    -- Edge Scanner (2026-06-10): read-only prediction-market dislocation
+    -- measurement. Kalshi = the only venue legally tradable from Ohio;
+    -- Polymarket is scanned as a free fair-value signal feed only.
+    -- edge_pairs: candidate/confirmed matches between a Kalshi market and a
+    -- Polymarket market (heuristic match, optionally LLM-verified).
+    CREATE TABLE IF NOT EXISTS edge_pairs (
+      id               TEXT PRIMARY KEY,
+      kalshi_ticker    TEXT NOT NULL,
+      kalshi_title     TEXT,
+      poly_condition_id TEXT NOT NULL,
+      poly_question    TEXT,
+      poly_event_slug  TEXT,
+      category         TEXT,
+      end_date         TEXT,
+      match_score      REAL,
+      llm_confidence   REAL,              -- null = not yet LLM-checked
+      status           TEXT NOT NULL DEFAULT 'candidate',  -- candidate | confirmed | rejected
+      invert           INTEGER NOT NULL DEFAULT 0,         -- 1 = poly YES maps to kalshi NO
+      created_at       INTEGER NOT NULL,
+      updated_at       INTEGER NOT NULL,
+      UNIQUE (kalshi_ticker, poly_condition_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_edge_pairs_status ON edge_pairs(status, updated_at DESC);
+
+    -- edge_opportunities: observed dislocations with lifecycle tracking.
+    -- A row opens when first seen, gets last_seen/max refreshed while it
+    -- persists, and closes when it disappears -> duration dataset for the
+    -- go/no-go decision on live capital.
+    CREATE TABLE IF NOT EXISTS edge_opportunities (
+      id          TEXT PRIMARY KEY,
+      kind        TEXT NOT NULL,     -- negrisk_yes | negrisk_no | xvenue | kalshi_intra | kalshi_spread
+      ref         TEXT NOT NULL,     -- event slug / pair id / ticker (stable per opportunity source)
+      title       TEXT,
+      venue       TEXT,              -- polymarket | kalshi | cross
+      category    TEXT,
+      detail      TEXT,              -- JSON: legs, prices, fee flags, sizes
+      gross_edge  REAL,              -- per-$1 contract (set), before fees
+      net_edge    REAL,              -- after venue fee model (conservative)
+      depth_usd   REAL,              -- null = unknown (no order-book depth in v1)
+      first_seen  INTEGER NOT NULL,
+      last_seen   INTEGER NOT NULL,
+      max_net_edge REAL,
+      status      TEXT NOT NULL DEFAULT 'open',  -- open | closed
+      closed_at   INTEGER,
+      alerted_at  INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_edge_opps_open ON edge_opportunities(status, kind, ref);
+    CREATE INDEX IF NOT EXISTS idx_edge_opps_seen ON edge_opportunities(last_seen DESC);
+
+    -- edge_stats: hourly snapshot for the dashboard chart.
+    CREATE TABLE IF NOT EXISTS edge_stats (
+      ts               INTEGER PRIMARY KEY,  -- hour bucket (epoch seconds)
+      kalshi_markets   INTEGER,
+      poly_events      INTEGER,
+      pairs_candidate  INTEGER,
+      pairs_confirmed  INTEGER,
+      opps_open        INTEGER,
+      opps_new         INTEGER,
+      best_net_edge    REAL
+    );
+
+    -- edge_paper_trades: simulated fills against REAL Kalshi books. This is
+    -- the go/no-go evidence: 4 weeks of honest fake-money P&L decides whether
+    -- real capital ever gets funded. No order endpoint is ever called.
+    CREATE TABLE IF NOT EXISTS edge_paper_trades (
+      id              TEXT PRIMARY KEY,
+      opportunity_id  TEXT,
+      kalshi_ticker   TEXT NOT NULL,
+      title           TEXT,
+      category        TEXT,
+      side            TEXT NOT NULL,      -- yes | no | arb (intra YES+NO pair)
+      qty             INTEGER NOT NULL,
+      entry_price     REAL NOT NULL,      -- per contract (arb: combined pair cost)
+      entry_fee       REAL NOT NULL,      -- total entry fee (fee model)
+      entry_poly_fair REAL,               -- Polymarket mid at entry (the thesis)
+      edge_captured   REAL,               -- theoretical edge locked at entry
+      opened_at       INTEGER NOT NULL,
+      status          TEXT NOT NULL DEFAULT 'open',  -- open | closed | settled
+      mark_price      REAL,
+      marked_at       INTEGER,
+      exit_price      REAL,
+      exit_fee        REAL,
+      exit_reason     TEXT,               -- convergence | settlement
+      result          TEXT,               -- yes | no (settlement only)
+      realized_pnl    REAL,
+      closed_at       INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_paper_status ON edge_paper_trades(status, opened_at DESC);
+
+    -- AI agency lane (2026-06-10): client pipeline for Oswalt's AI Solutions.
+    -- clients: one row per business in the pipeline (Good Nature first).
+    CREATE TABLE IF NOT EXISTS clients (
+      id              TEXT PRIMARY KEY,
+      company         TEXT NOT NULL,
+      contact_name    TEXT,
+      contact_role    TEXT,
+      contact_info    TEXT,
+      industry        TEXT,
+      location        TEXT,
+      stage           TEXT NOT NULL DEFAULT 'lead',  -- lead | contacted | pitched | pilot | active | closed_won | closed_lost
+      pain_points     TEXT,               -- freetext
+      notes           TEXT,
+      next_action     TEXT,
+      next_action_due INTEGER,            -- epoch seconds
+      monthly_value   REAL,               -- $/mo once active (real numbers only)
+      created_at      INTEGER NOT NULL,
+      updated_at      INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_clients_stage ON clients(stage, updated_at DESC);
+
+    -- client_artifacts: demos, proposals, ROI sheets produced for a client.
+    CREATE TABLE IF NOT EXISTS client_artifacts (
+      id          TEXT PRIMARY KEY,
+      client_id   TEXT NOT NULL,
+      kind        TEXT NOT NULL,      -- service_texts_demo | proposal | roi | note
+      title       TEXT,
+      content     TEXT,               -- JSON or markdown, per kind
+      created_at  INTEGER NOT NULL,
+      FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_client_artifacts ON client_artifacts(client_id, created_at DESC);
+
+    -- usage_ledger: measured (not estimated) cloud-token burn, one row per
+    -- model call ("leg"). Generic by design: scope+ref_id let ANY lane log
+    -- here (deep_dive today; fact_check / render / edge_judge later) with no
+    -- schema change. cost_weight = the model's output-price multiplier vs
+    -- claude-fable-5 (=1.0) so totals can be cost-compared across models.
+    CREATE TABLE IF NOT EXISTS usage_ledger (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts          INTEGER NOT NULL,
+      scope       TEXT NOT NULL,      -- 'deep_dive' | 'full_pitch' | 'demo_site' | future scopes
+      ref_id      TEXT,               -- job/artifact id the leg belongs to
+      leg         TEXT,               -- 'lens:reputation' | 'synthesis' | 'research' | ...
+      model       TEXT,
+      tokens_in   INTEGER NOT NULL DEFAULT 0,
+      tokens_out  INTEGER NOT NULL DEFAULT 0,
+      cost_weight REAL,
+      duration_ms INTEGER,
+      retries     INTEGER NOT NULL DEFAULT 0,
+      meta        TEXT                -- JSON: raw usage breakdown, cost estimate, notes
+    );
+    CREATE INDEX IF NOT EXISTS idx_usage_ledger ON usage_ledger(scope, ts DESC);
+
+    -- psyop_scores: Chase Hughes NCI Engineered Reality Scoring System runs.
+    -- Each row = one scored subject (claim/article/event). local_json = the
+    -- abliterated first pass, final_json = the cloud-verified PsyopScoreResult.
+    -- Additive, owned by the Psyop Scoring lane (see docs/RESUME-psyop.md).
+    CREATE TABLE IF NOT EXISTS psyop_scores (
+      id           TEXT PRIMARY KEY,
+      subject      TEXT NOT NULL,        -- short label for what was scored
+      input_text   TEXT,                 -- the text/claim that was scored
+      source_url   TEXT,                 -- optional source link
+      status       TEXT NOT NULL DEFAULT 'scoring', -- scoring | ready | failed
+      total        INTEGER,              -- 20-100
+      band         TEXT,                 -- low | moderate | strong | overwhelming
+      local_json   TEXT,                 -- raw local (oracle) 20-item draft
+      final_json   TEXT,                 -- verified PsyopScoreResult JSON
+      model_local  TEXT,
+      model_verify TEXT,
+      error        TEXT,
+      created_at   INTEGER NOT NULL,
+      updated_at   INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_psyop_scores ON psyop_scores(created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS social_accounts (
+      platform      TEXT PRIMARY KEY,   -- 'x'
+      user_id       TEXT,               -- platform user id
+      handle        TEXT,
+      access_token  TEXT NOT NULL,      -- encryptField()
+      refresh_token TEXT,               -- encryptField()
+      expires_at    INTEGER,            -- epoch seconds
+      scopes        TEXT,
+      updated_at    INTEGER NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS meet_sessions (
       id              TEXT PRIMARY KEY,         -- session id from the provider's join response
       agent_id        TEXT NOT NULL,            -- which agent is in the meeting
@@ -510,6 +814,30 @@ function runMigrations(database: Database.Database): void {
   // Workspace: link a mission task back to the project + research item it fills.
   addColumnIfMissing(database, 'mission_tasks', 'project_id', 'TEXT');
   addColumnIfMissing(database, 'mission_tasks', 'project_item_id', 'TEXT');
+
+  // Content Engine: intent gate + track/platform + scoring on library items.
+  addColumnIfMissing(database, 'library_items', 'intent', `TEXT`);            // content | build | reference
+  addColumnIfMissing(database, 'library_items', 'track', `TEXT`);             // ai | real_world | null
+  addColumnIfMissing(database, 'library_items', 'platforms', `TEXT`);         // JSON string[]: tiktok|youtube|instagram|x
+  addColumnIfMissing(database, 'library_items', 'content_score', `INTEGER`);  // 0-100 strength as a content opportunity
+  addColumnIfMissing(database, 'library_items', 'content_angle', `TEXT`);     // one-line hook/angle seed
+
+  // Fact-checking on content drafts: per-claim verdicts from the research team.
+  addColumnIfMissing(database, 'content_drafts', 'verification', `TEXT`);        // JSON {claims:[{claim,verdict,sources,...}],summary}
+  addColumnIfMissing(database, 'content_drafts', 'verification_status', `TEXT`); // none|running|done|failed
+  // Record Mode: per-platform upload metadata generated alongside the script.
+  addColumnIfMissing(database, 'content_drafts', 'publish_kit', `TEXT`);         // JSON {title,caption,hashtags[],thumbnail_text}
+  // Clustering: saves/sweeps about the SAME story share a cluster_id (the
+  // anchor item's id); null = singleton.
+  addColumnIfMissing(database, 'library_items', 'cluster_id', `TEXT`);
+
+  // AI agency: outreach tracking on clients (Gabe's personal outreach run).
+  // Touch history lives in client_artifacts (kind='outreach'); these columns
+  // hold the at-a-glance state the list view filters/sorts on.
+  addColumnIfMissing(database, 'clients', 'contacted_at', `INTEGER`);   // epoch s, first outgoing touch
+  addColumnIfMissing(database, 'clients', 'replied_at', `INTEGER`);     // epoch s, latest reply from them
+  addColumnIfMissing(database, 'clients', 'last_touch_at', `INTEGER`);  // epoch s, latest touch either direction
+  addColumnIfMissing(database, 'clients', 'next_touch_at', `INTEGER`);  // epoch s, follow-up due date
 
   // Multi-agent: migrate sessions table to composite primary key (chat_id, agent_id)
   // Check if PK is composite by looking at pk column count in pragma
@@ -2629,6 +2957,658 @@ export function deleteProjectItem(id: string): boolean {
   return db.prepare('DELETE FROM project_items WHERE id = ?').run(id).changes > 0;
 }
 
+// ── Content Library (X / Instagram saved posts) ─────────────────────
+
+export interface LibraryItem {
+  id: string;
+  url: string;
+  platform: string; // 'x' | 'instagram'
+  source: string; // telegram|dashboard|bookmark_sync|dyi_export
+  author_name: string | null;
+  author_handle: string | null;
+  caption: string | null;
+  posted_at: number | null;
+  duration_s: number | null;
+  media_type: string | null; // video|photo|carousel|text
+  media_dir: string | null;
+  media_file: string | null;
+  thumbnail_path: string | null;
+  oembed_html: string | null;
+  like_count: number | null;
+  repost_count: number | null;
+  comment_count: number | null;
+  transcript: string | null;
+  transcript_segments: string | null;
+  tags: string | null;
+  notes: string | null;
+  analysis: string | null;
+  project_id: string | null;
+  status: string;
+  error: string | null;
+  retry_count: number;
+  raw_metadata: string | null;
+  intent: string | null;        // content | build | reference
+  track: string | null;         // ai | real_world
+  platforms: string | null;     // JSON string[]
+  content_score: number | null; // 0-100
+  content_angle: string | null;
+  cluster_id: string | null;    // same story -> same anchor id; null = singleton
+  created_at: number;
+  updated_at: number;
+}
+
+export const LIBRARY_TERMINAL_FAILURES = new Set(['failed_gone']);
+export const LIBRARY_ACTIVE_STATUSES = ['queued', 'fetching_meta', 'downloading', 'transcribing', 'tagging'];
+
+export function createLibraryItem(
+  id: string,
+  url: string,
+  platform: string,
+  opts: { source?: string; notes?: string | null; projectId?: string | null } = {},
+): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `INSERT INTO library_items (id, url, platform, source, notes, project_id, status, retry_count, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)`,
+  ).run(id, url, platform, opts.source ?? 'telegram', opts.notes ?? null, opts.projectId ?? null, now, now);
+}
+
+/**
+ * Insert a live-event sweep opportunity directly as a READY text item.
+ * Bypasses the ingestion worker on purpose: there is no media to download
+ * for a news URL, and the content gate fields arrive pre-judged.
+ */
+export function createSweepLibraryItem(
+  id: string,
+  url: string,
+  fields: {
+    caption: string;
+    authorName?: string | null;
+    track: string;
+    platforms: string[];
+    contentScore: number;
+    contentAngle: string | null;
+    analysis?: Record<string, unknown>;
+    tags?: string[];
+  },
+): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `INSERT INTO library_items (
+       id, url, platform, source, author_name, caption, media_type,
+       tags, analysis, intent, track, platforms, content_score, content_angle,
+       status, retry_count, created_at, updated_at
+     ) VALUES (?, ?, 'web', 'sweep', ?, ?, 'text', ?, ?, 'content', ?, ?, ?, ?, 'ready', 0, ?, ?)`,
+  ).run(
+    id, url, fields.authorName ?? null, fields.caption,
+    fields.tags?.length ? JSON.stringify(fields.tags) : null,
+    fields.analysis ? JSON.stringify(fields.analysis) : null,
+    fields.track, JSON.stringify(fields.platforms),
+    fields.contentScore, fields.contentAngle, now, now,
+  );
+}
+
+export function getLibraryItem(id: string): LibraryItem | null {
+  return (db.prepare('SELECT * FROM library_items WHERE id = ?').get(id) as LibraryItem) ?? null;
+}
+
+export function getLibraryItemByUrl(url: string): LibraryItem | null {
+  return (db.prepare('SELECT * FROM library_items WHERE url = ?').get(url) as LibraryItem) ?? null;
+}
+
+export function listLibraryItems(opts: {
+  platform?: string;
+  status?: string;
+  tag?: string;
+  q?: string;
+  categoryId?: string;
+  uncategorized?: boolean;
+  intent?: string;
+  track?: string;
+  contentPlatform?: string;
+  minScore?: number;
+  sort?: string;
+  limit?: number;
+  offset?: number;
+} = {}): { items: LibraryItem[]; total: number } {
+  const where: string[] = [];
+  const vals: unknown[] = [];
+  if (opts.intent) { where.push('intent = ?'); vals.push(opts.intent); }
+  if (opts.track) { where.push('track = ?'); vals.push(opts.track); }
+  if (opts.contentPlatform) { where.push('platforms LIKE ?'); vals.push(`%"${opts.contentPlatform}"%`); }
+  if (typeof opts.minScore === 'number') { where.push('COALESCE(content_score, 0) >= ?'); vals.push(opts.minScore); }
+  if (opts.categoryId) {
+    // Match the subcategory directly, OR (if an umbrella was passed) any of its subcategories.
+    where.push(`id IN (SELECT item_id FROM library_item_categories WHERE category_id = ? OR category_id IN (SELECT id FROM categories WHERE parent_id = ?))`);
+    vals.push(opts.categoryId, opts.categoryId);
+  }
+  if (opts.uncategorized) {
+    where.push(`id NOT IN (SELECT item_id FROM library_item_categories)`);
+  }
+  if (opts.platform) { where.push('platform = ?'); vals.push(opts.platform); }
+  if (opts.status === 'failed') {
+    where.push(`status LIKE 'failed%'`);
+  } else if (opts.status === 'processing') {
+    where.push(`status IN ('queued', 'fetching_meta', 'downloading', 'transcribing', 'tagging')`);
+  } else if (opts.status) { where.push('status = ?'); vals.push(opts.status); }
+  if (opts.tag) { where.push('tags LIKE ?'); vals.push(`%"${opts.tag}"%`); }
+  if (opts.q) {
+    where.push('(caption LIKE ? OR transcript LIKE ? OR author_handle LIKE ? OR notes LIKE ?)');
+    const like = `%${opts.q}%`;
+    vals.push(like, like, like, like);
+  }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const total = (db.prepare(`SELECT COUNT(*) AS c FROM library_items ${whereSql}`).get(...vals) as { c: number }).c;
+  const orderBy = opts.sort === 'score'
+    ? 'COALESCE(content_score, 0) DESC, created_at DESC'
+    : 'created_at DESC';
+  const items = db
+    .prepare(`SELECT * FROM library_items ${whereSql} ORDER BY ${orderBy} LIMIT ? OFFSET ?`)
+    .all(...vals, opts.limit ?? 50, opts.offset ?? 0) as LibraryItem[];
+  return { items, total };
+}
+
+export function updateLibraryItem(
+  id: string,
+  patch: Partial<Omit<LibraryItem, 'id' | 'created_at' | 'updated_at'>>,
+): boolean {
+  const cols = [
+    'url', 'platform', 'source', 'author_name', 'author_handle', 'caption', 'posted_at', 'duration_s',
+    'media_type', 'media_dir', 'media_file', 'thumbnail_path', 'oembed_html', 'like_count', 'repost_count',
+    'comment_count', 'transcript', 'transcript_segments', 'tags', 'notes', 'analysis', 'project_id',
+    'status', 'error', 'retry_count', 'raw_metadata',
+    'intent', 'track', 'platforms', 'content_score', 'content_angle', 'cluster_id',
+  ] as const;
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  for (const key of cols) {
+    if (patch[key] !== undefined) {
+      sets.push(`${key} = ?`);
+      vals.push(patch[key]);
+    }
+  }
+  if (sets.length === 0) return false;
+  sets.push('updated_at = ?');
+  vals.push(Math.floor(Date.now() / 1000));
+  vals.push(id);
+  const res = db.prepare(`UPDATE library_items SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+  return res.changes > 0;
+}
+
+export function deleteLibraryItem(id: string): boolean {
+  return db.prepare('DELETE FROM library_items WHERE id = ?').run(id).changes > 0;
+}
+
+// ── Content drafts (staged: brief -> greenlight -> script) ──────────
+
+export interface ContentDraft {
+  id: string;
+  item_id: string;
+  track: string;
+  platform: string;
+  status: string; // brief|greenlit|scripted|rejected|failed
+  brief: string | null;
+  script: string | null;
+  model_used: string | null;
+  error: string | null;
+  verification: string | null;
+  verification_status: string | null; // none|running|done|failed
+  publish_kit: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export function createContentDraft(
+  id: string,
+  itemId: string,
+  track: string,
+  platform: string,
+  opts: { brief?: string | null; status?: string; modelUsed?: string | null; error?: string | null } = {},
+): ContentDraft {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `INSERT INTO content_drafts (id, item_id, track, platform, status, brief, script, model_used, error, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
+  ).run(id, itemId, track, platform, opts.status ?? 'brief', opts.brief ?? null, opts.modelUsed ?? null, opts.error ?? null, now, now);
+  return getContentDraft(id)!;
+}
+
+export function getContentDraft(id: string): ContentDraft | undefined {
+  return db.prepare('SELECT * FROM content_drafts WHERE id = ?').get(id) as ContentDraft | undefined;
+}
+
+export function updateContentDraft(
+  id: string,
+  patch: Partial<Omit<ContentDraft, 'id' | 'item_id' | 'created_at' | 'updated_at'>>,
+): boolean {
+  const cols = ['track', 'platform', 'status', 'brief', 'script', 'model_used', 'error', 'verification', 'verification_status', 'publish_kit'] as const;
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  for (const key of cols) {
+    if (patch[key] !== undefined) {
+      sets.push(`${key} = ?`);
+      vals.push(patch[key]);
+    }
+  }
+  if (sets.length === 0) return false;
+  sets.push('updated_at = ?');
+  vals.push(Math.floor(Date.now() / 1000));
+  vals.push(id);
+  return db.prepare(`UPDATE content_drafts SET ${sets.join(', ')} WHERE id = ?`).run(...vals).changes > 0;
+}
+
+export function listContentDrafts(itemId: string): ContentDraft[] {
+  return db.prepare('SELECT * FROM content_drafts WHERE item_id = ? ORDER BY created_at DESC').all(itemId) as ContentDraft[];
+}
+
+export function deleteContentDraft(id: string): boolean {
+  return db.prepare('DELETE FROM content_drafts WHERE id = ?').run(id).changes > 0;
+}
+
+// ── Edit Bay render jobs ─────────────────────────────────────────────
+
+export interface RenderJob {
+  id: string;
+  item_id: string | null;
+  kind: string;
+  status: string; // queued|preparing|rendering|ready|failed
+  spec: string | null;
+  output_file: string | null;
+  error: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export function createRenderJob(id: string, itemId: string | null, kind: string, spec: Record<string, unknown>): RenderJob {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `INSERT INTO render_jobs (id, item_id, kind, status, spec, created_at, updated_at)
+     VALUES (?, ?, ?, 'queued', ?, ?, ?)`,
+  ).run(id, itemId, kind, JSON.stringify(spec), now, now);
+  return getRenderJob(id)!;
+}
+
+export function getRenderJob(id: string): RenderJob | undefined {
+  return db.prepare('SELECT * FROM render_jobs WHERE id = ?').get(id) as RenderJob | undefined;
+}
+
+export function updateRenderJob(
+  id: string,
+  patch: Partial<Omit<RenderJob, 'id' | 'created_at' | 'updated_at'>>,
+): boolean {
+  const cols = ['item_id', 'kind', 'status', 'spec', 'output_file', 'error'] as const;
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  for (const key of cols) {
+    if (patch[key] !== undefined) { sets.push(`${key} = ?`); vals.push(patch[key]); }
+  }
+  if (sets.length === 0) return false;
+  sets.push('updated_at = ?');
+  vals.push(Math.floor(Date.now() / 1000));
+  vals.push(id);
+  return db.prepare(`UPDATE render_jobs SET ${sets.join(', ')} WHERE id = ?`).run(...vals).changes > 0;
+}
+
+export function listRenderJobs(limit = 50): RenderJob[] {
+  return db.prepare('SELECT * FROM render_jobs ORDER BY created_at DESC LIMIT ?').all(limit) as RenderJob[];
+}
+
+export function nextQueuedRenderJob(): RenderJob | undefined {
+  return db.prepare(`SELECT * FROM render_jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1`).get() as RenderJob | undefined;
+}
+
+export function deleteRenderJob(id: string): boolean {
+  return db.prepare('DELETE FROM render_jobs WHERE id = ?').run(id).changes > 0;
+}
+
+// ── Edit Projects (faceless workbench) ───────────────────────────────
+
+export interface EditProject {
+  id: string;
+  title: string;
+  status: string; // idea|approved|rendering|done|archived
+  item_ids: string | null;
+  idea_notes: string | null;
+  script: string | null;
+  script_labels: string | null;
+  brief: string | null;
+  aspect: string;
+  voiceover_file: string | null;
+  render_job_id: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export function createEditProject(id: string, title: string): EditProject {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `INSERT INTO edit_projects (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)`,
+  ).run(id, title, now, now);
+  return getEditProject(id)!;
+}
+
+export function getEditProject(id: string): EditProject | undefined {
+  return db.prepare('SELECT * FROM edit_projects WHERE id = ?').get(id) as EditProject | undefined;
+}
+
+export function updateEditProject(
+  id: string,
+  patch: Partial<Omit<EditProject, 'id' | 'created_at' | 'updated_at'>>,
+): boolean {
+  const cols = ['title', 'status', 'item_ids', 'idea_notes', 'script', 'script_labels', 'brief', 'aspect', 'voiceover_file', 'render_job_id'] as const;
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  for (const key of cols) {
+    if (patch[key] !== undefined) { sets.push(`${key} = ?`); vals.push(patch[key]); }
+  }
+  if (sets.length === 0) return false;
+  sets.push('updated_at = ?');
+  vals.push(Math.floor(Date.now() / 1000));
+  vals.push(id);
+  return db.prepare(`UPDATE edit_projects SET ${sets.join(', ')} WHERE id = ?`).run(...vals).changes > 0;
+}
+
+/** The project (if any) whose latest render is this job — for status sync on completion. */
+export function getEditProjectByRenderJobId(jobId: string): EditProject | undefined {
+  return db.prepare('SELECT * FROM edit_projects WHERE render_job_id = ?').get(jobId) as EditProject | undefined;
+}
+
+export function listEditProjects(includeArchived = false): EditProject[] {
+  return db.prepare(
+    includeArchived
+      ? 'SELECT * FROM edit_projects ORDER BY updated_at DESC LIMIT 100'
+      : `SELECT * FROM edit_projects WHERE status != 'archived' ORDER BY updated_at DESC LIMIT 100`,
+  ).all() as EditProject[];
+}
+
+export function deleteEditProject(id: string): boolean {
+  return db.prepare('DELETE FROM edit_projects WHERE id = ?').run(id).changes > 0;
+}
+
+/** Renders are idempotent: anything mid-flight when the service died re-queues at boot. */
+export function requeueStuckRenderJobs(): number {
+  return db.prepare(
+    `UPDATE render_jobs SET status = 'queued', updated_at = ?
+     WHERE status IN ('preparing', 'rendering')`,
+  ).run(Math.floor(Date.now() / 1000)).changes;
+}
+
+/** A restart mid-fact-check would strand 'running' forever; call at boot. */
+export function recoverStuckVerifications(): number {
+  return db.prepare(
+    `UPDATE content_drafts SET verification_status = 'failed', updated_at = ?
+     WHERE verification_status = 'running'`,
+  ).run(Math.floor(Date.now() / 1000)).changes;
+}
+
+// ── Social accounts (OAuth tokens, field-encrypted) ─────────────────
+
+export interface SocialAccount {
+  platform: string;
+  user_id: string | null;
+  handle: string | null;
+  access_token: string;
+  refresh_token: string | null;
+  expires_at: number | null;
+  scopes: string | null;
+  updated_at: number;
+}
+
+export function saveSocialAccount(acc: {
+  platform: string;
+  userId?: string | null;
+  handle?: string | null;
+  accessToken: string;
+  refreshToken?: string | null;
+  expiresAt?: number | null;
+  scopes?: string | null;
+}): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `INSERT INTO social_accounts (platform, user_id, handle, access_token, refresh_token, expires_at, scopes, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(platform) DO UPDATE SET
+       user_id = excluded.user_id, handle = excluded.handle,
+       access_token = excluded.access_token, refresh_token = excluded.refresh_token,
+       expires_at = excluded.expires_at, scopes = excluded.scopes, updated_at = excluded.updated_at`,
+  ).run(
+    acc.platform,
+    acc.userId ?? null,
+    acc.handle ?? null,
+    encryptField(acc.accessToken),
+    acc.refreshToken ? encryptField(acc.refreshToken) : null,
+    acc.expiresAt ?? null,
+    acc.scopes ?? null,
+    now,
+  );
+}
+
+/** Returns the account with tokens DECRYPTED. Treat the result as secret. */
+export function getSocialAccount(platform: string): SocialAccount | null {
+  const row = db.prepare('SELECT * FROM social_accounts WHERE platform = ?').get(platform) as SocialAccount | undefined;
+  if (!row) return null;
+  return {
+    ...row,
+    access_token: decryptField(row.access_token),
+    refresh_token: row.refresh_token ? decryptField(row.refresh_token) : null,
+  };
+}
+
+export function deleteSocialAccount(platform: string): boolean {
+  return db.prepare('DELETE FROM social_accounts WHERE platform = ?').run(platform).changes > 0;
+}
+
+// ── Content Library taxonomy (umbrellas + subcategories) ────────────
+
+export interface Category {
+  id: string;
+  kind: string; // 'umbrella' | 'subcategory'
+  parent_id: string | null;
+  name: string;
+  slug: string;
+  description: string | null;
+  created_by: string;
+  sort_order: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface CategoryNode extends Category {
+  item_count: number;
+  subcategories?: CategoryNode[];
+}
+
+export function slugifyCategory(name: string): string {
+  return name.toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'untitled';
+}
+
+/**
+ * Create a category if one with the same slug doesn't already exist in the
+ * same scope (umbrella slugs are global; subcategory slugs are unique under
+ * their umbrella). Returns the id of the new OR existing category, plus
+ * whether it was freshly created (so the worker can notify on new folders).
+ */
+export function ensureCategory(
+  kind: 'umbrella' | 'subcategory',
+  parentId: string | null,
+  name: string,
+  opts: { description?: string | null; createdBy?: string } = {},
+): { id: string; created: boolean } {
+  const slug = slugifyCategory(name);
+  const existing = db
+    .prepare(`SELECT id FROM categories WHERE COALESCE(parent_id, '') = ? AND slug = ?`)
+    .get(parentId ?? '', slug) as { id: string } | undefined;
+  if (existing) return { id: existing.id, created: false };
+  const id = crypto.randomBytes(4).toString('hex');
+  const now = Math.floor(Date.now() / 1000);
+  const maxOrder = (db.prepare(`SELECT COALESCE(MAX(sort_order), 0) AS m FROM categories WHERE COALESCE(parent_id,'') = ?`).get(parentId ?? '') as { m: number }).m;
+  db.prepare(
+    `INSERT INTO categories (id, kind, parent_id, name, slug, description, created_by, sort_order, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(id, kind, parentId, name, slug, opts.description ?? null, opts.createdBy ?? 'jarvis', maxOrder + 1, now, now);
+  return { id, created: true };
+}
+
+export function getCategory(id: string): Category | null {
+  return (db.prepare('SELECT * FROM categories WHERE id = ?').get(id) as Category) ?? null;
+}
+
+export function findUmbrellaByName(name: string): Category | null {
+  return (db.prepare(`SELECT * FROM categories WHERE kind='umbrella' AND slug = ?`).get(slugifyCategory(name)) as Category) ?? null;
+}
+
+export function findSubcategoryByName(umbrellaId: string, name: string): Category | null {
+  return (db.prepare(`SELECT * FROM categories WHERE kind='subcategory' AND parent_id = ? AND slug = ?`).get(umbrellaId, slugifyCategory(name)) as Category) ?? null;
+}
+
+export function renameCategory(id: string, name: string): boolean {
+  const cat = getCategory(id);
+  if (!cat) return false;
+  const slug = slugifyCategory(name);
+  const clash = db.prepare(`SELECT id FROM categories WHERE COALESCE(parent_id,'') = ? AND slug = ? AND id != ?`).get(cat.parent_id ?? '', slug, id);
+  if (clash) return false; // would collide with a sibling
+  return db.prepare('UPDATE categories SET name = ?, slug = ?, updated_at = ? WHERE id = ?')
+    .run(name, slug, Math.floor(Date.now() / 1000), id).changes > 0;
+}
+
+/** Move all item links from `fromId` into `toId`, then delete `fromId`. */
+export function mergeCategories(fromId: string, toId: string): boolean {
+  if (fromId === toId) return false;
+  const from = getCategory(fromId), to = getCategory(toId);
+  if (!from || !to || from.kind !== to.kind) return false;
+  const txn = db.transaction(() => {
+    const links = db.prepare('SELECT item_id, is_primary FROM library_item_categories WHERE category_id = ?').all(fromId) as Array<{ item_id: string; is_primary: number }>;
+    const now = Math.floor(Date.now() / 1000);
+    for (const l of links) {
+      db.prepare('INSERT OR IGNORE INTO library_item_categories (item_id, category_id, is_primary, created_at) VALUES (?, ?, ?, ?)')
+        .run(l.item_id, toId, l.is_primary, now);
+    }
+    db.prepare('DELETE FROM library_item_categories WHERE category_id = ?').run(fromId);
+    // Re-home orphaned subcategories if merging umbrellas.
+    if (from.kind === 'umbrella') db.prepare('UPDATE categories SET parent_id = ? WHERE parent_id = ?').run(toId, fromId);
+    db.prepare('DELETE FROM categories WHERE id = ?').run(fromId);
+  });
+  txn();
+  return true;
+}
+
+export function deleteCategory(id: string): boolean {
+  const cat = getCategory(id);
+  if (!cat) return false;
+  const txn = db.transaction(() => {
+    if (cat.kind === 'umbrella') {
+      const subs = db.prepare('SELECT id FROM categories WHERE parent_id = ?').all(id) as Array<{ id: string }>;
+      for (const s of subs) db.prepare('DELETE FROM library_item_categories WHERE category_id = ?').run(s.id);
+      db.prepare('DELETE FROM categories WHERE parent_id = ?').run(id);
+    }
+    db.prepare('DELETE FROM library_item_categories WHERE category_id = ?').run(id);
+    db.prepare('DELETE FROM categories WHERE id = ?').run(id);
+  });
+  txn();
+  return true;
+}
+
+export function assignItemCategory(itemId: string, categoryId: string, isPrimary = false): void {
+  const now = Math.floor(Date.now() / 1000);
+  if (isPrimary) db.prepare('UPDATE library_item_categories SET is_primary = 0 WHERE item_id = ?').run(itemId);
+  db.prepare(
+    `INSERT INTO library_item_categories (item_id, category_id, is_primary, created_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(item_id, category_id) DO UPDATE SET is_primary = excluded.is_primary`,
+  ).run(itemId, categoryId, isPrimary ? 1 : 0, now);
+}
+
+export function unassignItemCategory(itemId: string, categoryId: string): boolean {
+  return db.prepare('DELETE FROM library_item_categories WHERE item_id = ? AND category_id = ?').run(itemId, categoryId).changes > 0;
+}
+
+export function setPrimaryCategory(itemId: string, categoryId: string): void {
+  db.prepare('UPDATE library_item_categories SET is_primary = 0 WHERE item_id = ?').run(itemId);
+  db.prepare('UPDATE library_item_categories SET is_primary = 1 WHERE item_id = ? AND category_id = ?').run(itemId, categoryId);
+}
+
+/** Folders an item lives in, with umbrella + subcategory names. */
+export function getItemCategories(itemId: string): Array<{ category_id: string; is_primary: number; subcategory: string; umbrella: string; umbrella_id: string | null }> {
+  return db.prepare(
+    `SELECT lic.category_id, lic.is_primary,
+            s.name AS subcategory, COALESCE(u.name, '') AS umbrella, u.id AS umbrella_id
+     FROM library_item_categories lic
+     JOIN categories s ON s.id = lic.category_id
+     LEFT JOIN categories u ON u.id = s.parent_id
+     WHERE lic.item_id = ?
+     ORDER BY lic.is_primary DESC`,
+  ).all(itemId) as Array<{ category_id: string; is_primary: number; subcategory: string; umbrella: string; umbrella_id: string | null }>;
+}
+
+/** Full umbrella -> subcategory tree with item counts (distinct per umbrella). */
+export function listCategoryTree(): CategoryNode[] {
+  const all = db.prepare('SELECT * FROM categories ORDER BY sort_order, name').all() as Category[];
+  const subCounts = new Map<string, number>();
+  for (const r of db.prepare('SELECT category_id, COUNT(*) AS c FROM library_item_categories GROUP BY category_id').all() as Array<{ category_id: string; c: number }>) {
+    subCounts.set(r.category_id, r.c);
+  }
+  const umbrellaCounts = new Map<string, number>();
+  for (const r of db.prepare(
+    `SELECT p.id AS uid, COUNT(DISTINCT lic.item_id) AS c
+     FROM categories p JOIN categories s ON s.parent_id = p.id
+     LEFT JOIN library_item_categories lic ON lic.category_id = s.id
+     WHERE p.kind = 'umbrella' GROUP BY p.id`,
+  ).all() as Array<{ uid: string; c: number }>) {
+    umbrellaCounts.set(r.uid, r.c);
+  }
+  const umbrellas = all.filter((c) => c.kind === 'umbrella').map((u) => ({
+    ...u,
+    item_count: umbrellaCounts.get(u.id) ?? 0,
+    subcategories: all.filter((s) => s.parent_id === u.id).map((s) => ({ ...s, item_count: subCounts.get(s.id) ?? 0 })),
+  }));
+  return umbrellas;
+}
+
+const CATEGORY_SEED: Array<{ umbrella: string; description: string; subs: string[] }> = [
+  { umbrella: 'Finance & Markets', description: 'Money, markets, trading, and wealth building of any kind.', subs: ['Stocks & Investing', 'Trading', 'Copytrading', 'Quant & Algo Trading', 'Crypto', 'Prediction Markets', 'Gambling', 'Money-Making & Business'] },
+  { umbrella: 'Power & Geopolitics', description: 'Government, deep state, foreign influence, war, and global power.', subs: ['US Deep State', 'Foreign Influence on US', 'War & Conflict', 'Globalist Institutions', 'Nation Files'] },
+  { umbrella: 'History & Hidden History', description: 'The past, including suppressed or alternative history. File by era or subject, not by who is mentioned.', subs: ['WWII', 'Ancient Civilizations', 'Peoples & Eras', 'Suppressed & Alt History'] },
+  { umbrella: 'Spirituality & Consciousness', description: 'Religion, the esoteric, metaphysics, and consciousness.', subs: ['Religion', 'Esoteric & Occult', 'Metaphysics', 'Consciousness'] },
+  { umbrella: 'AI & Tech', description: 'AI, agents, software builds and setups, automation, and tech news.', subs: ['Builds & Setups', 'AI Tools', 'Automation', 'AI News'] },
+  { umbrella: 'Health & Human Performance', description: 'Body and mind: nutrition, fitness, longevity, performance.', subs: ['Nutrition', 'Fitness', 'Longevity', 'Mind'] },
+  { umbrella: 'Creator Craft', description: 'The craft of making content: hooks, editing, and audience growth.', subs: ['Hooks & Angles', 'Editing', 'Growth Tactics'] },
+  { umbrella: 'Science & Frontier', description: 'Hard and frontier science, including fringe or suppressed science.', subs: ['Physics', 'Space', 'Fringe & Suppressed Science'] },
+];
+
+/** Idempotent: seeds the starting umbrellas + subcategories if missing. */
+export function seedCategories(): void {
+  for (const u of CATEGORY_SEED) {
+    const { id } = ensureCategory('umbrella', null, u.umbrella, { description: u.description, createdBy: 'seed' });
+    for (const sub of u.subs) ensureCategory('subcategory', id, sub, { createdBy: 'seed' });
+  }
+}
+
+/** Next queued item to ingest (FIFO). Worker claims by flipping status. */
+export function nextQueuedLibraryItem(): LibraryItem | null {
+  return (db.prepare(`SELECT * FROM library_items WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1`).get() as LibraryItem) ?? null;
+}
+
+/** On boot: anything stuck mid-pipeline goes back to queued (steps are idempotent). */
+export function requeueStuckLibraryItems(): number {
+  return db.prepare(
+    `UPDATE library_items SET status = 'queued'
+     WHERE status IN ('fetching_meta', 'downloading', 'transcribing', 'tagging')`,
+  ).run().changes;
+}
+
+export function libraryStats(): { by_status: Record<string, number>; by_platform: Record<string, number>; total: number } {
+  const rows = db.prepare('SELECT status, platform, COUNT(*) AS c FROM library_items GROUP BY status, platform').all() as Array<{ status: string; platform: string; c: number }>;
+  const by_status: Record<string, number> = {};
+  const by_platform: Record<string, number> = {};
+  let total = 0;
+  for (const r of rows) {
+    by_status[r.status] = (by_status[r.status] ?? 0) + r.c;
+    by_platform[r.platform] = (by_platform[r.platform] ?? 0) + r.c;
+    total += r.c;
+  }
+  return { by_status, by_platform, total };
+}
+
 export function reassignMissionTask(id: string, newAgent: string): boolean {
   const result = db.prepare(
     `UPDATE mission_tasks SET assigned_agent = ? WHERE id = ? AND status = 'queued'`,
@@ -3440,4 +4420,601 @@ export function pruneAgentFileHistory(
      )`,
   ).run(agentId, fileKind, keep);
   return result.changes;
+}
+
+// ── Edge Scanner ────────────────────────────────────────────────────────────
+
+export interface EdgePair {
+  id: string;
+  kalshi_ticker: string;
+  kalshi_title: string | null;
+  poly_condition_id: string;
+  poly_question: string | null;
+  poly_event_slug: string | null;
+  category: string | null;
+  end_date: string | null;
+  match_score: number | null;
+  llm_confidence: number | null;
+  status: 'candidate' | 'confirmed' | 'rejected';
+  invert: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface EdgeOpportunity {
+  id: string;
+  kind: string;
+  ref: string;
+  title: string | null;
+  venue: string | null;
+  category: string | null;
+  detail: string | null;
+  gross_edge: number | null;
+  net_edge: number | null;
+  depth_usd: number | null;
+  first_seen: number;
+  last_seen: number;
+  max_net_edge: number | null;
+  status: 'open' | 'closed';
+  closed_at: number | null;
+  alerted_at: number | null;
+}
+
+/** Insert a candidate pair if it doesn't exist yet. Returns the row. */
+export function upsertEdgePair(p: {
+  kalshiTicker: string;
+  kalshiTitle: string | null;
+  polyConditionId: string;
+  polyQuestion: string | null;
+  polyEventSlug: string | null;
+  category: string | null;
+  endDate: string | null;
+  matchScore: number;
+}): EdgePair {
+  const now = Math.floor(Date.now() / 1000);
+  const existing = db.prepare(
+    'SELECT * FROM edge_pairs WHERE kalshi_ticker = ? AND poly_condition_id = ?',
+  ).get(p.kalshiTicker, p.polyConditionId) as EdgePair | undefined;
+  if (existing) {
+    db.prepare('UPDATE edge_pairs SET match_score = ?, updated_at = ? WHERE id = ?')
+      .run(p.matchScore, now, existing.id);
+    return { ...existing, match_score: p.matchScore, updated_at: now };
+  }
+  const id = crypto.randomUUID();
+  db.prepare(
+    `INSERT INTO edge_pairs (id, kalshi_ticker, kalshi_title, poly_condition_id, poly_question,
+       poly_event_slug, category, end_date, match_score, status, invert, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'candidate', 0, ?, ?)`,
+  ).run(id, p.kalshiTicker, p.kalshiTitle, p.polyConditionId, p.polyQuestion,
+    p.polyEventSlug, p.category, p.endDate, p.matchScore, now, now);
+  return db.prepare('SELECT * FROM edge_pairs WHERE id = ?').get(id) as EdgePair;
+}
+
+export function listEdgePairs(opts: { status?: string; limit?: number } = {}): EdgePair[] {
+  const limit = Math.min(opts.limit ?? 200, 1000);
+  if (opts.status) {
+    return db.prepare('SELECT * FROM edge_pairs WHERE status = ? ORDER BY updated_at DESC LIMIT ?')
+      .all(opts.status, limit) as EdgePair[];
+  }
+  return db.prepare('SELECT * FROM edge_pairs ORDER BY updated_at DESC LIMIT ?')
+    .all(limit) as EdgePair[];
+}
+
+export function getEdgePair(id: string): EdgePair | null {
+  return (db.prepare('SELECT * FROM edge_pairs WHERE id = ?').get(id) as EdgePair | undefined) ?? null;
+}
+
+export function updateEdgePair(
+  id: string,
+  patch: { status?: string; invert?: number; llm_confidence?: number | null },
+): boolean {
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  if (patch.status !== undefined) { sets.push('status = ?'); vals.push(patch.status); }
+  if (patch.invert !== undefined) { sets.push('invert = ?'); vals.push(patch.invert); }
+  if (patch.llm_confidence !== undefined) { sets.push('llm_confidence = ?'); vals.push(patch.llm_confidence); }
+  if (!sets.length) return false;
+  sets.push('updated_at = ?');
+  vals.push(Math.floor(Date.now() / 1000), id);
+  const res = db.prepare(`UPDATE edge_pairs SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+  return res.changes > 0;
+}
+
+/** The open opportunity row for a (kind, ref), if any. */
+export function getOpenEdgeOpportunity(kind: string, ref: string): EdgeOpportunity | null {
+  return (db.prepare(
+    "SELECT * FROM edge_opportunities WHERE kind = ? AND ref = ? AND status = 'open'",
+  ).get(kind, ref) as EdgeOpportunity | undefined) ?? null;
+}
+
+export function createEdgeOpportunity(o: {
+  kind: string;
+  ref: string;
+  title: string | null;
+  venue: string;
+  category: string | null;
+  detail: string;
+  grossEdge: number;
+  netEdge: number;
+  depthUsd: number | null;
+}): EdgeOpportunity {
+  const id = crypto.randomUUID();
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `INSERT INTO edge_opportunities (id, kind, ref, title, venue, category, detail,
+       gross_edge, net_edge, depth_usd, first_seen, last_seen, max_net_edge, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')`,
+  ).run(id, o.kind, o.ref, o.title, o.venue, o.category, o.detail,
+    o.grossEdge, o.netEdge, o.depthUsd, now, now, o.netEdge);
+  return db.prepare('SELECT * FROM edge_opportunities WHERE id = ?').get(id) as EdgeOpportunity;
+}
+
+/** Refresh a persisting opportunity: last_seen, current edges, max watermark. */
+export function touchEdgeOpportunity(
+  id: string,
+  grossEdge: number,
+  netEdge: number,
+  depthUsd: number | null,
+  detail: string,
+): void {
+  db.prepare(
+    `UPDATE edge_opportunities
+     SET last_seen = ?, gross_edge = ?, net_edge = ?, depth_usd = ?, detail = ?,
+         max_net_edge = MAX(COALESCE(max_net_edge, 0), ?)
+     WHERE id = ?`,
+  ).run(Math.floor(Date.now() / 1000), grossEdge, netEdge, depthUsd, detail, netEdge, id);
+}
+
+/** Close every open opportunity of the given kinds NOT in seenIds (it vanished this scan). */
+export function closeVanishedEdgeOpportunities(kinds: string[], seenIds: Set<string>): number {
+  if (!kinds.length) return 0;
+  const open = db.prepare(
+    `SELECT id FROM edge_opportunities WHERE status = 'open' AND kind IN (${kinds.map(() => '?').join(',')})`,
+  ).all(...kinds) as Array<{ id: string }>;
+  const now = Math.floor(Date.now() / 1000);
+  const close = db.prepare("UPDATE edge_opportunities SET status = 'closed', closed_at = ? WHERE id = ?");
+  let n = 0;
+  for (const row of open) {
+    if (!seenIds.has(row.id)) { close.run(now, row.id); n++; }
+  }
+  return n;
+}
+
+export function markEdgeOpportunityAlerted(id: string): void {
+  db.prepare('UPDATE edge_opportunities SET alerted_at = ? WHERE id = ?')
+    .run(Math.floor(Date.now() / 1000), id);
+}
+
+/** Most recent alert timestamp across ALL rows (open and closed) for a
+ *  (kind, ref). Cooldown must survive an opportunity closing and reopening
+ *  as a new row, otherwise a flapping market re-alerts every scan. */
+export function lastEdgeAlertTs(kind: string, ref: string): number | null {
+  const row = db.prepare(
+    'SELECT MAX(alerted_at) AS ts FROM edge_opportunities WHERE kind = ? AND ref = ?',
+  ).get(kind, ref) as { ts: number | null };
+  return row.ts ?? null;
+}
+
+export function listEdgeOpportunities(opts: {
+  status?: string;
+  kind?: string;
+  limit?: number;
+  offset?: number;
+} = {}): { rows: EdgeOpportunity[]; total: number } {
+  const where: string[] = [];
+  const vals: unknown[] = [];
+  if (opts.status) { where.push('status = ?'); vals.push(opts.status); }
+  if (opts.kind) { where.push('kind = ?'); vals.push(opts.kind); }
+  const w = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const total = (db.prepare(`SELECT COUNT(*) AS n FROM edge_opportunities ${w}`).get(...vals) as { n: number }).n;
+  const rows = db.prepare(
+    `SELECT * FROM edge_opportunities ${w} ORDER BY status = 'open' DESC, net_edge DESC, last_seen DESC LIMIT ? OFFSET ?`,
+  ).all(...vals, Math.min(opts.limit ?? 100, 500), opts.offset ?? 0) as EdgeOpportunity[];
+  return { rows, total };
+}
+
+export function upsertEdgeStats(row: {
+  kalshiMarkets: number;
+  polyEvents: number;
+  pairsCandidate: number;
+  pairsConfirmed: number;
+  oppsOpen: number;
+  oppsNew: number;
+  bestNetEdge: number | null;
+}): void {
+  const hour = Math.floor(Date.now() / 1000 / 3600) * 3600;
+  db.prepare(
+    `INSERT INTO edge_stats (ts, kalshi_markets, poly_events, pairs_candidate, pairs_confirmed, opps_open, opps_new, best_net_edge)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(ts) DO UPDATE SET
+       kalshi_markets = excluded.kalshi_markets,
+       poly_events = excluded.poly_events,
+       pairs_candidate = excluded.pairs_candidate,
+       pairs_confirmed = excluded.pairs_confirmed,
+       opps_open = excluded.opps_open,
+       opps_new = MAX(edge_stats.opps_new, excluded.opps_new),
+       best_net_edge = MAX(COALESCE(edge_stats.best_net_edge, 0), COALESCE(excluded.best_net_edge, 0))`,
+  ).run(hour, row.kalshiMarkets, row.polyEvents, row.pairsCandidate, row.pairsConfirmed,
+    row.oppsOpen, row.oppsNew, row.bestNetEdge);
+}
+
+export function listEdgeStats(hours = 72): Array<Record<string, number | null>> {
+  const cutoff = Math.floor(Date.now() / 1000) - hours * 3600;
+  return db.prepare('SELECT * FROM edge_stats WHERE ts >= ? ORDER BY ts ASC')
+    .all(cutoff) as Array<Record<string, number | null>>;
+}
+
+export function edgeSummaryCounts(): {
+  pairs_candidate: number; pairs_confirmed: number; opps_open: number; opps_closed: number;
+} {
+  const pc = (db.prepare("SELECT COUNT(*) AS n FROM edge_pairs WHERE status = 'candidate'").get() as { n: number }).n;
+  const pf = (db.prepare("SELECT COUNT(*) AS n FROM edge_pairs WHERE status = 'confirmed'").get() as { n: number }).n;
+  const oo = (db.prepare("SELECT COUNT(*) AS n FROM edge_opportunities WHERE status = 'open'").get() as { n: number }).n;
+  const oc = (db.prepare("SELECT COUNT(*) AS n FROM edge_opportunities WHERE status = 'closed'").get() as { n: number }).n;
+  return { pairs_candidate: pc, pairs_confirmed: pf, opps_open: oo, opps_closed: oc };
+}
+
+// ── Edge paper trading ──────────────────────────────────────────────────────
+
+export interface EdgePaperTrade {
+  id: string;
+  opportunity_id: string | null;
+  kalshi_ticker: string;
+  title: string | null;
+  category: string | null;
+  side: 'yes' | 'no' | 'arb';
+  qty: number;
+  entry_price: number;
+  entry_fee: number;
+  entry_poly_fair: number | null;
+  edge_captured: number | null;
+  opened_at: number;
+  status: 'open' | 'closed' | 'settled';
+  mark_price: number | null;
+  marked_at: number | null;
+  exit_price: number | null;
+  exit_fee: number | null;
+  exit_reason: string | null;
+  result: string | null;
+  realized_pnl: number | null;
+  closed_at: number | null;
+}
+
+export function createPaperTrade(t: {
+  opportunityId: string | null;
+  kalshiTicker: string;
+  title: string | null;
+  category: string | null;
+  side: 'yes' | 'no' | 'arb';
+  qty: number;
+  entryPrice: number;
+  entryFee: number;
+  entryPolyFair: number | null;
+  edgeCaptured: number | null;
+}): EdgePaperTrade {
+  const id = crypto.randomUUID();
+  db.prepare(
+    `INSERT INTO edge_paper_trades (id, opportunity_id, kalshi_ticker, title, category, side,
+       qty, entry_price, entry_fee, entry_poly_fair, edge_captured, opened_at, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')`,
+  ).run(id, t.opportunityId, t.kalshiTicker, t.title, t.category, t.side,
+    t.qty, t.entryPrice, t.entryFee, t.entryPolyFair, t.edgeCaptured, Math.floor(Date.now() / 1000));
+  return db.prepare('SELECT * FROM edge_paper_trades WHERE id = ?').get(id) as EdgePaperTrade;
+}
+
+export function openPaperTrades(): EdgePaperTrade[] {
+  return db.prepare("SELECT * FROM edge_paper_trades WHERE status = 'open' ORDER BY opened_at ASC")
+    .all() as EdgePaperTrade[];
+}
+
+export function hasOpenPaperTrade(kalshiTicker: string): boolean {
+  return !!db.prepare("SELECT 1 FROM edge_paper_trades WHERE status = 'open' AND kalshi_ticker = ?")
+    .get(kalshiTicker);
+}
+
+export function markPaperTrade(id: string, markPrice: number): void {
+  db.prepare('UPDATE edge_paper_trades SET mark_price = ?, marked_at = ? WHERE id = ?')
+    .run(markPrice, Math.floor(Date.now() / 1000), id);
+}
+
+export function closePaperTrade(
+  id: string,
+  patch: { status: 'closed' | 'settled'; exitPrice: number | null; exitFee: number; exitReason: string; result?: string | null; realizedPnl: number },
+): EdgePaperTrade | null {
+  db.prepare(
+    `UPDATE edge_paper_trades
+     SET status = ?, exit_price = ?, exit_fee = ?, exit_reason = ?, result = ?, realized_pnl = ?, closed_at = ?
+     WHERE id = ? AND status = 'open'`,
+  ).run(patch.status, patch.exitPrice, patch.exitFee, patch.exitReason, patch.result ?? null,
+    patch.realizedPnl, Math.floor(Date.now() / 1000), id);
+  return (db.prepare('SELECT * FROM edge_paper_trades WHERE id = ?').get(id) as EdgePaperTrade | undefined) ?? null;
+}
+
+export function listPaperTrades(opts: { status?: string; limit?: number } = {}): EdgePaperTrade[] {
+  const limit = Math.min(opts.limit ?? 200, 1000);
+  if (opts.status) {
+    return db.prepare('SELECT * FROM edge_paper_trades WHERE status = ? ORDER BY opened_at DESC LIMIT ?')
+      .all(opts.status, limit) as EdgePaperTrade[];
+  }
+  return db.prepare("SELECT * FROM edge_paper_trades ORDER BY status = 'open' DESC, opened_at DESC LIMIT ?")
+    .all(limit) as EdgePaperTrade[];
+}
+
+/** Book summary computed straight from the trades table (no separate balance state to drift). */
+export function paperBookSummary(startBalance: number): {
+  start_balance: number;
+  cash: number;
+  open_cost: number;
+  open_count: number;
+  realized_pnl: number;
+  closed_count: number;
+  edge_captured_total: number;
+  directional_residual_total: number;
+} {
+  const open = db.prepare(
+    "SELECT COUNT(*) AS n, COALESCE(SUM(entry_price * qty + entry_fee), 0) AS cost FROM edge_paper_trades WHERE status = 'open'",
+  ).get() as { n: number; cost: number };
+  const closed = db.prepare(
+    `SELECT COUNT(*) AS n,
+            COALESCE(SUM(realized_pnl), 0) AS pnl,
+            COALESCE(SUM(edge_captured), 0) AS edge
+     FROM edge_paper_trades WHERE status != 'open'`,
+  ).get() as { n: number; pnl: number; edge: number };
+  // Cash accounting: only OPEN trades hold cash hostage (their entry cost);
+  // a closed trade's cost came back as proceeds, so its net cash effect is
+  // exactly its realized pnl.
+  return {
+    start_balance: startBalance,
+    cash: startBalance - open.cost + closed.pnl,
+    open_cost: open.cost,
+    open_count: open.n,
+    realized_pnl: closed.pnl,
+    closed_count: closed.n,
+    edge_captured_total: closed.edge,
+    directional_residual_total: closed.pnl - closed.edge,
+  };
+}
+
+// ── AI agency: client pipeline ──────────────────────────────────────────────
+
+export interface Client {
+  id: string;
+  company: string;
+  contact_name: string | null;
+  contact_role: string | null;
+  contact_info: string | null;
+  industry: string | null;
+  location: string | null;
+  stage: string;
+  pain_points: string | null;
+  notes: string | null;
+  next_action: string | null;
+  next_action_due: number | null;
+  monthly_value: number | null;
+  contacted_at: number | null;
+  replied_at: number | null;
+  last_touch_at: number | null;
+  next_touch_at: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ClientArtifact {
+  id: string;
+  client_id: string;
+  kind: string;
+  title: string | null;
+  content: string | null;
+  created_at: number;
+}
+
+export const CLIENT_STAGES = ['lead', 'contacted', 'pitched', 'pilot', 'active', 'closed_won', 'closed_lost'] as const;
+
+export function createClient(c: {
+  company: string;
+  contactName?: string | null;
+  contactRole?: string | null;
+  contactInfo?: string | null;
+  industry?: string | null;
+  location?: string | null;
+  stage?: string;
+  painPoints?: string | null;
+  notes?: string | null;
+}): Client {
+  const id = crypto.randomUUID();
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `INSERT INTO clients (id, company, contact_name, contact_role, contact_info, industry, location,
+       stage, pain_points, notes, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(id, c.company, c.contactName ?? null, c.contactRole ?? null, c.contactInfo ?? null,
+    c.industry ?? null, c.location ?? null, c.stage ?? 'lead', c.painPoints ?? null, c.notes ?? null, now, now);
+  return db.prepare('SELECT * FROM clients WHERE id = ?').get(id) as Client;
+}
+
+export function getClient(id: string): Client | null {
+  return (db.prepare('SELECT * FROM clients WHERE id = ?').get(id) as Client | undefined) ?? null;
+}
+
+export function listClients(stage?: string): Client[] {
+  if (stage) {
+    return db.prepare('SELECT * FROM clients WHERE stage = ? ORDER BY updated_at DESC').all(stage) as Client[];
+  }
+  return db.prepare('SELECT * FROM clients ORDER BY updated_at DESC').all() as Client[];
+}
+
+export function updateClient(id: string, patch: Partial<Omit<Client, 'id' | 'created_at' | 'updated_at'>>): boolean {
+  const allowed = ['company', 'contact_name', 'contact_role', 'contact_info', 'industry', 'location',
+    'stage', 'pain_points', 'notes', 'next_action', 'next_action_due', 'monthly_value',
+    'contacted_at', 'replied_at', 'last_touch_at', 'next_touch_at'] as const;
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  for (const k of allowed) {
+    if (k in patch) { sets.push(`${k} = ?`); vals.push((patch as Record<string, unknown>)[k] ?? null); }
+  }
+  if (!sets.length) return false;
+  sets.push('updated_at = ?');
+  vals.push(Math.floor(Date.now() / 1000), id);
+  return db.prepare(`UPDATE clients SET ${sets.join(', ')} WHERE id = ?`).run(...vals).changes > 0;
+}
+
+export function deleteClient(id: string): boolean {
+  db.prepare('DELETE FROM client_artifacts WHERE client_id = ?').run(id);
+  return db.prepare('DELETE FROM clients WHERE id = ?').run(id).changes > 0;
+}
+
+export function createClientArtifact(clientId: string, kind: string, title: string | null, content: string | null): ClientArtifact {
+  const id = crypto.randomUUID();
+  db.prepare(
+    'INSERT INTO client_artifacts (id, client_id, kind, title, content, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+  ).run(id, clientId, kind, title, content, Math.floor(Date.now() / 1000));
+  db.prepare('UPDATE clients SET updated_at = ? WHERE id = ?').run(Math.floor(Date.now() / 1000), clientId);
+  return db.prepare('SELECT * FROM client_artifacts WHERE id = ?').get(id) as ClientArtifact;
+}
+
+export function listClientArtifacts(clientId: string): ClientArtifact[] {
+  return db.prepare('SELECT * FROM client_artifacts WHERE client_id = ? ORDER BY created_at DESC')
+    .all(clientId) as ClientArtifact[];
+}
+
+export function getClientArtifact(id: string): ClientArtifact | null {
+  return (db.prepare('SELECT * FROM client_artifacts WHERE id = ?').get(id) as ClientArtifact | undefined) ?? null;
+}
+
+export function updateClientArtifact(id: string, patch: { title?: string | null; content?: string | null }): boolean {
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  if ('title' in patch) { sets.push('title = ?'); vals.push(patch.title ?? null); }
+  if ('content' in patch) { sets.push('content = ?'); vals.push(patch.content ?? null); }
+  if (!sets.length) return false;
+  vals.push(id);
+  return db.prepare(`UPDATE client_artifacts SET ${sets.join(', ')} WHERE id = ?`).run(...vals).changes > 0;
+}
+
+// ── usage_ledger: measured cloud-token burn, one row per model call ──
+
+export interface UsageLedgerRow {
+  id: number;
+  ts: number;
+  scope: string;
+  ref_id: string | null;
+  leg: string | null;
+  model: string | null;
+  tokens_in: number;
+  tokens_out: number;
+  cost_weight: number | null;
+  duration_ms: number | null;
+  retries: number;
+  meta: string | null;
+}
+
+export function insertUsageLedger(row: {
+  scope: string;
+  refId?: string | null;
+  leg?: string | null;
+  model?: string | null;
+  tokensIn: number;
+  tokensOut: number;
+  costWeight?: number | null;
+  durationMs?: number | null;
+  retries?: number;
+  meta?: string | null;
+}): void {
+  db.prepare(
+    `INSERT INTO usage_ledger (ts, scope, ref_id, leg, model, tokens_in, tokens_out, cost_weight, duration_ms, retries, meta)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(Math.floor(Date.now() / 1000), row.scope, row.refId ?? null, row.leg ?? null, row.model ?? null,
+    row.tokensIn, row.tokensOut, row.costWeight ?? null, row.durationMs ?? null, row.retries ?? 0, row.meta ?? null);
+}
+
+export function listUsageLedger(refId: string): UsageLedgerRow[] {
+  return db.prepare('SELECT * FROM usage_ledger WHERE ref_id = ? ORDER BY ts ASC').all(refId) as UsageLedgerRow[];
+}
+
+// ── psyop_scores: NCI Engineered Reality Scoring System runs ──────────
+
+export interface PsyopScore {
+  id: string;
+  subject: string;
+  input_text: string | null;
+  source_url: string | null;
+  status: string;            // scoring | ready | failed
+  total: number | null;
+  band: string | null;
+  local_json: string | null;
+  final_json: string | null;
+  model_local: string | null;
+  model_verify: string | null;
+  error: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export function createPsyopScore(row: { id: string; subject: string; inputText?: string | null; sourceUrl?: string | null }): PsyopScore {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `INSERT INTO psyop_scores (id, subject, input_text, source_url, status, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'scoring', ?, ?)`,
+  ).run(row.id, row.subject, row.inputText ?? null, row.sourceUrl ?? null, now, now);
+  return getPsyopScore(row.id)!;
+}
+
+export function getPsyopScore(id: string): PsyopScore | undefined {
+  return db.prepare('SELECT * FROM psyop_scores WHERE id = ?').get(id) as PsyopScore | undefined;
+}
+
+export function updatePsyopScore(
+  id: string,
+  patch: Partial<Omit<PsyopScore, 'id' | 'created_at' | 'updated_at'>>,
+): boolean {
+  const cols = ['subject', 'input_text', 'source_url', 'status', 'total', 'band', 'local_json', 'final_json', 'model_local', 'model_verify', 'error'] as const;
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  for (const key of cols) {
+    if (patch[key] !== undefined) { sets.push(`${key} = ?`); vals.push(patch[key]); }
+  }
+  if (sets.length === 0) return false;
+  sets.push('updated_at = ?');
+  vals.push(Math.floor(Date.now() / 1000));
+  vals.push(id);
+  return db.prepare(`UPDATE psyop_scores SET ${sets.join(', ')} WHERE id = ?`).run(...vals).changes > 0;
+}
+
+export function listPsyopScores(limit = 50): PsyopScore[] {
+  return db.prepare('SELECT * FROM psyop_scores ORDER BY created_at DESC LIMIT ?').all(Math.min(limit, 200)) as PsyopScore[];
+}
+
+export function deletePsyopScore(id: string): boolean {
+  return db.prepare('DELETE FROM psyop_scores WHERE id = ?').run(id).changes > 0;
+}
+
+/** Totals since a timestamp (epoch s), optionally per scope. weighted_out =
+ *  sum(tokens_out * cost_weight) — comparable "fable-equivalent" output burn. */
+export function sumUsageSince(sinceTs: number, scope?: string): {
+  jobs: number; legs: number; tokens_in: number; tokens_out: number; weighted_out: number;
+} {
+  const where = scope ? 'WHERE ts >= ? AND scope = ?' : 'WHERE ts >= ?';
+  const args = scope ? [sinceTs, scope] : [sinceTs];
+  return db.prepare(
+    `SELECT COUNT(DISTINCT ref_id) AS jobs, COUNT(*) AS legs,
+            COALESCE(SUM(tokens_in), 0) AS tokens_in,
+            COALESCE(SUM(tokens_out), 0) AS tokens_out,
+            COALESCE(SUM(tokens_out * COALESCE(cost_weight, 1.0)), 0) AS weighted_out
+     FROM usage_ledger ${where}`,
+  ).get(...args) as { jobs: number; legs: number; tokens_in: number; tokens_out: number; weighted_out: number };
+}
+
+/** Research jobs are artifacts whose content JSON carries a status field;
+ *  the worker scans for queued/running ones (running = crashed mid-run). */
+export function pendingResearchArtifacts(): ClientArtifact[] {
+  return db.prepare(
+    `SELECT * FROM client_artifacts
+     WHERE kind IN ('deep_dive', 'full_pitch', 'demo_site')
+       AND (content LIKE '%"status":"queued"%' OR content LIKE '%"status":"running"%')
+     ORDER BY created_at ASC`,
+  ).all() as ClientArtifact[];
+}
+
+export function deleteClientArtifact(id: string): boolean {
+  return db.prepare('DELETE FROM client_artifacts WHERE id = ?').run(id).changes > 0;
 }

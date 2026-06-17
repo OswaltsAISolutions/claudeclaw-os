@@ -38,6 +38,13 @@ const envConfig = readEnvFile([
   'WARROOM_ENABLED',
   'WARROOM_PORT',
   'STREAM_STRATEGY',
+  'X_CLIENT_ID',
+  'X_CLIENT_SECRET',
+  'X_REDIRECT_URI',
+  'X_BEARER_TOKEN',
+  'KALSHI_API_KEY_ID',
+  'KALSHI_PRIVATE_KEY_PATH',
+  'LLMQUANT_API_KEY',
 ]);
 
 // ── Multi-agent support ──────────────────────────────────────────────
@@ -50,6 +57,17 @@ export let agentDefaultModel: string | undefined; // from agent.yaml
 export let agentObsidianConfig: { vault: string; folders: string[]; readOnly?: string[] } | undefined;
 export let agentSystemPrompt: string | undefined; // loaded from agents/{id}/CLAUDE.md
 export let agentMcpAllowlist: string[] | undefined; // from agent.yaml mcp_servers
+
+// ── Primary reasoning model: SINGLE SOURCE OF TRUTH ──────────────────
+// Main Jarvis, the task router, and the research pair (sleuth + prism) all run
+// on THIS model. Historically Claude Fable 5; Fable went unavailable 2026-06-13
+// so it is Opus 4.8 for now. INSTANT-SWITCH POLICY (Gabe 2026-06-13): the moment
+// Fable 5 is back, OR Anthropic ships a model stronger than Opus 4.8, change
+// these two constants and redeploy — every one of those roles follows from this
+// one edit (grep FABLE5-TEMP for the spots that reference it). Keep the SDK id
+// and the human display name in sync.
+export const PRIMARY_MODEL = 'claude-opus-4-8';
+export const PRIMARY_MODEL_DISPLAY = 'Opus 4.8';
 
 export function setAgentOverrides(opts: {
   agentId: string;
@@ -90,6 +108,22 @@ export const WHATSAPP_ENABLED =
 
 export const SLACK_USER_TOKEN =
   process.env.SLACK_USER_TOKEN || envConfig.SLACK_USER_TOKEN || '';
+
+// ── X (Twitter) bookmark sync — OAuth 2.0 PKCE app credentials ───────
+// Created in the X Developer Console (console.x.com > Apps). The client
+// secret is only present for confidential clients; PKCE works without it.
+export const X_BEARER_TOKEN = process.env.X_BEARER_TOKEN || envConfig.X_BEARER_TOKEN || '';
+export const X_CLIENT_ID = process.env.X_CLIENT_ID || envConfig.X_CLIENT_ID || '';
+export const X_CLIENT_SECRET = process.env.X_CLIENT_SECRET || envConfig.X_CLIENT_SECRET || '';
+export const X_REDIRECT_URI =
+  process.env.X_REDIRECT_URI || envConfig.X_REDIRECT_URI || 'http://127.0.0.1:3141/oauth/x/callback';
+
+// Kalshi API (Edge Scanner demo bot; key created 2026-06-10, account unfunded
+// beyond the $10 signup balance). Private key lives OUTSIDE the repo at
+// ~/.claudeclaw/keys/kalshi.pem (0600); only the path goes through .env.
+export const KALSHI_API_KEY_ID = process.env.KALSHI_API_KEY_ID || envConfig.KALSHI_API_KEY_ID || '';
+export const KALSHI_PRIVATE_KEY_PATH = process.env.KALSHI_PRIVATE_KEY_PATH || envConfig.KALSHI_PRIVATE_KEY_PATH || '';
+export const LLMQUANT_API_KEY = process.env.LLMQUANT_API_KEY || envConfig.LLMQUANT_API_KEY || '';
 
 // Voice — read via readEnvFile, not process.env
 export const GROQ_API_KEY = envConfig.GROQ_API_KEY ?? '';

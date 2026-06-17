@@ -24,6 +24,14 @@ import { LocalModels } from '@/pages/LocalModels';
 import { Specialists } from '@/pages/Specialists';
 import { JarvisHome } from '@/pages/JarvisHome';
 import { Workspace } from '@/pages/Workspace';
+import { Library } from '@/pages/Library';
+import { Studio } from '@/pages/Studio';
+import { Prompter } from '@/pages/Prompter';
+import { EditBay } from '@/pages/EditBay';
+import { Feeds } from '@/pages/Feeds';
+import { Edge } from '@/pages/Edge';
+import { Clients } from '@/pages/Clients';
+import { PsyopScoring } from '@/pages/PsyopScoring';
 
 export function App() {
   // Token gate: if the SPA loaded without a token in either URL or
@@ -52,6 +60,14 @@ export function App() {
         <Switch>
           <Route path="/"><JarvisHome /></Route>
           <Route path="/workspace"><Workspace /></Route>
+          <Route path="/library"><Library /></Route>
+          <Route path="/studio"><Studio /></Route>
+          <Route path="/prompter/:draftId"><Prompter /></Route>
+          <Route path="/editbay"><EditBay /></Route>
+          <Route path="/feeds"><Feeds /></Route>
+          <Route path="/edge"><Edge /></Route>
+          <Route path="/clients"><Clients /></Route>
+          <Route path="/psyop"><PsyopScoring /></Route>
           <Route path="/mission"><MissionControl /></Route>
           <Route path="/scheduled"><Scheduled /></Route>
           <Route path="/agents"><Agents /></Route>

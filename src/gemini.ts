@@ -17,11 +17,14 @@ function getClient(): GoogleGenAI {
 
 /**
  * Generate text content via Gemini.
- * Defaults to gemini-2.0-flash for speed and cost efficiency.
+ * Defaults to gemini-3.5-flash for speed and cost efficiency.
+ * 2026-06-13: upgraded from gemini-2.0-flash, which Google retired (404
+ * "no longer available"). 3.5-flash is the current flash tier; verified live
+ * with the same JSON-mode call this function makes.
  */
 export async function generateContent(
   prompt: string,
-  model = 'gemini-2.0-flash',
+  model = 'gemini-3.5-flash',
 ): Promise<string> {
   // Kill-switch: refuse Gemini calls when LLM_SPAWN_ENABLED is off.
   // Memory ingestion, classifier paths, and any other generateContent

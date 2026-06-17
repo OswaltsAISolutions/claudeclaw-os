@@ -16,6 +16,8 @@ vi.mock('./config.js', () => ({
   PROJECT_ROOT: '/tmp/test',
   agentCwd: undefined,
   agentSystemPrompt: undefined,
+  PRIMARY_MODEL: 'claude-opus-4-8',
+  PRIMARY_MODEL_DISPLAY: 'Opus 4.8',
 }));
 
 vi.mock('./logger.js', () => ({
