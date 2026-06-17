@@ -5,7 +5,7 @@
 | PC | Lane / session | Status | Working on | Last update |
 |---|---|---|---|---|
 | Main PC (WSL service host) | Agency + system (built GN package, model swap, hive-mind docs) | active | Created HANDOVER / HIVE-MIND / this registry; agency dive run PAUSED | 2026-06-15 |
-| Desktop 2 | Multi-PC AI system architecture | (self-register) | Building cross-PC architecture (Phase 2 live link) | 2026-06-15 |
+| Desktop 2 | Multi-PC AI system architecture | active | Phase 2 hive link DESIGNED; full plan in docs/PHASE2-HIVE-PLAN.md. Awaiting Gabe on open decisions D1-D6 + Main-PC implementation. | 2026-06-17 |
 | Gaming laptop | (to be added) | offline | Not yet set up | - |
 
 ## Notes
