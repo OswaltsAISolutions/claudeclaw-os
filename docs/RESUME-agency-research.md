@@ -1,6 +1,16 @@
 # RESUME: Agency deep-dive research run
 
-**Saved 2026-06-12 ~20:45 EST (session 3). Read this first in a new session, then pick up at "What to do next".**
+**Saved 2026-06-15 (session 4). Read SESSION 4 below FIRST; older sections are historical.**
+
+## SESSION 4 (2026-06-15) — READ THIS FIRST (newest)
+
+- **GOOD NATURE PITCH HAPPENED MON 2026-06-15 — WENT WELL.** Gabe pitched COO Matt at the quarterly. Matt very engaged, only soft pushback ("usually master the tech role first"), is ESCALATING to CEO Alec, and asked for a proposal package. **Package BUILT** in `C:\Users\GCruise\Desktop\Matt Quarterly\`: `Good Nature - AI Proposal.html` (doc) + `Good Nature - AI Proposal (Deck).pptx` (12 slides) + the demo + leave-behind + cheat sheet + pitch v2 + survey prep. Built via a verified multi-agent workflow; governing rule = 100% accurate / zero BS (Matt audits a $50 donation). PENDING GABE before he sends: confirm cert exam specifics + have his Anthropic credential-verification link ready. Phase-2 tech-stack mapping waits on Matt granting office access. The 2 external clients are COMMITTED, NOT paying yet (B&B Roofing + We R One Pressure Washing) and appear only as illustrative examples. Full detail: memory `client_good_nature.md`.
+- **MODEL SWAP (Fable 5 outage):** Fable 5 went unavailable. main + router + sleuth + prism are now **claude-opus-4-8** via a single-source `PRIMARY_MODEL` in `src/config.ts` (grep `FABLE5-TEMP`; flip PRIMARY_MODEL + PRIMARY_MODEL_DISPLAY back to fable when it returns). gemini-2.0-flash (retired) -> gemini-3.5-flash. Dives now run on Opus everywhere; the older "GN max-depth = Fable / bulk legs = Opus" distinction is moot while Fable is down. Detail: memory `project_fable5_upgrade.md`.
+- **DIVE RUN: still PAUSED, unchanged.** ~43 ready, ~39 paused, 0 failed, worker idle. The 5 hot leads are DONE (Challengers / Clary / Euro / J.B. Express / Rainbow). RESUME CONDITION (unchanged): after the weekly cap reset + Gabe's explicit go, flip paused->queued (`/tmp/agency-resume-all.sql`). Do NOT flip early; do NOT re-decide sequencing.
+- **REPO is now the cross-PC source of truth + fully committed:** all live app source committed (commit 1be8946) + pushed, plus cross-PC hive-mind docs (`docs/HANDOVER.md`, `HIVE-MIND.md`, `SESSION-REGISTRY.md`) on origin/main. Gabe runs Claude sessions on 3 PCs sharing this private repo. Boot: `git pull`, read HANDOVER + SESSIONS + SESSION-REGISTRY, register, additive-only, pull-before/push-after on shared docs. (`.env.bak*` now gitignored; stray `E` at repo root = junk, ignore.)
+- Session-3's usage ledger + outreach tracking are live (per-dive burn in usage_ledger + docs/USAGE.md; outreach panel in the Clients drawer).
+
+**CURRENT NEXT STEPS:** (1) Agency dives, wait for weekly cap reset + Gabe's go, then resume the ~39 paused. (2) Good Nature, Gabe finishes his confirm-list and sends the package; Phase-2 after Matt grants office access. (3) Storefront build side done, waiting on Gabe. (4) Multi-PC hive-mind Phase-2 (live cross-PC link) belongs to the desktop-2 architecture lane.
 
 ## Session-3 work (2026-06-12 evening)
 
